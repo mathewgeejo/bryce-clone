@@ -64,7 +64,10 @@ int gListScroll = 0;
 uint32_t gSeed = 100;
 float gBrushSize = 0.06f, gBrushStr = 0.5f, gRough = 0.5f, gTerraces = 6;
 BrushMode gBrush = BrushMode::Raise;
-enum Drag { DragNone, DragObj, DragCam } gDrag = DragNone;
+enum Drag { DragNone, DragObj, DragCam, DragSculpt } gDrag = DragNone;
+const int TOOL_SCULPT = 3;
+struct SculptHit { int obj = -1; float u = 0, v = 0; } gSculptHover, gSculpt;
+DWORD gSculptLast = 0;
 bool gRDrag = false, gMDrag = false;
 std::vector<uint32_t> gIcons[(int)ObjType::COUNT], gTreeIcon;
 std::vector<std::vector<uint32_t>> gSkyThumbs;
@@ -912,9 +915,12 @@ void drawTop() {
         x += 60;
         if (iconButton({x, 30, 56, 62}, {}, ICW, ICH, "Import", false, "OBJ")) defer(actImport);
     } else if (gTab == 1) {
-        const char* tools[3] = {"Move", "Rotate", "Resize"};
-        for (int i = 0; i < 3; i++)
-            if (button({10 + i * 64, 32, 60, 24}, tools[i], gTool == i)) gTool = i;
+        const char* tools[4] = {"Move", "Rotate", "Resize", "Sculpt"};
+        for (int i = 0; i < 4; i++)
+            if (button({10 + i * 64, 32, 60, 24}, tools[i], gTool == i)) {
+                gTool = i;
+                if (i == TOOL_SCULPT) gStatus = "Sculpt: click and hold on a terrain to raise it. Ctrl lowers, Shift smooths, [ and ] change brush size.";
+            }
         struct B { const char* n; int w; std::function<void()> fn; } bs[] = {
             {"Materials Lab", 100, [] { openLab(LabMat); }}, {"Terrain Editor", 100, [] { openLab(LabTerrain); }},
             {"Tree Lab", 72, [] { openLab(LabTree); }},       {"Edit Tools", 80, [] { openLab(LabTools); }},
@@ -923,10 +929,20 @@ void drawTop() {
             {"Ungroup", 66, actUngroup},                      {"Undo", 50, [] { undoRedo(false); }},
             {"Redo", 50, [] { undoRedo(true); }},
         };
-        int x = 206;
+        int x = 270;
         for (auto& b : bs) {
             if (button({x, 32, b.w, 24}, b.n)) b.fn();
             x += b.w + 4;
+        }
+        if (gTool == TOOL_SCULPT) {
+            textIn({10, 64, 60, 24}, "Brush:", TXT_DIM, gSmall, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            int bx = 56;
+            for (int i = 0; i < (int)BrushMode::COUNT; i++, bx += 70)
+                if (button({bx, 64, 66, 24}, brushName((BrushMode)i), gBrush == (BrushMode)i, gSmall)) gBrush = (BrushMode)i;
+            slider({bx + 6, 64, 190, 24}, "Size", gBrushSize, 0.01f, 0.3f, "%.2f", true);
+            slider({bx + 202, 64, 190, 24}, "Strength", gBrushStr, 0.05f, 1);
+            textIn({bx + 400, 64, gW - bx - 410, 24}, "Hold to build up  |  Ctrl invert  |  Shift smooth", TXT_DIM, gSmall, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            return;
         }
         auto cats = categories(false);
         gQuickCat = (gQuickCat + (int)cats.size()) % (int)cats.size();
@@ -1171,6 +1187,36 @@ int pick(int mx, int my) {
     return intersectScene(gScene, vb.ray((mx - cx) / hh, -(my - cy) / hh), 1e30f, h) ? h.obj : -1;
 }
 
+// Nearest terrain/lattice under the cursor, ignoring water and other objects in front of it.
+SculptHit sculptPick(int mx, int my) {
+    ViewBasis vb = curBasis();
+    float hh = gVP.h * 0.5f, cx = gVP.x + gVP.w * 0.5f, cy = gVP.y + hh;
+    Ray r = vb.ray((mx - cx) / hh, -(my - cy) / hh);
+    SculptHit best;
+    float bt = 1e30f;
+    for (int i = 0; i < (int)gScene.objs.size(); i++) {
+        const Object& o = gScene.objs[i];
+        if (!isHeightfield(o.type) || !o.hf || o.hidden || o.locked) continue;
+        Hit h;
+        if (intersectObject(o, r, bt, h)) { bt = h.t; best = {i, clampf((h.lr.x + 1) * 0.5f, 0, 1), clampf((h.lr.z + 1) * 0.5f, 0, 1)}; }
+    }
+    return best;
+}
+
+BrushMode sculptMode() {
+    if (gIn.shift) return BrushMode::Smooth;
+    if (gIn.ctrl && (gBrush == BrushMode::Raise || gBrush == BrushMode::Peak || gBrush == BrushMode::Plateau)) return BrushMode::Lower;
+    if (gIn.ctrl && gBrush == BrushMode::Lower) return BrushMode::Raise;
+    return gBrush;
+}
+
+void sculptStep() {
+    if (gSculpt.obj < 0 || gSculpt.obj >= (int)gScene.objs.size() || !gScene.objs[gSculpt.obj].hf) return;
+    hfBrush(*gScene.objs[gSculpt.obj].hf, gSculpt.u, gSculpt.v, gBrushSize, gBrushStr * 0.03f, sculptMode());
+    gShowRender = false;
+    sceneChanged();
+}
+
 void dragObject() {
     ViewBasis vb = curBasis();
     float hh = gVP.h * 0.5f, dx = (float)gIn.dx, dy = (float)gIn.dy;
@@ -1258,9 +1304,37 @@ void drawViewport() {
             if (!isSel(i) && !gScene.objs[i].hidden) drawObj(i);
         for (int i : gSelSet)
             if (i < (int)gScene.objs.size()) drawObj(i);
+        if (gTool == TOOL_SCULPT) {
+            gSculptHover = gDrag == DragSculpt && gIn.down ? gSculpt : (hov(vp) ? sculptPick(gIn.mx, gIn.my) : SculptHit());
+            if (gSculptHover.obj >= 0) {
+                const Object& o = gScene.objs[gSculptHover.obj];
+                const Heightfield& f = *o.hf;
+                auto H = [&](float x, float z) {
+                    float sx = clampf((x + 1) * 0.5f, 0, 1) * (f.res - 1), sz = clampf((z + 1) * 0.5f, 0, 1) * (f.res - 1);
+                    int ix = std::min((int)sx, f.res - 2), iz = std::min((int)sz, f.res - 2);
+                    float fx = sx - ix, fz = sz - iz;
+                    return lerpf(lerpf(f.at(ix, iz), f.at(ix + 1, iz), fx), lerpf(f.at(ix, iz + 1), f.at(ix + 1, iz + 1), fx), fz);
+                };
+                BrushMode bm = sculptMode();
+                SetDCPenColor(gDC, bm == BrushMode::Lower ? rgb(80, 200, 255) : (bm == BrushMode::Smooth ? rgb(140, 255, 140) : rgb(255, 150, 30)));
+                float cxl = gSculptHover.u * 2 - 1, czl = gSculptHover.v * 2 - 1;
+                for (float rr : {1.f, 0.5f}) {
+                    float R2 = gBrushSize * 2 * rr;
+                    V3 prev;
+                    for (int k = 0; k <= 40; k++) {
+                        float a = 2 * PI * k / 40, x = cxl + std::cos(a) * R2, z = czl + std::sin(a) * R2;
+                        V3 p = o.pos + o.fwd * V3(x, H(x, z) + 0.004f, z);
+                        if (k) seg(prev, p);
+                        prev = p;
+                    }
+                }
+                V3 c0 = o.pos + o.fwd * V3(cxl, H(cxl, czl), czl), up = normalize(o.fwd * V3(0, 1, 0));
+                seg(c0, c0 + up * (o.scl.y * 0.25f + 0.5f));
+            }
+        }
         SelectClipRgn(gDC, nullptr);
         const char* vn[4] = {"Camera View", "Top View", "Front View", "Side View"};
-        const char* tn[3] = {"Move", "Rotate", "Resize"};
+        const char* tn[4] = {"Move", "Rotate", "Resize", "Sculpt Terrain"};
         char buf[160];
         snprintf(buf, sizeof buf, "%s   |   Tool: %s   |   Frame %d", vn[gView], tn[gTool], gScene.frame);
         textIn({vp.x + 10, vp.y + 6, vp.w - 20, 18}, buf, rgb(240, 240, 245), gBold, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
@@ -1269,8 +1343,16 @@ void drawViewport() {
 
     if (hov(vp) && gIn.pressed && gActive == 0) {
         gActive = VIEW_ID;
+        SculptHit sh = gTool == TOOL_SCULPT && !gShowRender ? sculptPick(gIn.mx, gIn.my) : SculptHit();
         if (gShowRender) { gShowRender = false; gDrag = DragNone; }
-        else {
+        else if (sh.obj >= 0) {
+            if (!isSel(sh.obj) || gSel != sh.obj) selectObj(sh.obj, false);
+            gSculpt = sh;
+            gDrag = DragSculpt;
+            gSculptLast = GetTickCount();
+            sculptStep();
+            gStatus = "Sculpting " + gScene.objs[sh.obj].name + ": hold to build up, Ctrl inverts, Shift smooths, [ ] resize brush.";
+        } else {
             int p = pick(gIn.mx, gIn.my);
             if (p >= 0 && !(gIn.shift || isSel(p))) selectObj(p, false, gIn.alt);
             else if (p >= 0 && gIn.shift) selectObj(p, true, gIn.alt);
@@ -1280,7 +1362,12 @@ void drawViewport() {
             if (p >= 0) gStatus = "Selected " + gScene.objs[p].name + (gSelSet.size() > 1 ? " (+" + std::to_string(gSelSet.size() - 1) + " more)." : ".");
         }
     }
-    if (gActive == VIEW_ID && gIn.down && (gIn.dx || gIn.dy)) {
+    if (gActive == VIEW_ID && gIn.down && gDrag == DragSculpt && (gIn.dx || gIn.dy)) {
+        SculptHit sh = sculptPick(gIn.mx, gIn.my);
+        if (sh.obj == gSculpt.obj) gSculpt = sh;
+        DWORD now = GetTickCount();
+        if (now - gSculptLast >= 30) { gSculptLast = now; sculptStep(); }
+    } else if (gActive == VIEW_ID && gIn.down && (gIn.dx || gIn.dy)) {
         if (gDrag == DragObj && validSel()) dragObject();
         else if (gDrag == DragCam) {
             if (gView == 0) orbitCam((float)gIn.dx, (float)gIn.dy);
@@ -1575,10 +1662,17 @@ void drawTerrainLab() {
     note({hm.x, hm.y + hm.h + 6, hm.w, 36}, "Paint on the height map to sculpt (Shift swaps raise/lower). Bright = high, dark = low.");
 
     int x = P.x + 432, y = P.y + 46;
-    label(x, y, "Generate / Filter");
+    label(x, y, "Generate");
+    y += 20;
+    for (int i = 0; i < (int)TerrainKind::COUNT; i++)
+        if (button({x + (i % 3) * 76, y + (i / 3) * 26, 72, 22}, terrainKindName((TerrainKind)i), false, gSmall)) {
+            hfGenerate(f, (TerrainKind)i, ++gSeed, gRough);
+            ch = true;
+        }
+    y += (((int)TerrainKind::COUNT + 2) / 3) * 26 + 6;
+    label(x, y, "Filter");
     y += 20;
     struct Op { const char* n; std::function<void()> fn; } ops[] = {
-        {"Fractal", [&] { hfFractal(f, ++gSeed, gRough, false); }},  {"Ridged", [&] { hfFractal(f, ++gSeed, gRough, true); }},
         {"Erode", [&] { hfErode(f, f.res * f.res, ++gSeed); }},       {"Smooth", [&] { hfSmooth(f); }},
         {"Sharpen", [&] { hfSharpen(f); }},                           {"Add Noise", [&] { hfNoise(f, ++gSeed, 0.06f); }},
         {"Terrace", [&] { hfTerrace(f, (int)gTerraces); }},           {"Plateau", [&] { hfPlateau(f, 0.6f); }},
@@ -1590,8 +1684,8 @@ void drawTerrainLab() {
     };
     int nops = (int)(sizeof ops / sizeof ops[0]);
     for (int i = 0; i < nops; i++)
-        if (button({x + (i % 2) * 114, y + (i / 2) * 26, 110, 22}, ops[i].n, false, gSmall)) { ops[i].fn(); ch = true; }
-    y += ((nops + 1) / 2) * 26 + 8;
+        if (button({x + (i % 3) * 76, y + (i / 3) * 26, 72, 22}, ops[i].n, false, gSmall)) { ops[i].fn(); ch = true; }
+    y += ((nops + 2) / 3) * 26 + 6;
     label(x, y, "Resolution");
     y += 20;
     const int resv[3] = {129, 257, 513};
@@ -1607,9 +1701,8 @@ void drawTerrainLab() {
     slider({x, y, 224, 24}, "Terrace Steps", gTerraces, 2, 20, "%.0f"); y += 28;
     slider({x, y, 224, 24}, "Brush Size", gBrushSize, 0.01f, 0.3f, "%.2f", true); y += 28;
     slider({x, y, 224, 24}, "Brush Strength", gBrushStr, 0.05f, 1); y += 28;
-    const char* bn[4] = {"Raise", "Lower", "Smooth", "Flatten"};
-    for (int i = 0; i < 4; i++)
-        if (button({x + (i % 2) * 114, y + (i / 2) * 26, 110, 22}, (std::string("Brush: ") + bn[i]).c_str(), gBrush == (BrushMode)i, gSmall)) gBrush = (BrushMode)i;
+    for (int i = 0; i < (int)BrushMode::COUNT; i++)
+        if (button({x + (i % 4) * 57, y + (i / 4) * 26, 54, 22}, brushName((BrushMode)i), gBrush == (BrushMode)i, gSmall)) gBrush = (BrushMode)i;
     int sel = gSel;
     int x4 = P.x + P.w - 336;
     preview({x4, P.y + 46, 320, 240}, "Camera view preview");
@@ -1827,19 +1920,16 @@ void drawToolsLab() {
 }
 
 void drawExamplesLab() {
-    R P = panel(640, 460, "Example Scenes");
-    static const char* desc[] = {"Eroded snowy island, water and a chrome sphere.", "Terraced red mesas and sandstone rocks under desert haze.",
-                                 "A moon rising over a dark lake with a glowing campfire.", "Boolean objects, glass, chrome torus and a spotlight.",
-                                 "Generated trees in golden-hour light with ground fog.", "A floating lattice, hologram ring and gas giant on an alien world."};
+    R P = panel(700, 40 + 32 * (int)exampleNames().size() + 120, "Example Scenes");
     int y = P.y + 50;
     for (size_t i = 0; i < exampleNames().size(); i++) {
-        if (button({P.x + 20, y, 180, 30}, exampleNames()[i].c_str(), false, gBold)) {
+        if (button({P.x + 20, y, 180, 28}, exampleNames()[i].c_str(), false, gBold)) {
             int n = (int)i;
             closeLab(true);
             defer([n] { loadExample(n); });
         }
-        textIn({P.x + 214, y, P.w - 234, 30}, desc[i], TXT, gFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        y += 38;
+        textIn({P.x + 214, y, P.w - 234, 28}, exampleDescriptions()[i].c_str(), TXT, gFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        y += 32;
     }
     note({P.x + 20, y + 6, P.w - 40, 40}, "Loading an example replaces the current scene. All example content is original to Canyon 3D.");
     labFooter(P, true);
@@ -1892,6 +1982,11 @@ void doFrame() {
 
 void tick() {
     DWORD now = GetTickCount();
+    if (gDrag == DragSculpt && gIn.down && gActive == VIEW_ID && !gModal && now - gSculptLast >= 33) {
+        gSculptLast = now;
+        sculptStep();
+        doFrame();
+    }
     if (gPlaying && now - gPlayLast >= 1000u / (DWORD)std::max(1, gScene.fps)) {
         gPlayLast = now;
         gScene.applyFrame((gScene.frame + 1) % gScene.frames);
@@ -2041,6 +2136,7 @@ void handleKey(WPARAM wp) {
     else if (ctrl && wp == 'L') actLand();
     else if (ctrl && wp == 'K') addKey();
     else if (wp == VK_SPACE) { gPlaying = !gPlaying; gPlayLast = GetTickCount(); }
+    else if (wp == VK_OEM_4 || wp == VK_OEM_6) gBrushSize = clampf(gBrushSize * (wp == VK_OEM_6 ? 1.2f : 1 / 1.2f), 0.01f, 0.3f);
     else if (wp >= '1' && wp <= '4') { gView = (int)(wp - '1'); gShowRender = false; }
     endInteraction();
 }

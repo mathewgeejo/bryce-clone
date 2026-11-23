@@ -25,18 +25,37 @@ static bool saveBMP(const std::string& p, int w, int h, const std::vector<uint32
 }
 
 int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "ex") {
+        const int tw = 480, th = 300, cols = 2;
+        int first = argc > 2 ? atoi(argv[2]) : 6, n = (int)exampleNames().size() - first;
+        int rows = (n + cols - 1) / cols;
+        std::vector<uint32_t> big((size_t)tw * cols * th * rows);
+        for (int i = 0; i < n; i++) {
+            Scene s = makeExample(first + i);
+            std::vector<uint32_t> px((size_t)tw * th);
+            renderImage(s, tw, th, px.data(), 1);
+            int ox = (i % cols) * tw, oy = (i / cols) * th;
+            for (int y = 0; y < th; y++)
+                for (int x = 0; x < tw; x++) big[(size_t)(oy + y) * tw * cols + ox + x] = px[(size_t)y * tw + x];
+            printf("%s\n", exampleNames()[first + i].c_str());
+        }
+        saveBMP("build/t/ex.bmp", tw * cols, th * rows, big);
+        return 0;
+    }
     const char* out = argc > 1 ? argv[1] : "build/t/terr.bmp";
-    std::vector<std::pair<const char*, std::function<void(Heightfield&)>>> ops = {
-        {"default", [](Heightfield& f) { hfFractal(f, 20, 0.5f, false); hfErode(f, 60000, 1); }},
-        {"fractal", [](Heightfield& f) { hfFractal(f, 21, 0.5f, false); }},
-        {"ridged", [](Heightfield& f) { hfFractal(f, 22, 0.5f, true); }},
-        {"rough.7", [](Heightfield& f) { hfFractal(f, 23, 0.7f, false); }},
-        {"erode x3", [](Heightfield& f) { hfFractal(f, 24, 0.5f, false); for (int i = 0; i < 3; i++) hfErode(f, f.res * f.res, i); }},
-        {"terrace", [](Heightfield& f) { hfFractal(f, 25, 0.5f, false); hfTerrace(f, 6); }},
-        {"crater", [](Heightfield& f) { hfFractal(f, 26, 0.5f, false); hfCrater(f, 0.5f, 0.5f, 0.28f, 0.3f); }},
-        {"spikes", [](Heightfield& f) { hfInit(f, f.res); hfSpikes(f, 3, 12); }},
-        {"plateau", [](Heightfield& f) { hfFractal(f, 27, 0.5f, false); hfPlateau(f, 0.6f); }},
-    };
+    std::vector<std::pair<std::string, std::function<void(Heightfield&)>>> ops;
+    for (int k = 0; k < (int)TerrainKind::COUNT; k++)
+        ops.push_back({terrainKindName((TerrainKind)k), [k](Heightfield& f) { hfGenerate(f, (TerrainKind)k, 30 + k, 0.5f); }});
+    ops.push_back({"mountains+erode", [](Heightfield& f) { hfGenerate(f, TerrainKind::Mountains, 20, 0.5f); hfErode(f, f.res * f.res, 1); }});
+    ops.push_back({"brushes", [](Heightfield& f) {
+        hfGenerate(f, TerrainKind::Hills, 5, 0.5f);
+        for (int i = 0; i < 30; i++) hfBrush(f, 0.3f, 0.35f, 0.08f, 0.03f, BrushMode::Peak);
+        for (int i = 0; i < 30; i++) hfBrush(f, 0.68f, 0.4f, 0.12f, 0.03f, BrushMode::Plateau);
+        for (int i = 0; i < 20; i++) hfBrush(f, 0.5f, 0.72f, 0.15f, 0.03f, BrushMode::Raise);
+        for (int i = 0; i < 20; i++) hfBrush(f, 0.5f, 0.72f, 0.15f, 0.03f, BrushMode::Roughen);
+        for (int i = 0; i < 40; i++) hfBrush(f, 0.5f, 0.72f, 0.15f, 0.03f, BrushMode::Erode);
+    }});
+    ops.push_back({"terrace", [](Heightfield& f) { hfGenerate(f, TerrainKind::Mountains, 25, 0.5f); hfTerrace(f, 6); }});
     const int tw = 360, th = 240, cols = 3;
     int rows = (int)((ops.size() + cols - 1) / cols);
     std::vector<uint32_t> big((size_t)tw * cols * th * rows);
@@ -55,7 +74,7 @@ int main(int argc, char** argv) {
         int ox = (int)(i % cols) * tw, oy = (int)(i / cols) * th;
         for (int y = 0; y < th; y++)
             for (int x = 0; x < tw; x++) big[(size_t)(oy + y) * tw * cols + ox + x] = px[(size_t)y * tw + x];
-        printf("%s\n", ops[i].first);
+        printf("%s\n", ops[i].first.c_str());
     }
     saveBMP(out, tw * cols, th * rows, big);
 }

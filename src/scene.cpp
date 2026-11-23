@@ -329,7 +329,8 @@ static bool hitTerrain(const Heightfield& f, V3 o, V3 d, LHit& h) {
         float tExit = std::min(std::min(tmx, tmz), t1);
         float y0 = o.y + d.y * tEnter, y1 = o.y + d.y * tExit;
         float h00 = f.at(i, j), h10 = f.at(i + 1, j), h01 = f.at(i, j + 1), h11 = f.at(i + 1, j + 1);
-        if (std::min(y0, y1) <= std::max(std::max(h00, h10), std::max(h01, h11)) + 1e-4f) {
+        float hmax = std::max(std::max(h00, h10), std::max(h01, h11));
+        if (hmax > 1e-4f && std::min(y0, y1) <= hmax + 1e-4f) {
             float x0 = -1 + i * cs, z0 = -1 + j * cs;
             V3 a(x0, h00, z0), b(x0 + cs, h10, z0), c(x0, h01, z0 + cs), e(x0 + cs, h11, z0 + cs);
             float bt = INF, bu = 0, bv = 0, t, u, v;
@@ -514,6 +515,8 @@ static bool intersectCsg(const Scene& s, const std::vector<int>& g, const Ray& r
     return false;
 }
 
+bool intersectObject(const Object& o, const Ray& r, float tmax, Hit& h) { return intersectObj(o, r, tmax, h); }
+
 bool intersectScene(const Scene& s, const Ray& r, float tmax, Hit& h, int skip) {
     bool any = false;
     for (size_t i = 0; i < s.objs.size(); ++i) {
@@ -565,11 +568,15 @@ void wireframe(const Object& o, std::vector<V3>& s) {
         }
     };
     auto grid = [&](const Heightfield& f, float sign) {
-        int step = std::max(1, (f.res - 1) / 32);
+        int step = std::max(1, (f.res - 1) / 48);
         float cs = 2.f / (f.res - 1);
         auto P = [&](int x, int z) { return V3(-1 + x * cs, f.at(x, z) * sign, -1 + z * cs); };
+        auto E = [&](int x0, int z0, int x1, int z1) {
+            if (f.at(x0, z0) > 1e-4f || f.at(x1, z1) > 1e-4f) L(P(x0, z0), P(x1, z1));
+        };
         for (int a = 0; a < f.res; a += step)
-            for (int b = 0; b + step < f.res; b += step) { L(P(b, a), P(b + step, a)); L(P(a, b), P(a, b + step)); }
+            for (int b = 0; b + step < f.res; b += step) { E(b, a, b + step, a); E(a, b, a, b + step); }
+        if (sign > 0) { L(V3(-1, 0, -1), V3(1, 0, -1)); L(V3(1, 0, -1), V3(1, 0, 1)); L(V3(1, 0, 1), V3(-1, 0, 1)); L(V3(-1, 0, 1), V3(-1, 0, -1)); }
     };
     switch (o.type) {
     case ObjType::Sphere: sphere(1, 2, 6); break;

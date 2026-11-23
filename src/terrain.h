@@ -1,9 +1,14 @@
 #pragma once
 #include "scene.h"
 
-enum class BrushMode { Raise, Lower, Smooth, Flatten, COUNT };
+enum class BrushMode { Raise, Lower, Smooth, Flatten, Peak, Plateau, Roughen, Erode, COUNT };
+const char* brushName(BrushMode m);
+
+enum class TerrainKind { Mountains, Alpine, Hills, Canyon, Dunes, Volcano, Mesas, Archipelago, Crags, COUNT };
+const char* terrainKindName(TerrainKind k);
 
 void hfInit(Heightfield& f, int res);
+void hfGenerate(Heightfield& f, TerrainKind k, uint32_t seed, float rough);
 void hfFractal(Heightfield& f, uint32_t seed, float rough, bool ridged);
 void hfSmooth(Heightfield& f);
 void hfErode(Heightfield& f, int drops, uint32_t seed);

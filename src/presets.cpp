@@ -88,6 +88,7 @@ const std::vector<Material>& materialPresets() {
         M("Waters", "Deep Ocean", T::Waves, {.02f, .1f, .2f}, {0, 0, 0}, .2f, .2f, 1, 150, .5f, .3f, 1.33f, .8f, .3f),
         M("Waters", "Ice", T::Noise, {.8f, .9f, 1}, {.65f, .8f, .95f}, .2f, .3f, .9f, 120, .15f, .6f, 1.31f, .2f, 2),
         M("Waters", "Molten Lava", T::Lava, {1, .75f, .2f}, {.25f, .03f, .01f}, .9f, .2f, .2f, 20, 0, 0, 1, .6f, 1, 0, 1.2f),
+        M("Waters", "Mirror Water", T::Waves, {.05f, .08f, .12f}, {0, 0, 0}, .1f, .1f, 1, 200, .85f, .1f, 1.33f, .08f, .4f),
         // Clouds
         M("Clouds", "Clouds", T::Clouds, {1, 1, 1}, {.72f, .75f, .8f}, .8f, .7f, 0, 10, 0, 0, 1, 0, .035f),
         M("Clouds", "Storm Clouds", T::Clouds, {.55f, .57f, .6f}, {.25f, .26f, .3f}, .8f, .5f, 0, 10, 0, 0, 1, 0, .03f),
@@ -113,6 +114,10 @@ const std::vector<Material>& materialPresets() {
         M("Fantasy", "Psychedelic", T::Marble, {1, .1f, .8f}, {.1f, .9f, 1}, .85f, .4f, .5f, 50, .05f, 0, 1, 0, 2),
         M("Fantasy", "Hologram", T::Rings, {.4f, .9f, 1}, {.05f, .2f, .4f}, .3f, .3f, .8f, 80, .1f, .6f, 1.02f, 0, 6, 0, .5f),
         M("Fantasy", "Leopard", T::Spots, {.9f, .7f, .35f}, {.15f, .1f, .05f}, .9f, .35f, .1f, 15, 0, 0, 1, 0, 3),
+        M("Fantasy", "Planet Rings", T::Rings, {.95f, .88f, .75f}, {.45f, .38f, .3f}, .8f, .5f, .1f, 10, 0, .35f, 1, 0, 4),
+        M("Fantasy", "Obsidian", T::None, {.02f, .02f, .03f}, {0, 0, 0}, .5f, .15f, 1, 180, .35f, 0, 1, 0, 1),
+        M("Fantasy", "Mirror", T::None, {.97f, .97f, .98f}, {0, 0, 0}, .02f, .05f, 1, 250, .97f, 0, 1, 0, 1),
+        M("Fantasy", "Floating Rock", T::Granite, {.5f, .42f, .36f}, {.22f, .18f, .16f}, .85f, .3f, .15f, 20, 0, 0, 1, .8f, 1.2f),
     };
     return p;
 }
@@ -164,8 +169,20 @@ const std::vector<Sky>& skyPresets() {
 // ---------------------------------------------------------------- example scenes (original content)
 
 const std::vector<std::string>& exampleNames() {
-    static const std::vector<std::string> n = {"Snowy Island", "Desert Canyon", "Moonlit Lake", "Boolean Studio", "Forest Glade", "Alien World"};
+    static const std::vector<std::string> n = {"Snowy Island", "Desert Canyon", "Moonlit Lake", "Boolean Studio", "Forest Glade", "Alien World",
+                                               "Chrome Dreams", "Floating Isles", "Ringed Planet", "Monolith Lake", "Stone Arch", "Volcano Isle"};
     return n;
+}
+
+const std::vector<std::string>& exampleDescriptions() {
+    static const std::vector<std::string> d = {
+        "Eroded snowy island, water and a chrome sphere.", "Terraced red mesas and sandstone rocks under desert haze.",
+        "A moon rising over a dark lake with a glowing campfire.", "Boolean objects, glass, chrome torus and a spotlight.",
+        "Generated trees in golden-hour light with ground fog.", "A floating lattice, hologram ring and gas giant on an alien world.",
+        "Chrome and glass spheres on an endless checkerboard at sunset.", "Rock islands with trees drifting above a sea of clouds.",
+        "A ringed giant rising over jagged crags under a starfield.", "A black monolith standing in mirror-still water at dusk.",
+        "A weathered sandstone arch among dunes and distant mesas.", "A smoking volcano island glowing over a deep ocean."};
+    return d;
 }
 
 namespace {
@@ -195,6 +212,58 @@ Object prim(ObjType ty, int n, V3 pos, V3 scl, const char* mat) {
     o.scl = scl;
     o.mat = findMaterial(mat);
     return o;
+}
+
+Object kindTerrain(int n, V3 pos, V3 scl, const char* mat, TerrainKind k, uint32_t seed, int res = 257) {
+    Object t = terrainObj(n, pos, scl, mat, seed, false, res);
+    hfGenerate(*t.hf, k, seed, 0.5f);
+    return t;
+}
+
+float heightAt(const Object& t, float u, float v) {
+    const Heightfield& f = *t.hf;
+    int x = (int)std::lround(clampf(u, 0, 1) * (f.res - 1)), z = (int)std::lround(clampf(v, 0, 1) * (f.res - 1));
+    return t.pos.y + f.at(x, z) * t.scl.y;
+}
+
+// Rocky underside for a floating island: follows the top's outline, deepest in the middle.
+Object islandUnderside(const Object& top, int n, float depth, uint32_t seed) {
+    Object b = top;
+    b.name = "Terrain " + std::to_string(n);
+    b.mat = findMaterial("Floating Rock");
+    b.hf = std::make_shared<Heightfield>(*top.hf);
+    Heightfield& f = *b.hf;
+    int N = f.res;
+    std::vector<float> solid(f.h.size());
+    for (size_t i = 0; i < f.h.size(); i++) solid[i] = f.h[i] > 0 ? 1.f : 0.f;
+    // Chamfer distance to the island edge, so the underside tapers like an inverted mountain.
+    std::vector<float> d(f.h.size());
+    for (size_t i = 0; i < d.size(); i++) d[i] = solid[i] > 0 ? 1e9f : 0.f;
+    auto relax = [&](int x, int z, int dx, int dz, float c) {
+        int xx = x + dx, zz = z + dz;
+        float o = (xx < 0 || zz < 0 || xx >= N || zz >= N) ? 0.f : d[zz * N + xx];
+        d[z * N + x] = std::min(d[z * N + x], o + c);
+    };
+    for (int z = 0; z < N; z++)
+        for (int x = 0; x < N; x++) { relax(x, z, -1, 0, 1); relax(x, z, 0, -1, 1); relax(x, z, -1, -1, 1.414f); relax(x, z, 1, -1, 1.414f); }
+    for (int z = N - 1; z >= 0; z--)
+        for (int x = N - 1; x >= 0; x--) { relax(x, z, 1, 0, 1); relax(x, z, 0, 1, 1); relax(x, z, 1, 1, 1.414f); relax(x, z, -1, 1, 1.414f); }
+    float dmax = 1;
+    for (float v : d) dmax = std::max(dmax, v);
+    for (int z = 0; z < N; z++)
+        for (int x = 0; x < N; x++) {
+            float ridge = std::fabs(noise3(V3(x * 0.06f + seed, 0.3f, z * 0.06f))) + 0.5f * std::fabs(noise3(V3(x * 0.15f, 1.7f, z * 0.15f + seed)));
+            float t = d[z * N + x] / dmax;
+            f.h[z * N + x] = solid[z * N + x] > 0 ? std::pow(t, 0.75f) * (0.7f + 0.6f * ridge) + 0.015f : 0.f;
+        }
+    hfNoise(f, seed, 0.05f);
+    for (int z = 0; z < N; z++)
+        for (int x = 0; x < N; x++)
+            if (solid[z * N + x] <= 0) f.h[z * N + x] = 0;
+    f.computeNormals();
+    b.scl.y = -depth;
+    b.update();
+    return b;
 }
 
 }  // namespace
@@ -279,6 +348,116 @@ Scene makeExample(int i) {
         for (int k = 0; k < 3; k++) s.objs.push_back(prim(ObjType::Stone, k + 1, {-4.f + k * 5, 0.5f, 8.f + rng.f() * 3}, V3(0.9f, 0.6f, 0.8f), "Granite"));
         s.cam.target = {0, 3, -2}; s.cam.dist = 30; s.cam.pitch = 6; s.cam.yaw = 10;
         s.sky.sunAz = 45;
+        break;
+    }
+    case 6: {
+        s.sky = skyNamed("Sunset");
+        s.sky.sunAz = 180; s.sky.sunAlt = 8; s.sky.clouds = 0.3f;
+        Object g = prim(ObjType::Ground, 1, {}, V3(1.f), "Checker");
+        g.mat.texScale = 0.12f; g.mat.reflect = 0.25f; g.mat.specular = 0.6f;
+        s.objs.push_back(g);
+        s.objs.push_back(prim(ObjType::Sphere, 1, {0, 4, 0}, V3(4.f), "Mirror"));
+        s.objs.push_back(prim(ObjType::Sphere, 2, {-8, 1.6f, 6}, V3(1.6f), "Chrome"));
+        s.objs.push_back(prim(ObjType::Sphere, 3, {7, 2.2f, 5}, V3(2.2f), "Glass"));
+        s.objs.push_back(prim(ObjType::Sphere, 4, {4, 9.5f, -6}, V3(1.2f), "Gold"));
+        s.objs.push_back(prim(ObjType::Sphere, 5, {-5, 7.5f, -10}, V3(0.8f), "Chrome"));
+        Object p = prim(ObjType::Pyramid, 1, {-30, 9, -70}, V3(9.f), "Marble");
+        s.objs.push_back(p);
+        Object c = prim(ObjType::Cylinder, 1, {22, 6, -40}, {1.2f, 6, 1.2f}, "Marble");
+        s.objs.push_back(c);
+        s.cam.target = {0, 4, 0}; s.cam.dist = 26; s.cam.pitch = 5; s.cam.yaw = 20; s.cam.fov = 55;
+        break;
+    }
+    case 7: {
+        s.sky = skyNamed("Fair Weather");
+        s.sky.sunAz = 60; s.sky.haze = 0.25f;
+        Object cl = prim(ObjType::Cloud, 1, {0, 2, 0}, V3(1.f), "Clouds");
+        cl.mat.texScale = 0.05f;
+        s.objs.push_back(cl);
+        struct Isle { V3 pos; float size, h, depth; TerrainKind k; uint32_t seed; } isles[] = {
+            {{0, 22, -8}, 20, 5, 14, TerrainKind::Mountains, 71},
+            {{-30, 30, -30}, 11, 3.5f, 9, TerrainKind::Hills, 72},
+            {{26, 16, -26}, 9, 2.5f, 8, TerrainKind::Alpine, 73},
+        };
+        int n = 1, tc = 1;
+        for (auto& is : isles) {
+            Object top = kindTerrain(n++, is.pos, {is.size, is.h, is.size}, "Alpine Meadow", is.k, is.seed);
+            s.objs.push_back(top);
+            s.objs.push_back(islandUnderside(top, n++, is.depth, is.seed));
+            for (int k = 0; k < 3; k++) {
+                float u = 0.4f + rng.f() * 0.2f, v = 0.4f + rng.f() * 0.2f;
+                TreeParams p;
+                p.seed = 300 + tc;
+                addTree(s, p, {is.pos.x + (u * 2 - 1) * is.size, heightAt(top, u, v) - 0.2f, is.pos.z + (v * 2 - 1) * is.size}, is.size * 0.22f,
+                        findMaterial("Bark"), findMaterial("Leaves"), tc++);
+            }
+        }
+        for (int k = 0; k < 6; k++)
+            s.objs.push_back(prim(ObjType::Stone, k + 1, {-20.f + k * 8 + rng.f() * 4, 12.f + rng.f() * 14, 4.f + rng.f() * 8}, V3(0.8f + rng.f() * 1.4f), "Floating Rock"));
+        s.cam.target = {0, 20, -10}; s.cam.dist = 62; s.cam.pitch = 6; s.cam.yaw = 15; s.cam.fov = 55;
+        break;
+    }
+    case 8: {
+        s.sky = skyNamed("Crescent Night");
+        s.sky.stars = 1; s.sky.ambient = 0.45f; s.sky.sunVisible = false; s.sky.sunAlt = 22; s.sky.sunAz = 330;
+        s.sky.sunColor = {0.95f, 0.88f, 0.8f};
+        s.objs.push_back(prim(ObjType::Ground, 1, {}, V3(1.f), "Lunar Dust"));
+        s.objs.push_back(kindTerrain(1, {-20, 0, -30}, {34, 16, 34}, "Lunar Dust", TerrainKind::Crags, 81));
+        s.objs.push_back(kindTerrain(2, {30, 0, -10}, {22, 9, 22}, "Volcanic Rock", TerrainKind::Crags, 82));
+        Object planet = prim(ObjType::Sphere, 1, {20, 60, -190}, V3(48.f), "Gas Giant");
+        planet.rot = {0, 0, 18};
+        s.objs.push_back(planet);
+        Object rings = prim(ObjType::Disc, 1, {20, 60, -190}, V3(105.f), "Planet Rings");
+        rings.rot = {14, 0, 18}; rings.mat.texScale = 6;
+        s.objs.push_back(rings);
+        s.objs.push_back(prim(ObjType::Sphere, 2, {-4, 2.5f, 8}, V3(2.5f), "Chrome"));
+        s.cam.target = {0, 14, -20}; s.cam.dist = 46; s.cam.pitch = 2; s.cam.yaw = 6; s.cam.fov = 60;
+        break;
+    }
+    case 9: {
+        s.sky = skyNamed("Twilight");
+        s.sky.sunAlt = 4; s.sky.sunAz = 180; s.sky.stars = 0.5f; s.sky.haze = 0.3f;
+        s.objs.push_back(prim(ObjType::Ground, 1, {0, -2, 0}, V3(1.f), "Earth"));
+        s.objs.push_back(prim(ObjType::Water, 1, {0, 0.2f, 0}, V3(1.f), "Mirror Water"));
+        s.objs.push_back(kindTerrain(1, {-40, -2, -90}, {60, 22, 30}, "Snowy Peaks", TerrainKind::Alpine, 91));
+        s.objs.push_back(kindTerrain(2, {45, -2, -80}, {40, 14, 26}, "Snowy Peaks", TerrainKind::Mountains, 92));
+        s.objs.push_back(prim(ObjType::Cube, 1, {0, 7, -8}, {1.6f, 9, 0.4f}, "Obsidian"));
+        for (int k = 0; k < 3; k++)
+            s.objs.push_back(prim(ObjType::Stone, k + 1, {-3.f + k * 3 + rng.f(), 0.2f, -7.f + rng.f() * 2}, V3(0.5f + rng.f() * 0.4f, 0.3f, 0.5f + rng.f() * 0.4f), "Granite"));
+        s.cam.target = {0, 6, -8}; s.cam.dist = 34; s.cam.pitch = 3; s.cam.yaw = 0; s.cam.fov = 55;
+        break;
+    }
+    case 10: {
+        s.sky = skyNamed("Desert Heat");
+        s.sky.sunAz = 230; s.sky.sunAlt = 22;
+        s.objs.push_back(prim(ObjType::Ground, 1, {}, V3(1.f), "Desert Sand"));
+        s.objs.push_back(kindTerrain(1, {0, 0, 0}, {60, 4, 60}, "Desert Sand", TerrainKind::Dunes, 101));
+        s.objs.push_back(kindTerrain(2, {-30, 0, -90}, {45, 16, 30}, "Red Mesa", TerrainKind::Mesas, 102));
+        s.objs.push_back(kindTerrain(3, {50, 0, -80}, {35, 12, 30}, "Canyon Strata", TerrainKind::Canyon, 103));
+        Object arch = prim(ObjType::Torus, 1, {0, 1.5f, -12}, {9, 5, 9}, "Sandstone");
+        arch.rot = {90, 0, 0};
+        arch.mat.texScale = 0.6f;
+        s.objs.push_back(arch);
+        for (int k = 0; k < 4; k++)
+            s.objs.push_back(prim(ObjType::Stone, k + 1, {-10.f + k * 6 + rng.f() * 3, 0.8f, -4.f + rng.f() * 8}, V3(0.9f + rng.f(), 0.7f + rng.f() * 0.6f, 0.9f + rng.f()), "Sandstone"));
+        s.cam.target = {0, 6, -12}; s.cam.dist = 40; s.cam.pitch = 6; s.cam.yaw = 10; s.cam.fov = 55;
+        break;
+    }
+    case 11: {
+        s.sky = skyNamed("Golden Hour");
+        s.sky.sunAz = 260; s.sky.haze = 0.35f; s.sky.clouds = 0.45f;
+        s.objs.push_back(prim(ObjType::Ground, 1, {0, -4, 0}, V3(1.f), "Basalt"));
+        s.objs.push_back(prim(ObjType::Water, 1, {0, 0, 0}, V3(1.f), "Deep Ocean"));
+        Object v = kindTerrain(1, {0, -3, -20}, {32, 20, 32}, "Volcanic Rock", TerrainKind::Volcano, 111);
+        s.objs.push_back(v);
+        float rim = heightAt(v, 0.5f, 0.5f);
+        Object lava = prim(ObjType::Sphere, 1, {0, rim + 0.5f, -20}, {3.2f, 1.f, 3.2f}, "Molten Lava");
+        s.objs.push_back(lava);
+        Object glow = makeObject(ObjType::Light, 1);
+        glow.pos = {0, rim + 4, -20}; glow.lightColor = {1, 0.45f, 0.15f}; glow.lightPower = 3;
+        s.objs.push_back(glow);
+        s.objs.push_back(kindTerrain(2, {40, -3, -50}, {14, 5, 14}, "Alpine Meadow", TerrainKind::Archipelago, 112));
+        s.cam.target = {0, 8, -20}; s.cam.dist = 58; s.cam.pitch = 17; s.cam.yaw = 330; s.cam.fov = 50;
         break;
     }
     default: {
