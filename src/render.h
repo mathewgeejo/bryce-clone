@@ -7,16 +7,20 @@
 #include "scene.h"
 
 V3 skyColor(const Sky& k, V3 d);
-void renderImage(const Scene& s, int w, int h, uint32_t* out, bool aa);
+// quality: -1 = use the scene's render settings, 0 draft, 1 normal (adaptive AA), 2 premium (accumulated samples).
+void renderImage(const Scene& s, int w, int h, uint32_t* out, int quality = -1);
 
-// Progressive renderer: coarse-to-fine block passes followed by an adaptive anti-aliasing pass.
+// Progressive renderer: coarse-to-fine block passes, then adaptive anti-aliasing (normal)
+// or accumulated jittered samples with soft shadows, depth of field and blurry reflections (premium).
 class Renderer {
 public:
     ~Renderer() { cancel(); }
-    void start(const Scene& s, int w, int h, bool aa);
+    void start(const Scene& s, int w, int h, int quality = -1);
     void cancel();
+    void wait();
     bool busy() const { return running.load(); }
     bool hasImage() const { return w > 0; }
+    bool finished() const { return !running.load() && done.load(); }
     int width() const { return w; }
     int height() const { return h; }
     float progress() const { return prog.load(); }
@@ -25,11 +29,10 @@ public:
 private:
     void run();
     Scene sc;
-    int w = 0, h = 0;
-    bool aa = true;
+    int w = 0, h = 0, quality = 1;
     std::unique_ptr<std::atomic<uint32_t>[]> px;
     std::vector<V3> acc;
     std::thread th;
-    std::atomic<bool> stop{false}, running{false};
+    std::atomic<bool> stop{false}, running{false}, done{false};
     std::atomic<float> prog{0};
 };

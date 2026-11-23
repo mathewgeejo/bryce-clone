@@ -197,9 +197,9 @@ void makeTree(const TreeParams& p, Mesh& trunk, Mesh& leaves) {
         leaves.tri.insert(leaves.tri.end(), {b, b + 1, b + 2, b, b + 2, b + 3});
     };
     std::function<void(V3, V3, float, float, int)> branch;
-    branch = [&](V3 base, V3 dir, float len, float rad, int level) {
+    branch = [&](V3 base, V3 dir, float len, float radius, int level) {
         V3 tip = base + dir * len;
-        tube(trunk, base, tip, rad, rad * 0.7f);
+        tube(trunk, base, tip, radius, radius * 0.7f);
         if (level >= p.levels) {
             int cnt = std::max(1, (int)(12 * p.leafDensity));
             for (int i = 0; i < cnt; i++)
@@ -214,9 +214,9 @@ void makeTree(const TreeParams& p, Mesh& trunk, Mesh& leaves) {
             float sp = rad(p.spread * (0.75f + 0.5f * rng.f()));
             V3 perp = u * std::cos(ang) + w * std::sin(ang);
             V3 nd = normalize(dir * std::cos(sp) + perp * std::sin(sp) + V3(0, 0.15f, 0));
-            branch(lerp(base, tip, at), nd, len * (0.55f + 0.2f * rng.f()), rad * 0.6f, level + 1);
+            branch(lerp(base, tip, at), nd, len * (0.55f + 0.2f * rng.f()), radius * 0.6f, level + 1);
         }
-        branch(tip, normalize(dir + V3(rng.f() - 0.5f, 0.3f, rng.f() - 0.5f) * 0.25f), len * 0.65f, rad * 0.7f, level + 1);
+        branch(tip, normalize(dir + V3(rng.f() - 0.5f, 0.3f, rng.f() - 0.5f) * 0.25f), len * 0.65f, radius * 0.7f, level + 1);
     };
     branch(V3(0, 0, 0), V3(0, 1, 0), p.height * 0.42f, p.trunkRadius * p.height, 0);
     trunk.build();

@@ -86,8 +86,10 @@ struct Object {
     BoolMode boolMode = BoolMode::Neutral;
     bool hidden = false, locked = false;
     uint32_t seed = 1;
+    int treePart = 0;  // 0 none, 1 trunk, 2 foliage (mesh regenerated from `tree`)
+    TreeParams tree;
     std::shared_ptr<Heightfield> hf;
-    std::shared_ptr<Mesh> mesh;
+    std::shared_ptr<const Mesh> mesh;
     std::vector<Key> keys;
     // derived by update()
     M3 fwd, inv, nrm;
@@ -175,3 +177,9 @@ Scene makeDefaultScene();
 Scene makeEmptyScene();
 bool intersectScene(const Scene& s, const Ray& r, float tmax, Hit& h, int skip = -1);
 void wireframe(const Object& o, std::vector<V3>& segs);
+bool localBounds(const Object& o, V3& lo, V3& hi);
+bool worldBounds(const Object& o, V3& lo, V3& hi);
+void regenTree(Object& o);
+void addTree(Scene& s, const TreeParams& p, V3 pos, float size, const Material& trunk, const Material& foliage, int counter);
+const std::vector<std::string>& exampleNames();
+Scene makeExample(int i);

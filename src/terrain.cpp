@@ -126,18 +126,113 @@ void hfPlateau(Heightfield& f, float level) {
     f.computeNormals();
 }
 
-void hfBrush(Heightfield& f, float u, float v, float radius, float amount) {
+void hfBrush(Heightfield& f, float u, float v, float radius, float amount, BrushMode mode) {
     int N = f.res;
     float cx = u * (N - 1), cz = v * (N - 1), rp = std::max(1.f, radius * (N - 1));
     int x0 = std::max(0, (int)(cx - rp)), x1 = std::min(N - 1, (int)(cx + rp) + 1);
     int z0 = std::max(0, (int)(cz - rp)), z1 = std::min(N - 1, (int)(cz + rp) + 1);
+    std::vector<float> o = f.h;
+    float centre = o[std::min(N - 1, std::max(0, (int)cz)) * N + std::min(N - 1, std::max(0, (int)cx))];
     for (int z = z0; z <= z1; z++)
         for (int x = x0; x <= x1; x++) {
             float d2 = ((x - cx) * (x - cx) + (z - cz) * (z - cz)) / (rp * rp);
             if (d2 >= 1) continue;
-            float w = (1 - d2) * (1 - d2);
-            float& hv = f.h[z * N + x];
-            hv = clampf(hv + amount * w, 0, 1);
+            float w = (1 - d2) * (1 - d2), &hv = f.h[z * N + x];
+            if (mode == BrushMode::Raise) hv += amount * w;
+            else if (mode == BrushMode::Lower) hv -= amount * w;
+            else if (mode == BrushMode::Flatten) hv = lerpf(hv, centre, clampf(amount * 8 * w, 0, 1));
+            else {
+                float s = 0;
+                int c = 0;
+                for (int dz = -2; dz <= 2; dz++)
+                    for (int dx = -2; dx <= 2; dx++) {
+                        int xx = x + dx, zz = z + dz;
+                        if (xx >= 0 && zz >= 0 && xx < N && zz < N) { s += o[zz * N + xx]; c++; }
+                    }
+                hv = lerpf(hv, s / c, clampf(amount * 12 * w, 0, 1));
+            }
+            hv = clampf(hv, 0, 1);
+        }
+    f.computeNormals();
+}
+
+void hfTerrace(Heightfield& f, int levels) {
+    for (float& x : f.h) {
+        float s = x * levels, b = std::floor(s);
+        x = clampf((b + smoothstep(0.65f, 1.f, s - b)) / levels, 0, 1);
+    }
+    f.computeNormals();
+}
+
+void hfSpikes(Heightfield& f, uint32_t seed, int count) {
+    Rng r(seed * 2891336453u + 11);
+    int N = f.res;
+    for (int i = 0; i < count; i++) {
+        float cx = (0.15f + 0.7f * r.f()) * (N - 1), cz = (0.15f + 0.7f * r.f()) * (N - 1), rad = (0.02f + 0.05f * r.f()) * N, ht = 0.3f + 0.6f * r.f();
+        for (int z = std::max(0, (int)(cz - rad)); z <= std::min(N - 1, (int)(cz + rad) + 1); z++)
+            for (int x = std::max(0, (int)(cx - rad)); x <= std::min(N - 1, (int)(cx + rad) + 1); x++) {
+                float d = std::sqrt((x - cx) * (x - cx) + (z - cz) * (z - cz)) / rad;
+                if (d < 1) f.h[z * N + x] = std::max(f.h[z * N + x], ht * std::pow(1 - d, 1.6f));
+            }
+    }
+    f.computeNormals();
+}
+
+void hfCrater(Heightfield& f, float u, float v, float radius, float depth) {
+    int N = f.res;
+    for (int z = 0; z < N; z++)
+        for (int x = 0; x < N; x++) {
+            float dx = x / (float)(N - 1) - u, dz = z / (float)(N - 1) - v, d = std::sqrt(dx * dx + dz * dz) / radius;
+            float bowl = d < 1 ? -(1 - d * d) * depth : 0, rim = depth * 0.6f * std::exp(-(d - 1) * (d - 1) * 18);
+            f.h[z * N + x] = clampf(f.h[z * N + x] + bowl + rim, 0, 1);
+        }
+    f.computeNormals();
+}
+
+void hfRoundEdges(Heightfield& f) {
+    int N = f.res;
+    for (int z = 0; z < N; z++)
+        for (int x = 0; x < N; x++) {
+            float u = x / (float)(N - 1) * 2 - 1, v = z / (float)(N - 1) * 2 - 1;
+            f.h[z * N + x] *= smoothstep(1.f, 0.55f, std::sqrt(u * u + v * v));
+        }
+    f.computeNormals();
+}
+
+void hfMound(Heightfield& f) {
+    int N = f.res;
+    for (int z = 0; z < N; z++)
+        for (int x = 0; x < N; x++) {
+            float u = x / (float)(N - 1) - 0.5f, v = z / (float)(N - 1) - 0.5f;
+            f.h[z * N + x] = clampf(f.h[z * N + x] + 0.35f * std::exp(-(u * u + v * v) * 14), 0, 1);
+        }
+    f.computeNormals();
+}
+
+void hfNoise(Heightfield& f, uint32_t seed, float amount) {
+    int N = f.res;
+    V3 off((seed % 997) * 1.37f, 0, (seed % 389) * 2.11f);
+    for (int z = 0; z < N; z++)
+        for (int x = 0; x < N; x++) {
+            V3 p(x * 24.f / N + off.x, 0.5f, z * 24.f / N + off.z);
+            f.h[z * N + x] = clampf(f.h[z * N + x] + fbm(p, 3) * amount, 0, 1);
+        }
+    f.computeNormals();
+}
+
+void hfSharpen(Heightfield& f) {
+    std::vector<float> o = f.h;
+    hfSmooth(f);
+    for (size_t i = 0; i < o.size(); i++) f.h[i] = clampf(o[i] + (o[i] - f.h[i]) * 1.5f, 0, 1);
+    f.computeNormals();
+}
+
+void hfFromImage(Heightfield& f, const Image& img) {
+    int N = f.res;
+    for (int z = 0; z < N; z++)
+        for (int x = 0; x < N; x++) {
+            V3 c = img.sample((x + 0.5f) / N, (z + 0.5f) / N);
+            f.h[z * N + x] = clampf(c.x * 0.3f + c.y * 0.59f + c.z * 0.11f, 0, 1);
         }
     f.computeNormals();
 }
