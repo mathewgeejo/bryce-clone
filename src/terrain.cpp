@@ -35,6 +35,8 @@ void hfFractal(Heightfield& f, uint32_t seed, float rough, bool ridged) {
             f.h[z * N + x] = sum / norm * smoothstep(0, 0.22f, e);
         }
     hfNormalize(f);
+    for (float& v : f.h) v = std::pow(v, 1.6f);
+    f.computeNormals();
 }
 
 void hfSmooth(Heightfield& f) {
@@ -60,7 +62,7 @@ void hfErode(Heightfield& f, int drops, uint32_t seed) {
     int N = f.res;
     auto& h = f.h;
     Rng r(seed * 747796405u + 7);
-    const float inertia = 0.05f, capK = 2.f, minSlope = 0.002f, depK = 0.3f, eroK = 0.15f, evap = 0.03f, gravity = 4.f;
+    const float inertia = 0.05f, capK = 2.f, minSlope = 0.002f, depK = 0.3f, eroK = 0.05f, evap = 0.03f, gravity = 4.f;
     auto sample = [&](float x, float y, float& gx, float& gy) {
         int ix = (int)x, iy = (int)y;
         float fx = x - ix, fy = y - iy;
