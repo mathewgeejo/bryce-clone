@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <iterator>
 #include <map>
 #include <string>
 #include <vector>
@@ -27,9 +28,10 @@ struct R {
 const int TOP = 98, LEFT = 170, RIGHT = 236, STATUS = 24, TIMELINE = 34;
 const int NANO_W = 150, NANO_H = 112, ICW = 48, ICH = 32, STW = 64, STH = 40;
 const int VIEW_ID = 1000000;
+constexpr char APP_NAME[] = "Two Hoodoos and a Floppy";
 const ObjType kCreate[] = {ObjType::Sphere, ObjType::Cube,    ObjType::Cylinder, ObjType::Cone,  ObjType::Pyramid, ObjType::Torus,
                            ObjType::Disc,   ObjType::Square,  ObjType::Stone,    ObjType::Terrain, ObjType::Lattice, ObjType::Ground,
-                           ObjType::Water,  ObjType::Cloud,   ObjType::Light,    ObjType::Spotlight, ObjType::Parallel};
+                           ObjType::Water,  ObjType::Cloud,   ObjType::Light,    ObjType::Spotlight, ObjType::Parallel, ObjType::Metaball};
 
 HWND gWnd;
 int gW = 1440, gH = 900;
@@ -51,11 +53,11 @@ std::vector<int> gSelSet;
 int gSel = -1, gTab = 0, gView = 0, gTool = 0;
 bool gShowRender = false;
 Renderer gMainR, gNanoR, gLabR;
-enum Lab { LabNone, LabMat, LabSky, LabTerrain, LabTree, LabRender, LabTools, LabExamples } gLab = LabNone;
+enum Lab { LabNone, LabMat, LabSky, LabTerrain, LabTree, LabRender, LabTools, LabExamples, LabObject, LabAttributes } gLab = LabNone;
 Scene gLabBackup;
 bool gLabChanged = false, gNanoDirty = true, gLabDirty = false, gMainWasBusy = false;
 DWORD gLastChange = 0, gRenderStart = 0;
-std::string gStatus = "Welcome to Canyon 3D. Create objects from the Create palette, or open Examples, then press Render.", gPath;
+std::string gStatus = "Open Examples or add objects from the Create palette, then press Render.", gPath;
 V3 gOrthoC[4];
 float gOrthoS[4] = {40, 40, 40, 40};
 int gCounter[(int)ObjType::COUNT] = {}, gTreeCounter = 0;
@@ -64,7 +66,7 @@ int gListScroll = 0;
 uint32_t gSeed = 100;
 float gBrushSize = 0.06f, gBrushStr = 0.5f, gRough = 0.5f, gTerraces = 6;
 BrushMode gBrush = BrushMode::Raise;
-enum Drag { DragNone, DragObj, DragCam, DragSculpt } gDrag = DragNone;
+enum Drag { DragNone, DragObj, DragCam, DragSculpt, DragLightAim } gDrag = DragNone;
 const int TOOL_SCULPT = 3;
 struct SculptHit { int obj = -1; float u = 0, v = 0; } gSculptHover, gSculpt;
 DWORD gSculptLast = 0;
@@ -77,6 +79,8 @@ bool gHavePre = false, gChanged = false, gNoPush = false, gDirty = false;
 int gEditObj = -1;
 std::string gEditBuf;
 int gQuickCat = 0, gSkyCat = 0, gMatCat = 0, gLabSkyCat = 0;
+bool gMatLayers = false;
+int gLayerIndex = 0;
 Library gLib;
 std::string gLibPath;
 TreeParams gTreeP;
@@ -228,7 +232,10 @@ bool iconButton(R r, const std::vector<uint32_t>& img, int iw, int ih, const cha
     bool h = hov(r), act = gActive == id && h;
     vgrad(r, on ? rgb(126, 142, 182) : (h ? rgb(134, 134, 142) : rgb(102, 102, 108)), on ? rgb(70, 82, 120) : rgb(66, 66, 72));
     bevel(r, act);
-    if (!img.empty()) blit({r.x + (r.w - iw) / 2, r.y + 4, iw, ih}, img.data(), iw, ih);
+    if (!img.empty()) {
+        int w = std::min(iw, r.w - 4), h = std::max(1, ih * w / iw);
+        blit({r.x + (r.w - w) / 2, r.y + 4 + (ih - h) / 2, w, h}, img.data(), iw, ih);
+    }
     else if (glyph) textIn({r.x, r.y + 4, r.w, ih}, glyph, rgb(255, 230, 150), gTitle);
     textIn({r.x, r.y + r.h - 16, r.w, 14}, text, TXT, gSmall);
     return clicked(r, id);
@@ -334,7 +341,7 @@ void swatch(R r, const char* text, V3& c) {
 
 int modalBox(const char* text, UINT flags) {
     gModal = true;
-    int r = MessageBoxA(gWnd, text, "Canyon 3D", flags);
+    int r = MessageBoxA(gWnd, text, APP_NAME, flags);
     gModal = false;
     gIn.down = false;
     gActive = 0;
@@ -451,6 +458,43 @@ void zoomView(float steps) {
     if (gView == 0) gScene.cam.dist = clampf(gScene.cam.dist * f, 1.f, 5000.f);
     else gOrthoS[gView] = clampf(gOrthoS[gView] * f, 1.f, 5000.f);
     sceneChanged();
+}
+
+bool sceneBounds(bool selected, V3& lo, V3& hi) {
+    bool any = false;
+    for (int i = 0; i < (int)gScene.objs.size(); i++) {
+        const Object& o = gScene.objs[i];
+        V3 a, b;
+        if (o.hidden || (selected && !isSel(i)) || !worldBounds(o, a, b)) continue;
+        if (!any) { lo = a; hi = b; any = true; continue; }
+        lo = {std::min(lo.x, a.x), std::min(lo.y, a.y), std::min(lo.z, a.z)};
+        hi = {std::max(hi.x, b.x), std::max(hi.y, b.y), std::max(hi.z, b.z)};
+    }
+    return any;
+}
+
+void frameView(bool selection) {
+    V3 lo, hi;
+    if (!sceneBounds(selection, lo, hi)) {
+        if (!selection || !validSel() || gScene.objs[gSel].hidden) {
+            gStatus = selection ? "Select a visible object to frame it." : "There are no finite objects to frame.";
+            return;
+        }
+        lo = hi = gScene.objs[gSel].pos;
+    }
+    V3 center = (lo + hi) * 0.5f;
+    float radius = std::max(0.75f, length(hi - center));
+    float aspect = std::min(1.f, (float)gVP.w / gVP.h);
+    if (gView == 0) {
+        gScene.cam.target = center;
+        float fov = std::atan(std::tan(rad(gScene.cam.fov * 0.5f)) * aspect);
+        gScene.cam.dist = clampf(radius * 1.18f / std::sin(fov), 1.f, 5000.f);
+        sceneChanged();
+    } else {
+        gOrthoC[gView] = center;
+        gOrthoS[gView] = clampf(radius * 1.18f / aspect, 1.f, 5000.f);
+    }
+    gShowRender = false;
 }
 
 void addObject(Object o) {
@@ -603,7 +647,7 @@ bool fileDialog(bool save, const char* filter, const char* ext, std::string& out
     return ok != 0;
 }
 
-const char* SCENE_FILTER = "Canyon 3D Scene (*.c3d)\0*.c3d\0All Files (*.*)\0*.*\0";
+const char* SCENE_FILTER = "Landscape Scene (*.c3d)\0*.c3d\0All Files (*.*)\0*.*\0";
 const char* BMP_FILTER = "Bitmap Image (*.bmp)\0*.bmp\0";
 
 std::string baseName(const std::string& p) {
@@ -624,6 +668,30 @@ void actImport() {
     o.scl = V3(3.f);
     gStatus = "Imported " + o.name + " (" + std::to_string(m->triCount()) + " triangles).";
     addObject(o);
+}
+
+bool loadPicture(Picture& picture) {
+    std::string path;
+    if (!fileDialog(false, BMP_FILTER, "bmp", path)) return false;
+    auto image = loadImageCached(path, true);
+    if (!image) { gStatus = "Could not read picture " + path + "."; return false; }
+    picture.path = path;
+    picture.aspect = (float)image->w / image->h;
+    picture.image = std::move(image);
+    return true;
+}
+
+void actCreatePicture() {
+    Picture picture;
+    if (!loadPicture(picture)) return;
+    Object o = makeObject(ObjType::Picture, ++gCounter[(int)ObjType::Picture]);
+    o.name = baseName(picture.path);
+    o.picture = std::move(picture);
+    o.pos.x = gScene.cam.target.x;
+    o.pos.z = gScene.cam.target.z;
+    o.rot.y = gScene.cam.yaw;
+    gStatus = "Imported picture " + o.name + ".";
+    addObject(std::move(o));
 }
 
 bool confirmDiscard() { return !gDirty || modalBox("Discard unsaved changes to the current scene?", MB_YESNO | MB_ICONQUESTION) == IDYES; }
@@ -804,11 +872,20 @@ std::vector<int> treeMembers() {
     return r;
 }
 
+Lab objectEditor(const Object& o) {
+    if (isHeightfield(o.type)) return LabTerrain;
+    if (o.treePart) return LabTree;
+    if (o.type == ObjType::Metaball || o.type == ObjType::Picture || o.type == ObjType::Stone ||
+        o.type == ObjType::Torus || o.type == ObjType::Mesh || isLight(o.type)) return LabObject;
+    return LabNone;
+}
+
 void openLab(Lab l) {
-    if (l == LabMat || l == LabTerrain) {
+    if (l == LabNone) return;
+    if (l == LabMat || l == LabTerrain || l == LabObject || l == LabAttributes) {
         if (!validSel()) { gStatus = "Select an object first."; return; }
         Object& o = gScene.objs[gSel];
-        if (l == LabMat && isLight(o.type)) { gStatus = "Lights have no material; edit color and power in the side panel."; return; }
+        if (l == LabMat && isLight(o.type)) { gStatus = "Press E to open the selected light's editor."; return; }
         if (l == LabTerrain && (!isHeightfield(o.type) || !o.hf)) { gStatus = "Select a terrain or lattice to open the Terrain Editor."; return; }
     }
     if (l == LabTree) {
@@ -818,6 +895,7 @@ void openLab(Lab l) {
     }
     if (l == LabTools && gSelSet.empty()) { gStatus = "Select objects to use the Edit Tools."; return; }
     commitRename();
+    if (l == LabMat) { gMatLayers = false; gLayerIndex = 0; }
     gLabBackup = gScene.snapshot();
     gLab = l;
     gLabChanged = false;
@@ -866,7 +944,7 @@ void startLabPreview() {
         s.cam.dist = 10; s.cam.pitch = 8; s.cam.yaw = 30; s.cam.fov = 45;
         gLabR.start(s, 320, 320, 1);
     } else if (gLab == LabSky) gLabR.start(gScene, 340, 255, 0);
-    else if (gLab == LabTerrain) gLabR.start(gScene, 320, 240, 0);
+    else if (gLab == LabTerrain || gLab == LabObject) gLabR.start(gScene, 320, 240, 0);
 }
 
 // ---------------------------------------------------------------- panels
@@ -892,7 +970,7 @@ void drawTop() {
     const char* tabs[3] = {"Create", "Edit", "Sky & Fog"};
     for (int i = 0; i < 3; i++)
         if (button({10 + i * 96, 4, 92, 22}, tabs[i], gTab == i, gBold)) gTab = i;
-    textIn({310, 4, 200, 22}, "CANYON 3D", rgb(240, 240, 245), gTitle, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    textIn({310, 4, 260, 22}, APP_NAME, rgb(240, 240, 245), gTitle, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     const char* fb[6] = {"New", "Open...", "Merge...", "Save", "Save As...", "Examples..."};
     int fx = gW - 6 * 76 - 6;
     for (int i = 0; i < 6; i++)
@@ -907,13 +985,16 @@ void drawTop() {
 
     if (gTab == 0) {
         int x = 10;
+        int step = std::clamp((gW - 16) / ((int)std::size(kCreate) + 3), 38, 60), width = step - 4;
         for (ObjType t : kCreate) {
-            if (iconButton({x, 30, 56, 62}, gIcons[(int)t], ICW, ICH, objTypeName(t))) createObject(t);
-            x += 60;
+            if (iconButton({x, 30, width, 62}, gIcons[(int)t], ICW, ICH, objTypeName(t))) createObject(t);
+            x += step;
         }
-        if (iconButton({x, 30, 56, 62}, gTreeIcon, ICW, ICH, "Tree")) createTree();
-        x += 60;
-        if (iconButton({x, 30, 56, 62}, {}, ICW, ICH, "Import", false, "OBJ")) defer(actImport);
+        if (iconButton({x, 30, width, 62}, gTreeIcon, ICW, ICH, "Tree")) createTree();
+        x += step;
+        if (iconButton({x, 30, width, 62}, {}, ICW, ICH, "Picture", false, "BMP")) defer(actCreatePicture);
+        x += step;
+        if (iconButton({x, 30, width, 62}, {}, ICW, ICH, "Import", false, "OBJ")) defer(actImport);
     } else if (gTab == 1) {
         const char* tools[4] = {"Move", "Rotate", "Resize", "Sculpt"};
         for (int i = 0; i < 4; i++)
@@ -1012,6 +1093,9 @@ void drawLeft() {
         }
     }
     y += 30;
+    if (button({x, y, 72, 22}, "Frame Sel", false, gSmall)) frameView(true);
+    if (button({x + 76, y, 72, 22}, "Frame All", false, gSmall)) frameView(false);
+    y += 30;
 
     int tid = newId();
     R tb{x + 2, y, 84, 84};
@@ -1059,6 +1143,18 @@ void row3(int x, int& y, int w, const char* title, V3& v, float speed, float min
     ch |= dragF({x + cw + 4, y, cw, 20}, "Y", v.y, speed, minV);
     ch |= dragF({x + 2 * (cw + 4), y, cw, 20}, "Z", v.z, speed, minV);
     y += 26;
+    if (ch) sceneChanged();
+}
+
+void lightControls(Object& light, int x, int& y, int w) {
+    swatch({x, y, w, 24}, "Light Color", light.lightColor);
+    y += 28;
+    bool ch = slider({x, y, w, 22}, "Power", light.lightPower, 0, 5); y += 26;
+    if (light.type == ObjType::Spotlight) {
+        ch |= slider({x, y, w, 22}, "Cone Angle", light.spotAngle, 2, 85, "%.0f"); y += 26;
+        ch |= slider({x, y, w, 22}, "Softness", light.spotSoft, 0, 1); y += 26;
+    }
+    ch |= slider({x, y, w, 22}, "Soft Shadow Size", light.lightSize, 0, 3); y += 28;
     if (ch) sceneChanged();
 }
 
@@ -1114,9 +1210,10 @@ void drawRight() {
             textIn({x + 66, y, w - 66, 16}, o.mat.name.c_str(), TXT, gFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
             y += 20;
             int bw = (w - 4) / 2;
-            if (button({x, y, isHeightfield(o.type) || o.treePart ? bw : w, 22}, "Materials Lab...")) openLab(LabMat);
-            if (isHeightfield(o.type) && button({x + bw + 4, y, bw, 22}, "Terrain Editor...")) openLab(LabTerrain);
-            if (o.treePart && button({x + bw + 4, y, bw, 22}, "Tree Lab...")) openLab(LabTree);
+            Lab editor = objectEditor(o);
+            if (button({x, y, editor != LabNone ? bw : w, 22}, "Materials Lab...")) openLab(LabMat);
+            const char* editLabel = editor == LabTerrain ? "Terrain Editor..." : (editor == LabTree ? "Tree Lab..." : "Object Editor...");
+            if (editor != LabNone && button({x + bw + 4, y, bw, 22}, editLabel)) openLab(editor);
             y += 28;
             if (isCsgCapable(o.type)) {
                 label(x, y, "Boolean");
@@ -1128,16 +1225,9 @@ void drawRight() {
                 y += 28;
             }
         } else {
-            swatch({x, y, w, 24}, "Light Color", o.lightColor);
+            if (button({x, y, w, 22}, "Light Editor...")) openLab(LabObject);
             y += 28;
-            bool ch = slider({x, y, w, 22}, "Power", o.lightPower, 0, 5);
-            y += 26;
-            if (o.type == ObjType::Spotlight) {
-                ch |= slider({x, y, w, 22}, "Cone Angle", o.spotAngle, 2, 85, "%.0f"); y += 26;
-                ch |= slider({x, y, w, 22}, "Softness", o.spotSoft, 0, 1); y += 26;
-            }
-            ch |= slider({x, y, w, 22}, "Soft Shadow Size", o.lightSize, 0, 3); y += 28;
-            if (ch) sceneChanged();
+            lightControls(o, x, y, w);
         }
         int tw = (w - 8) / 3;
         std::string gl = o.group ? "Group " + std::to_string(o.group) : "No group";
@@ -1176,7 +1266,7 @@ int pick(int mx, int my) {
     float hh = gVP.h * 0.5f, cx = gVP.x + gVP.w * 0.5f, cy = gVP.y + hh;
     for (int i = 0; i < (int)gScene.objs.size(); i++) {
         const Object& o = gScene.objs[i];
-        if (!isLight(o.type) || o.hidden) continue;
+        if (o.hidden || (!isLight(o.type) && !(gIn.alt && o.type == ObjType::Metaball))) continue;
         V3 c = vb.toCam(o.pos);
         if (!vb.ortho && c.z < 0.1f) continue;
         float d = vb.ortho ? 1.f : c.z;
@@ -1236,7 +1326,7 @@ void dragObject() {
         M3 ry = rotY(rad(yaw));
         for (int i : s) {
             Object& o = gScene.objs[i];
-            if (gIn.shift) o.rot.z += dx * 0.5f;
+            if (gIn.shift || (o.type == ObjType::Picture && o.picture.billboard)) o.rot.z += dx * 0.5f;
             else { o.rot.y += yaw; o.rot.x += dy * 0.5f; }
             if (s.size() > 1) o.pos = c + ry * (o.pos - c);
         }
@@ -1250,6 +1340,21 @@ void dragObject() {
             if (s.size() > 1) o.pos = c + (o.pos - c) * f;
         }
     }
+    sceneChanged();
+}
+
+V3 lightAimTip(const Object& o) { return o.pos + o.lightAxis() * (o.type == ObjType::Spotlight ? 4.f : 5.f); }
+
+void dragLightAim() {
+    Object& o = gScene.objs[gSel];
+    ViewBasis vb = curBasis();
+    V3 tip = lightAimTip(o);
+    float wpp = (vb.ortho ? 1.f : std::max(0.1f, vb.toCam(tip).z)) * vb.k / (gVP.h * 0.5f);
+    V3 aim = normalize(tip - o.pos + (vb.r * (float)gIn.dx - vb.u * (float)gIn.dy) * wpp);
+    if (length(aim) < 0.5f) return;
+    o.rot.x = std::acos(clampf(-aim.y, -1, 1)) * 180 / PI;
+    if (std::fabs(aim.x) + std::fabs(aim.z) > 1e-5f) o.rot.y = std::atan2(-aim.x, -aim.z) * 180 / PI;
+    o.rot.z = 0;
     sceneChanged();
 }
 
@@ -1292,7 +1397,7 @@ void drawViewport() {
             COLORREF c = isInfinite(o.type) ? rgb(58, 78, 122) : rgb(24, 42, 140);
             if (isLight(o.type)) c = sel ? rgb(255, 140, 0) : rgb(240, 220, 60);
             else if (sel) c = i == gSel ? rgb(225, 28, 28) : rgb(235, 90, 70);
-            else if (o.boolMode == BoolMode::Negative) c = rgb(20, 110, 40);
+            else if (o.boolMode == BoolMode::Negative || (o.type == ObjType::Metaball && o.metaNegative)) c = rgb(20, 110, 40);
             else if (o.boolMode == BoolMode::Intersect) c = rgb(120, 40, 140);
             else if (o.locked) c = rgb(70, 70, 76);
             SetDCPenColor(gDC, c);
@@ -1304,6 +1409,81 @@ void drawViewport() {
             if (!isSel(i) && !gScene.objs[i].hidden) drawObj(i);
         for (int i : gSelSet)
             if (i < (int)gScene.objs.size()) drawObj(i);
+        if (validSel() && gTool != TOOL_SCULPT) {
+            const Object& selected = gScene.objs[gSel];
+            R aim{};
+            if (!selected.hidden && !selected.locked && (selected.type == ObjType::Spotlight || selected.type == ObjType::Parallel)) {
+                V3 tip = lightAimTip(selected), c = vb.toCam(tip);
+                float d = vb.ortho ? 1.f : c.z;
+                if (d > 0.1f) {
+                    int x = (int)clampf(cx + c.x / (d * vb.k) * hh, -30000, 30000);
+                    int y = (int)clampf(cy - c.y / (d * vb.k) * hh, -30000, 30000);
+                    SetDCPenColor(gDC, rgb(255, 218, 120));
+                    seg(selected.pos, tip);
+                    if (vp.in(x, y) && vp.w >= 38 && vp.h >= 20) {
+                        aim = {std::clamp(x - 19, vp.x, vp.x + vp.w - 38), std::clamp(y - 10, vp.y, vp.y + vp.h - 20), 38, 20};
+                        bool hover = hov(aim);
+                        if (hover && gIn.pressed && gActive == 0) { gActive = VIEW_ID; gDrag = DragLightAim; }
+                        fill(aim, hover ? rgb(120, 88, 37) : rgb(63, 52, 34));
+                        bevel(aim, gActive == VIEW_ID && gDrag == DragLightAim);
+                        textIn(aim, "Aim", TXT, gSmall);
+                    }
+                }
+            }
+            V3 lo, hi;
+            bool bounded = sceneBounds(true, lo, hi);
+            V3 center = bounded ? (lo + hi) * 0.5f : gScene.objs[gSel].pos;
+            V3 c = vb.toCam(center);
+            float depth = vb.ortho ? 1.f : c.z;
+            if (depth > 0.1f) {
+                V3 corner[8];
+                SetDCPenColor(gDC, rgb(255, 218, 120));
+                if (bounded) {
+                    for (int i = 0; i < 8; i++) corner[i] = {(i & 1) ? hi.x : lo.x, (i & 2) ? hi.y : lo.y, (i & 4) ? hi.z : lo.z};
+                    for (int i = 0; i < 8; i++)
+                        for (int bit : {1, 2, 4})
+                            if (!(i & bit)) seg(corner[i], corner[i | bit]);
+                }
+                float screenX = cx + c.x / (depth * vb.k) * hh, screenY = cy - c.y / (depth * vb.k) * hh;
+                float bottom = screenY;
+                if (bounded) for (V3 p : corner) {
+                    V3 q = vb.toCam(p);
+                    float d = vb.ortho ? 1.f : q.z;
+                    if (d > 0.1f) bottom = std::max(bottom, cy - q.y / (d * vb.k) * hh);
+                }
+                if (screenX >= vp.x && screenX < vp.x + vp.w && screenY >= vp.y && screenY < vp.y + vp.h) {
+                    const int w = 74, gap = 4;
+                    int left = std::clamp((int)screenX - (w * 3 + gap * 2) / 2, vp.x + 4, std::max(vp.x + 4, vp.x + vp.w - 3 * (w + gap)));
+                    int y = std::clamp((int)clampf(bottom, 0, (float)(vp.y + vp.h)) + 9,
+                                       vp.y + 30, std::max(vp.y + 30, vp.y + vp.h - 53));
+                    if (aim.w && left < aim.x + aim.w && left + 3 * (w + gap) > aim.x && y < aim.y + aim.h && y + 47 > aim.y) {
+                        if (aim.y - 51 >= vp.y + 30) y = aim.y - 51;
+                        else if (aim.y + 24 <= vp.y + vp.h - 53) y = aim.y + 24;
+                    }
+                    const char* tools[] = {"Move", "Rotate", "Scale"};
+                    bool lightsOnly = std::all_of(gSelSet.begin(), gSelSet.end(), [](int i) { return isLight(gScene.objs[i].type); });
+                    for (int i = 0; i < 3; i++) {
+                        if (i == 2 && lightsOnly) continue;
+                        R handle{left + i * (w + gap), y, w, 22};
+                        if (hov(handle) && gIn.pressed && gActive == 0) {
+                            gActive = VIEW_ID;
+                            gDrag = DragObj;
+                            gTool = i;
+                        }
+                        bool active = gActive == VIEW_ID && gDrag == DragObj && gTool == i;
+                        vgrad(handle, hov(handle) || active ? rgb(103, 105, 137) : rgb(78, 80, 103), rgb(43, 45, 59));
+                        bevel(handle, active);
+                        textIn(handle, tools[i], TXT, gSmall);
+                    }
+                    const Object& o = gScene.objs[gSel];
+                    y += 25;
+                    if (button({left, y, w, 22}, "A Attributes", false, gSmall)) openLab(LabAttributes);
+                    if (!isLight(o.type) && button({left + w + gap, y, w, 22}, "M Material", false, gSmall)) openLab(LabMat);
+                    Lab editor = objectEditor(o);
+                    if (editor != LabNone && button({left + 2 * (w + gap), y, w, 22}, "E Edit", false, gSmall)) openLab(editor);
+                }
+            }
+        }
         if (gTool == TOOL_SCULPT) {
             gSculptHover = gDrag == DragSculpt && gIn.down ? gSculpt : (hov(vp) ? sculptPick(gIn.mx, gIn.my) : SculptHit());
             if (gSculptHover.obj >= 0) {
@@ -1354,7 +1534,7 @@ void drawViewport() {
             gStatus = "Sculpting " + gScene.objs[sh.obj].name + ": hold to build up, Ctrl inverts, Shift smooths, [ ] resize brush.";
         } else {
             int p = pick(gIn.mx, gIn.my);
-            if (p >= 0 && !(gIn.shift || isSel(p))) selectObj(p, false, gIn.alt);
+            if (p >= 0 && !gIn.shift && (gIn.alt || !isSel(p))) selectObj(p, false, gIn.alt);
             else if (p >= 0 && gIn.shift) selectObj(p, true, gIn.alt);
             else if (p >= 0) gSel = p;
             else if (!gIn.shift) clearSel();
@@ -1369,6 +1549,7 @@ void drawViewport() {
         if (now - gSculptLast >= 30) { gSculptLast = now; sculptStep(); }
     } else if (gActive == VIEW_ID && gIn.down && (gIn.dx || gIn.dy)) {
         if (gDrag == DragObj && validSel()) dragObject();
+        else if (gDrag == DragLightAim && validSel()) dragLightAim();
         else if (gDrag == DragCam) {
             if (gView == 0) orbitCam((float)gIn.dx, (float)gIn.dy);
             else panView((float)gIn.dx, (float)gIn.dy);
@@ -1455,6 +1636,80 @@ void preview(R pv, const char* caption) {
     textIn({pv.x, pv.y + pv.h + 4, pv.w, 18}, gLabR.busy() ? "Rendering preview..." : caption, TXT_DIM, gSmall);
 }
 
+void drawObjectLab() {
+    if (!validSel()) { closeLab(true); return; }
+    Object& o = gScene.objs[gSel];
+    R p = panel(660, 350, std::string(objTypeName(o.type)) + " Editor  -  " + o.name);
+    int x = p.x + 16, y = p.y + 46;
+    bool ch = false;
+    if (o.type == ObjType::Picture) {
+        Picture& picture = o.picture;
+        int sel = gSel;
+        if (button({x, y, 288, 24}, "Replace BMP..."))
+            defer([sel] { if (loadPicture(gScene.objs[sel].picture)) sceneChanged(); });
+        std::string filename = picture.image ? baseName(picture.path) : "Missing image: " + baseName(picture.path);
+        textIn({x, y + 28, 288, 18}, filename.c_str(), TXT_DIM, gSmall, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        ch |= toggle({x, y + 52, 142, 24}, "Face Camera", picture.billboard);
+        ch |= toggle({x + 146, y + 52, 142, 24}, "Chroma Cutout", picture.chroma);
+        ch |= toggle({x, y + 82, 142, 24}, "Cast Shadows", picture.shadows);
+        ch |= toggle({x + 146, y + 82, 142, 24}, "In Reflections", picture.reflections);
+        if (picture.chroma) {
+            swatch({x, y + 112, 288, 24}, "Key Color", picture.keyColor);
+            ch |= slider({x, y + 142, 288, 24}, "Key Tolerance", picture.keyTolerance, 0, 1);
+        }
+    } else if (o.type == ObjType::Metaball) {
+        ch |= slider({x, y, 288, 24}, "Influence Radius", o.metaRadius, 0.2f, 4.f);
+        ch |= slider({x, y + 30, 288, 24}, "Field Strength", o.metaStrength, 0.1f, 4.f);
+        ch |= toggle({x, y + 60, 288, 24}, "Subtract From Field", o.metaNegative);
+        note({x, y + 96, 288, 82}, "Group overlapping metaballs to fuse them. A subtractive ball removes field inside that group. Group Boolean primitives with the balls to cut or intersect the fused shape.");
+    } else if (o.type == ObjType::Torus) {
+        TorusShape& t = o.torus;
+        if (slider({x, y, 288, 24}, "Ring Radius", t.major, 0.1f, 3)) {
+            t.minor = std::min(t.minor, t.major * 0.98f);
+            ch = true;
+        }
+        ch |= slider({x, y + 30, 288, 24}, "Tube Radius", t.minor, 0.04f, t.major * 0.98f);
+        ch |= slider({x, y + 60, 288, 24}, "Tube Height Ratio", t.section, 0.2f, 3);
+        ch |= slider({x, y + 90, 288, 24}, "Start Angle", t.start, 0, 360, "%.0f");
+        ch |= slider({x, y + 120, 288, 24}, "Sweep Angle", t.sweep, 5, 360, "%.0f");
+    } else if (o.type == ObjType::Stone) {
+        int seed = (int)std::min(o.seed, 1000000u);
+        if (sliderI({x, y, 288, 24}, "Seed", seed, 0, 1000000)) { o.seed = (uint32_t)seed; ch = true; }
+        if (button({x, y + 30, 288, 24}, "New Seed")) { o.seed = (++gSeed * 7919u) % 1000000u; ch = true; }
+        ch |= slider({x, y + 60, 288, 24}, "Irregularity", o.stone.irregularity, 0, 2);
+        ch |= slider({x, y + 90, 288, 24}, "Blockiness", o.stone.blockiness, 0, 1);
+        ch |= slider({x, y + 120, 288, 24}, "Smoothing", o.stone.smoothing, 0, 1);
+    } else if (o.type == ObjType::Mesh) {
+        std::string info = o.mesh ? std::to_string(o.mesh->v.size()) + " vertices  /  " +
+            std::to_string(o.mesh->triCount()) + " triangles" : "No mesh data";
+        label(x, y, info.c_str(), 288);
+        ch |= toggle({x, y + 26, 288, 24}, "Flat Shading", o.flatMesh);
+        swatch({x, y + 70, 288, 24}, "Base Color", o.mat.color1);
+        ch |= slider({x, y + 100, 288, 24}, "Diffuse", o.mat.diffuse, 0, 1);
+    } else if (isLight(o.type)) {
+        int ly = y;
+        lightControls(o, x, ly, 288);
+        if (o.type != ObjType::Light) row3(x, ly, 288, "Aim Rotation", o.rot, 0.5f);
+    }
+    if (ch) sceneChanged();
+    preview({p.x + 324, y, 320, 240}, "Scene preview");
+    labFooter(p);
+}
+
+void drawAttributesLab() {
+    if (!validSel()) { closeLab(true); return; }
+    Object& o = gScene.objs[gSel];
+    R p = panel(390, 280, "Attributes  -  " + o.name);
+    int x = p.x + 20, y = p.y + 48, w = p.w - 40;
+    row3(x, y, w, "Position", o.pos, 0.05f);
+    if (o.type != ObjType::Light) row3(x, y, w, "Rotation", o.rot, 0.5f);
+    if (!isLight(o.type)) row3(x, y, w, "Size", o.scl, 0.02f, 0.01f);
+    bool ch = toggle({x, y + 6, 168, 24}, "Hidden", o.hidden);
+    ch |= toggle({x + 182, y + 6, 168, 24}, "Locked", o.locked);
+    if (ch) sceneChanged();
+    labFooter(p);
+}
+
 template <class T> int grid2(int x, int y, const std::vector<T>& items, std::function<const char*(const T&)> name, std::function<bool(const T&)> on,
                              std::function<void(const T&)> act, int bw = 110) {
     for (size_t i = 0; i < items.size(); i++)
@@ -1462,11 +1717,148 @@ template <class T> int grid2(int x, int y, const std::vector<T>& items, std::fun
     return y + (int)((items.size() + 1) / 2) * 26;
 }
 
+void drawTextureLayers(Material& m) {
+    R p = panel(1040, 640, "Texture Layers");
+    int x = p.x + 16, y = p.y + 46, sel = gSel;
+    auto& layers = m.layers;
+    bool ch = false;
+    if (button({x, y, 216, 24}, "Base Material")) gMatLayers = false;
+    y += 36;
+    if ((int)layers.size() < MAX_TEXTURE_LAYERS) {
+        if (button({x, y, 106, 24}, "Add Layer")) {
+            layers.emplace_back();
+            layers.back().tex = TexType::Noise;
+            gLayerIndex = (int)layers.size() - 1;
+            ch = true;
+        }
+        if (button({x + 110, y, 106, 24}, "Load Texture...")) {
+            defer([sel] {
+                std::string path;
+                if (!fileDialog(false, "Texture Preset (*.c3tex)\0*.c3tex\0", "c3tex", path)) return;
+                TextureLayer layer;
+                if (!layer.load(path)) { gStatus = "Could not read texture preset " + path + "."; return; }
+                auto& items = gScene.objs[sel].mat.layers;
+                items.push_back(std::move(layer));
+                gLayerIndex = (int)items.size() - 1;
+                sceneChanged();
+            });
+        }
+    }
+    y += 30;
+    if (!layers.empty()) {
+        gLayerIndex = std::clamp(gLayerIndex, 0, (int)layers.size() - 1);
+        bool up = button({x, y, 62, 24}, "Up");
+        bool down = button({x + 66, y, 62, 24}, "Down");
+        int next = std::clamp(gLayerIndex + (down ? 1 : 0) - (up ? 1 : 0), 0, (int)layers.size() - 1);
+        if (next != gLayerIndex) {
+            std::swap(layers[gLayerIndex], layers[next]);
+            gLayerIndex = next;
+            ch = true;
+        }
+        if (button({x + 132, y, 84, 24}, "Remove")) {
+            layers.erase(layers.begin() + gLayerIndex);
+            gLayerIndex = std::max(0, std::min(gLayerIndex, (int)layers.size() - 1));
+            ch = true;
+        }
+    }
+    y += 32;
+    label(x, y, "Layers in blend order", 216);
+    y += 20;
+    for (int i = 0; i < (int)layers.size(); i++) {
+        std::string name = std::to_string(i + 1) + ". " + texName(layers[i].tex);
+        if (button({x, y + i * 24, 216, 22}, name.c_str(), gLayerIndex == i, gSmall)) gLayerIndex = i;
+    }
+
+    const char* channel[] = {"Color", "Bump", "Specular", "Reflection", "Transparency", "Ambient"};
+    std::string affected;
+    if (!layers.empty()) {
+        TextureLayer& layer = layers[gLayerIndex];
+        int tx = p.x + 250;
+        y = p.y + 46;
+        label(tx, y, "Texture");
+        y += 20;
+        for (int i = 0; i < (int)TexType::COUNT; i++)
+            if (button({tx + (i % 2) * 110, y + (i / 2) * 22, 106, 20}, texName((TexType)i), layer.tex == (TexType)i, gSmall)) {
+                layer.tex = (TexType)i;
+                ch = true;
+            }
+        y += ((int)TexType::COUNT + 1) / 2 * 22 + 6;
+        label(tx, y, "Coordinate source");
+        y += 20;
+        for (int i = 0; i < (int)TexMap::COUNT; i++)
+            if (button({tx + (i % 2) * 110, y + (i / 2) * 22, 106, 20}, mapName((TexMap)i), layer.map == (TexMap)i, gSmall)) {
+                layer.map = (TexMap)i;
+                ch = true;
+            }
+        y += 72;
+        swatch({tx, y, 216, 24}, "Color A", layer.color1); y += 28;
+        swatch({tx, y, 216, 24}, "Color B", layer.color2); y += 28;
+        if (button({tx, y, 216, 24}, layer.image.empty() ? "Load BMP..." : baseName(layer.image).c_str())) {
+            int i = gLayerIndex;
+            defer([sel, i] {
+                std::string path;
+                if (!fileDialog(false, BMP_FILTER, "bmp", path)) return;
+                auto image = loadImageCached(path, true);
+                if (!image) { gStatus = "Could not read picture " + path + "."; return; }
+                auto& item = gScene.objs[sel].mat.layers[i];
+                item.image = path;
+                item.img = std::move(image);
+                item.tex = TexType::Image;
+                sceneChanged();
+            });
+        }
+        y += 30;
+        ch |= slider({tx, y, 216, 24}, "Scale", layer.texScale, 0.01f, 20, "%.3f", true); y += 30;
+        row3(tx, y, 216, "Offset", layer.offset, 0.02f);
+        row3(tx, y, 216, "Rotation", layer.rotation, 0.5f);
+
+        int ax = p.x + 484;
+        y = p.y + 46;
+        label(ax, y, "Blend");
+        const char* blend[] = {"Mix", "Multiply", "Add"};
+        for (int i = 0; i < (int)TexBlend::COUNT; i++)
+            if (button({ax + i * 72, y + 20, 68, 22}, blend[i], (int)layer.blend == i, gSmall)) {
+                layer.blend = (TexBlend)i;
+                ch = true;
+            }
+        y += 48;
+        const char* mask[] = {"No Mask", "Mask: Luminance", "Mask: Inverse Luminance", "Mask: Previous Layer"};
+        if (button({ax, y, 212, 24}, mask[(int)layer.mask])) {
+            layer.mask = (TexMask)(((int)layer.mask + 1) % (int)TexMask::COUNT);
+            ch = true;
+        }
+        y += 30;
+        ch |= slider({ax, y, 212, 24}, "Opacity", layer.opacity, 0, 1); y += 34;
+        label(ax, y, "Channel influence", 212); y += 20;
+        for (int i = 0; i < TexChannelCount; i++) {
+            ch |= slider({ax, y, 212, 24}, channel[i], layer.influence[i], 0, 1); y += 30;
+            if (layer.influence[i] > 0 && layer.opacity > 0) {
+                if (!affected.empty()) affected += ", ";
+                affected += channel[i];
+            }
+        }
+        if (button({ax, y, 212, 24}, "Save Texture...")) {
+            TextureLayer preset = layer;
+            defer([preset] {
+                std::string path;
+                if (fileDialog(true, "Texture Preset (*.c3tex)\0*.c3tex\0", "c3tex", path))
+                    gStatus = preset.save(path) ? "Saved texture preset " + baseName(path) + "." : "Could not save texture preset " + path + ".";
+            });
+        }
+    }
+    preview({p.x + 714, p.y + 46, 310, 310}, "Material preview");
+    if (!layers.empty())
+        note({p.x + 714, p.y + 386, 310, 62}, ("Selected layer affects " + (affected.empty() ? std::string("no channels.") : affected + ".")).c_str());
+    if (ch) sceneChanged();
+    labFooter(p);
+}
+
 void drawMatLab() {
     if (!validSel()) { gLab = LabNone; return; }
     int sel = gSel;
     Object& o = gScene.objs[sel];
     Material& m = o.mat;
+    if (gMatLayers) { drawTextureLayers(m); return; }
     bool ch = false;
     R P = panel(1100, 640, "Materials Lab  -  " + o.name + (gSelSet.size() > 1 ? "  (OK applies to all selected)" : ""));
     int x = P.x + 16, y = P.y + 46;
@@ -1543,8 +1935,8 @@ void drawMatLab() {
     for (auto& s : ss) { ch |= slider({x3, y, sw, 24}, s.n, *s.v, s.lo, s.hi, s.fmt, s.lg); y += 30; }
     note({x3, y + 4, sw, 60}, "Blur gives frosted glass and brushed reflections in Premium renders.");
     preview({P.x + P.w - 336, P.y + 46, 320, 320}, m.name.c_str());
-    note({P.x + P.w - 336, P.y + 390, 320, 120},
-         "Pick a category and preset, then tune texture, mapping, colors and channels. Changes apply live; Cancel restores the original.");
+    std::string layers = "Texture Layers (" + std::to_string(m.layers.size()) + ")...";
+    if (button({P.x + P.w - 336, P.y + 396, 320, 26}, layers.c_str())) gMatLayers = true;
     if (ch) sceneChanged();
     labFooter(P);
 }
@@ -1931,7 +2323,7 @@ void drawExamplesLab() {
         textIn({P.x + 214, y, P.w - 234, 28}, exampleDescriptions()[i].c_str(), TXT, gFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         y += 32;
     }
-    note({P.x + 20, y + 6, P.w - 40, 40}, "Loading an example replaces the current scene. All example content is original to Canyon 3D.");
+    note({P.x + 20, y + 6, P.w - 40, 40}, "Loading an example replaces the current scene.");
     labFooter(P, true);
 }
 
@@ -1960,6 +2352,8 @@ void drawUI() {
         case LabRender: drawRenderLab(); break;
         case LabTools: drawToolsLab(); break;
         case LabExamples: drawExamplesLab(); break;
+        case LabObject: drawObjectLab(); break;
+        case LabAttributes: drawAttributesLab(); break;
         default: break;
         }
     }
@@ -2115,7 +2509,7 @@ void buildIcons() {
 void handleKey(WPARAM wp) {
     bool ctrl = GetKeyState(VK_CONTROL) < 0, shift = GetKeyState(VK_SHIFT) < 0;
     if (wp == VK_ESCAPE) {
-        if (gLab != LabNone) closeLab(true);
+        if (gLab != LabNone) { closeLab(true); endInteraction(); }
         else if (gMainR.busy() || gAnimRender) actRender();
         else gShowRender = false;
         return;
@@ -2135,6 +2529,10 @@ void handleKey(WPARAM wp) {
     else if (ctrl && wp == 'N') actNew();
     else if (ctrl && wp == 'L') actLand();
     else if (ctrl && wp == 'K') addKey();
+    else if (!ctrl && wp == 'A' && validSel()) openLab(LabAttributes);
+    else if (!ctrl && wp == 'M' && validSel()) openLab(LabMat);
+    else if (!ctrl && wp == 'E' && validSel()) openLab(objectEditor(gScene.objs[gSel]));
+    else if (!ctrl && wp == 'F') frameView(validSel());
     else if (wp == VK_SPACE) { gPlaying = !gPlaying; gPlayLast = GetTickCount(); }
     else if (wp == VK_OEM_4 || wp == VK_OEM_6) gBrushSize = clampf(gBrushSize * (wp == VK_OEM_6 ? 1.2f : 1 / 1.2f), 0.01f, 0.3f);
     else if (wp >= '1' && wp <= '4') { gView = (int)(wp - '1'); gShowRender = false; }
@@ -2286,7 +2684,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmd, int show) {
     RECT wa;
     SystemParametersInfoA(SPI_GETWORKAREA, 0, &wa, 0);
     int ww = std::min<int>(1440, wa.right - wa.left), wh = std::min<int>(900, wa.bottom - wa.top);
-    gWnd = CreateWindowExA(0, wc.lpszClassName, "Canyon 3D - Bryce-style landscape studio", WS_OVERLAPPEDWINDOW,
+    gWnd = CreateWindowExA(0, wc.lpszClassName, APP_NAME, WS_OVERLAPPEDWINDOW,
                            wa.left + (wa.right - wa.left - ww) / 2, wa.top + (wa.bottom - wa.top - wh) / 2, ww, wh, nullptr, nullptr, inst, nullptr);
     if (!gWnd) return 1;
     bool small = ww < 1440 || wh < 900;

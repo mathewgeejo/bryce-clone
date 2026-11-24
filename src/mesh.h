@@ -13,7 +13,7 @@ struct Mesh {
     std::vector<int> order;
     int triCount() const { return (int)(tri.size() / 3); }
     void build();
-    bool intersect(V3 o, V3 d, float tmin, float tmax, float& t, V3& nrm) const;
+    bool intersect(V3 o, V3 d, float tmin, float tmax, float& t, V3& nrm, bool flat = false) const;
 
 private:
     int buildNode(int first, int count, int depth);

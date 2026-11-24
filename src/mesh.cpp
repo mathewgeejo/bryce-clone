@@ -72,7 +72,7 @@ static bool boxHit(V3 lo, V3 hi, V3 o, V3 inv, float tmin, float tmax) {
     return true;
 }
 
-bool Mesh::intersect(V3 o, V3 d, float tmin, float tmax, float& tOut, V3& nOut) const {
+bool Mesh::intersect(V3 o, V3 d, float tmin, float tmax, float& tOut, V3& nOut, bool flat) const {
     if (nodes.empty()) return false;
     V3 inv(1.f / (d.x != 0 ? d.x : 1e-30f), 1.f / (d.y != 0 ? d.y : 1e-30f), 1.f / (d.z != 0 ? d.z : 1e-30f));
     int stack[96], sp = 0;
@@ -99,7 +99,7 @@ bool Mesh::intersect(V3 o, V3 d, float tmin, float tmax, float& tOut, V3& nOut) 
                 if (tt <= tmin || tt >= tmax) continue;
                 tmax = tt;
                 tOut = tt;
-                nOut = n[ia] * (1 - u - w) + n[ib] * u + n[ic] * w;
+                nOut = flat ? cross(e1, e2) : n[ia] * (1 - u - w) + n[ib] * u + n[ic] * w;
                 hit = true;
             }
         } else if (sp + 2 <= 96) {

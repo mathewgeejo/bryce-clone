@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 #include <memory>
 #include <string>
 #include <vector>
@@ -12,15 +13,35 @@ const char* texName(TexType t);
 enum class TexMap { Object, World, Spherical, Cylindrical, PlanarXZ, PlanarXY, COUNT };
 const char* mapName(TexMap m);
 
-struct Material {
-    std::string name = "Default Gray", category = "Basic";
+struct Texture {
     TexType tex = TexType::None;
     TexMap map = TexMap::Object;
     V3 color1{0.72f, 0.72f, 0.72f}, color2{0.3f, 0.3f, 0.3f};
-    float diffuse = 0.85f, ambient = 0.3f, specular = 0.25f, shininess = 30.f;
-    float reflect = 0.f, transparency = 0.f, ior = 1.f, bump = 0.f, texScale = 1.f, metal = 0.f, emission = 0.f, blur = 0.f;
+    float texScale = 1.f;
     std::string image;
     std::shared_ptr<const Image> img;
+};
+
+enum class TexBlend { Mix, Multiply, Add, COUNT };
+enum class TexMask { None, Luminance, InverseLuminance, Previous, COUNT };
+enum TexChannel { TexColor, TexBump, TexSpecular, TexReflection, TexTransparency, TexAmbient, TexChannelCount };
+constexpr int MAX_TEXTURE_LAYERS = 16;
+
+struct TextureLayer : Texture {
+    V3 offset, rotation;
+    TexBlend blend = TexBlend::Mix;
+    TexMask mask = TexMask::None;
+    float opacity = 1.f;
+    std::array<float, TexChannelCount> influence{1};
+    bool save(const std::string& path) const;
+    bool load(const std::string& path);
+};
+
+struct Material : Texture {
+    std::string name = "Default Gray", category = "Basic";
+    float diffuse = 0.85f, ambient = 0.3f, specular = 0.25f, shininess = 30.f;
+    float reflect = 0.f, transparency = 0.f, ior = 1.f, bump = 0.f, metal = 0.f, emission = 0.f, blur = 0.f;
+    std::vector<TextureLayer> layers;
 };
 const std::vector<Material>& materialPresets();
 Material findMaterial(const std::string& name);
@@ -55,7 +76,7 @@ const std::vector<Sky>& skyPresets();
 const char* skyModeName(int m);
 Sky lerpSky(const Sky& a, const Sky& b, float t);
 
-enum class ObjType { Sphere, Cube, Cylinder, Cone, Pyramid, Terrain, Ground, Water, Cloud, Light, Torus, Disc, Square, Stone, Lattice, Mesh, Spotlight, Parallel, COUNT };
+enum class ObjType { Sphere, Cube, Cylinder, Cone, Pyramid, Terrain, Ground, Water, Cloud, Light, Torus, Disc, Square, Stone, Lattice, Mesh, Spotlight, Parallel, Metaball, Picture, COUNT };
 const char* objTypeName(ObjType t);
 inline bool isInfinite(ObjType t) { return t == ObjType::Ground || t == ObjType::Water || t == ObjType::Cloud; }
 inline bool isLight(ObjType t) { return t == ObjType::Light || t == ObjType::Spotlight || t == ObjType::Parallel; }
@@ -74,6 +95,25 @@ struct Heightfield {
 };
 
 struct Key { int frame = 0; V3 pos, rot, scl{1, 1, 1}; };
+struct Camera;
+
+struct Picture {
+    std::string path;
+    std::shared_ptr<const Image> image;
+    float aspect = 1.f, keyTolerance = 0.08f;
+    V3 keyColor{1, 0, 1};
+    bool billboard = false, chroma = false, shadows = true, reflections = true;
+    V3 halfExtent() const { return {std::min(aspect, 1.f), std::min(1.f / aspect, 1.f), 0.01f}; }
+};
+
+struct TorusShape {
+    float major = 0.7f, minor = 0.3f, section = 1.f;
+    float start = 0.f, sweep = 360.f;
+};
+
+struct StoneShape {
+    float irregularity = 1.f, blockiness = 0.f, smoothing = 0.f;
+};
 
 struct Object {
     ObjType type = ObjType::Sphere;
@@ -85,6 +125,12 @@ struct Object {
     int group = 0;
     BoolMode boolMode = BoolMode::Neutral;
     bool hidden = false, locked = false;
+    float metaRadius = 1.4f, metaStrength = 1.f;
+    bool metaNegative = false;
+    Picture picture;
+    TorusShape torus;
+    StoneShape stone;
+    bool flatMesh = false;
     uint32_t seed = 1;
     int treePart = 0;  // 0 none, 1 trunk, 2 foliage (mesh regenerated from `tree`)
     TreeParams tree;
@@ -96,7 +142,7 @@ struct Object {
     V3 bcenter;
     float bradius = -1;
     bool csg = false;
-    void update();
+    void update(const Camera* camera = nullptr);
     V3 lightAxis() const { return normalize(fwd * V3(0, -1, 0)); }
 };
 
@@ -128,9 +174,13 @@ ViewBasis orthoBasis(int mode, V3 center, float halfH);
 
 struct Hit {
     float t = 0;
-    V3 p, n, lp, lr;
+    V3 p, n, lp, lr, pictureColor;
     float ly = 0;
     int obj = -1;
+};
+
+struct MetaballGroup {
+    std::vector<int> balls, operands;
 };
 
 struct Scene {
@@ -144,6 +194,7 @@ struct Scene {
     Camera memory[6];
     bool memorySet[6] = {};
     std::vector<std::vector<int>> csg;  // derived: boolean groups
+    std::vector<MetaballGroup> metaballs;
     void updateAll();
     Scene snapshot() const;
     void applyFrame(int f);
@@ -175,7 +226,8 @@ struct Library {
 Object makeObject(ObjType t, int counter);
 Scene makeDefaultScene();
 Scene makeEmptyScene();
-bool intersectScene(const Scene& s, const Ray& r, float tmax, Hit& h, int skip = -1);
+enum class RayPurpose { View, Shadow, Reflection };
+bool intersectScene(const Scene& s, const Ray& r, float tmax, Hit& h, int skip = -1, RayPurpose purpose = RayPurpose::View);
 bool intersectObject(const Object& o, const Ray& r, float tmax, Hit& h);
 void wireframe(const Object& o, std::vector<V3>& segs);
 bool localBounds(const Object& o, V3& lo, V3& hi);

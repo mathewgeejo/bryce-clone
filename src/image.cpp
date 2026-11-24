@@ -18,6 +18,15 @@ V3 Image::sample(float u, float v) const {
     return lerp(lerp(px[y0 * w + x0], px[y0 * w + x1], fx), lerp(px[y1 * w + x0], px[y1 * w + x1], fx), fy);
 }
 
+V3 Image::sampleClamped(float u, float v, bool nearest) const {
+    if (w <= 0 || h <= 0) return {};
+    float x = clampf(u * w - 0.5f, 0, (float)w - 1), y = clampf(v * h - 0.5f, 0, (float)h - 1);
+    if (nearest) return px[(size_t)std::lround(y) * w + std::lround(x)];
+    int x0 = (int)x, y0 = (int)y, x1 = std::min(x0 + 1, w - 1), y1 = std::min(y0 + 1, h - 1);
+    return lerp(lerp(px[(size_t)y0 * w + x0], px[(size_t)y0 * w + x1], x - x0),
+                lerp(px[(size_t)y1 * w + x0], px[(size_t)y1 * w + x1], x - x0), y - y0);
+}
+
 std::shared_ptr<Image> loadBMP(const std::string& path) {
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) return nullptr;
@@ -33,7 +42,8 @@ std::shared_ptr<Image> loadBMP(const std::string& path) {
     if (b.size() < 54 || b[0] != 'B' || b[1] != 'M') return nullptr;
     uint32_t off = rd32(&b[10]), dib = rd32(&b[14]), comp = rd32(&b[30]), ncol = rd32(&b[46]);
     int w = (int32_t)rd32(&b[18]), h = (int32_t)rd32(&b[22]), bpp = (int)rd16(&b[28]);
-    if (w <= 0 || h == 0 || w > 16384 || std::abs(h) > 16384) return nullptr;
+    if (w <= 0 || h == 0 || w > 16384 || h < -16384 || h > 16384) return nullptr;
+    if (dib < 40 || (size_t)dib + 14 > off || off > b.size() || rd16(&b[26]) != 1) return nullptr;
     if (bpp != 8 && bpp != 24 && bpp != 32) return nullptr;
     if (!(comp == 0 || (comp == 3 && bpp == 32))) return nullptr;
     bool topDown = h < 0;
@@ -42,7 +52,7 @@ std::shared_ptr<Image> loadBMP(const std::string& path) {
     if ((size_t)off + stride * h > b.size()) return nullptr;
     if (bpp == 8) {
         if (ncol == 0 || ncol > 256) ncol = 256;
-        if ((size_t)14 + dib + ncol * 4 > b.size()) return nullptr;
+        if ((size_t)14 + dib + ncol * 4 > off) return nullptr;
     }
     const uint8_t* pal = b.data() + 14 + dib;
     auto img = std::make_shared<Image>();
@@ -63,13 +73,13 @@ std::shared_ptr<Image> loadBMP(const std::string& path) {
     return img;
 }
 
-std::shared_ptr<const Image> loadImageCached(const std::string& path) {
+std::shared_ptr<const Image> loadImageCached(const std::string& path, bool refresh) {
     static std::mutex mu;
     static std::map<std::string, std::shared_ptr<const Image>> cache;
     std::lock_guard<std::mutex> lock(mu);
     auto it = cache.find(path);
-    if (it != cache.end()) return it->second;
+    if (!refresh && it != cache.end()) return it->second;
     auto img = loadBMP(path);
-    cache[path] = img;
+    if (img || it == cache.end()) cache[path] = img;
     return img;
 }

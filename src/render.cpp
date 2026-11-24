@@ -8,7 +8,13 @@ struct Ctx {
     bool soft, blur, premium;
 };
 
-struct Surf { V3 color; float trans, glow; };
+struct TextureSample { V3 color; float trans, glow; };
+struct Surf {
+    V3 color;
+    float trans, glow, specular, reflect, ambient;
+    float height = 0.5f;
+    bool layeredBump = false;
+};
 
 static V3 inSphere(Rng& r) {
     for (;;) {
@@ -39,7 +45,7 @@ static V3 spectrum(float t) {
 }
 
 // Texture-space point for procedural textures plus (u, v) for picture textures.
-static V3 texCoord(const Material& m, const Object& o, const Hit& h, float& u, float& v) {
+static V3 texCoord(const Texture& m, const Object& o, const Hit& h, float& u, float& v) {
     V3 lr = h.lr;
     auto ang = [&] { return std::atan2(lr.z, lr.x) / (2 * PI) + 0.5f; };
     switch (m.map) {
@@ -63,10 +69,8 @@ static V3 texCoord(const Material& m, const Object& o, const Hit& h, float& u, f
     }
 }
 
-static Surf evalSurface(const Material& m, const Object& o, const Hit& h) {
-    float u = 0, v = 0;
-    V3 p = texCoord(m, o, h, u, v) * m.texScale;
-    Surf s{m.color1, m.transparency, 1};
+static TextureSample evalTexture(const Texture& m, V3 p, float u, float v, float y, float ny, float transparency, bool layer = false) {
+    TextureSample s{m.color1, transparency, 1};
     switch (m.tex) {
     case TexType::Checker: {
         int c = (int)std::floor(p.x) + (int)std::floor(p.y + 1e-3f) + (int)std::floor(p.z);
@@ -90,13 +94,16 @@ static Surf evalSurface(const Material& m, const Object& o, const Hit& h) {
         s.color = lerp(m.color2, m.color1, smoothstep(0.f, 0.5f, n));
         break;
     }
+    case TexType::Waves:
+        if (layer) s.color = lerp(m.color2, m.color1, clampf(0.5f + fbm(V3(p.x * 1.2f, p.y, p.z * 3.6f), 3), 0, 1));
+        break;
     case TexType::Strata:
         s.color = lerp(m.color2, m.color1, 0.5f + 0.5f * std::sin(p.y * 12.f + fbm(p * 0.8f, 3) * 4.f)) * (0.85f + 0.15f * noise3(p * 6.f));
         break;
     case TexType::Altitude: {
-        float hg = h.ly + fbm(p, 4) * 0.12f;
-        float snow = smoothstep(0.5f, 0.62f, hg) * smoothstep(0.55f, 0.8f, h.n.y);
-        float grass = smoothstep(0.25f, 0.1f, hg) * smoothstep(0.75f, 0.92f, h.n.y);
+        float hg = y + fbm(p, 4) * 0.12f;
+        float snow = smoothstep(0.5f, 0.62f, hg) * smoothstep(0.55f, 0.8f, ny);
+        float grass = smoothstep(0.25f, 0.1f, hg) * smoothstep(0.75f, 0.92f, ny);
         V3 rock = m.color2 * (0.75f + 0.35f * (0.5f + 0.5f * fbm(p * 2.3f, 3)));
         s.color = lerp(lerp(rock, V3(0.3f, 0.42f, 0.18f), grass), m.color1, snow);
         break;
@@ -127,11 +134,67 @@ static Surf evalSurface(const Material& m, const Object& o, const Hit& h) {
         break;
     }
     case TexType::Rings: s.color = lerp(m.color2, m.color1, 0.5f + 0.5f * std::sin(p.y * 9.f + fbm(p * 1.5f, 4) * 3.f)); break;
-    case TexType::Gradient: s.color = lerp(m.color2, m.color1, clampf((h.lr.y + 1) * 0.5f, 0, 1)); break;
+    case TexType::Gradient: s.color = lerp(m.color2, m.color1, clampf((y + 1) * 0.5f, 0, 1)); break;
     case TexType::Image:
-        if (m.img) s.color = m.img->sample(u * m.texScale, 1 - v * m.texScale);
+        if (m.img) s.color = m.img->sample(u, 1 - v);
         break;
     default: break;
+    }
+    return s;
+}
+
+template <class T> static T blendTexture(T base, T texture, float weight, TexBlend mode) {
+    if (mode == TexBlend::Add) return base + texture * weight;
+    if (mode == TexBlend::Multiply) texture = base * texture;
+    return base + (texture - base) * weight;
+}
+
+static Surf evalSurface(const Material& m, const Object& o, const Hit& h, bool bumpOnly = false) {
+    Surf s{m.color1, m.transparency, 1, m.specular, m.reflect, m.ambient};
+    if (!bumpOnly) {
+        if (o.type == ObjType::Picture) s.color = h.pictureColor;
+        else if (m.tex != TexType::None) {
+            float u = 0, v = 0;
+            V3 p = texCoord(m, o, h, u, v) * m.texScale;
+            float y = m.tex == TexType::Gradient ? h.lr.y : h.ly;
+            TextureSample base = evalTexture(m, p, u * m.texScale, v * m.texScale, y, h.n.y, m.transparency);
+            s.color = base.color;
+            s.trans = base.trans;
+            s.glow = base.glow;
+        }
+    }
+    float previous = 1;
+    for (const TextureLayer& layer : m.layers) {
+        float u = 0, v = 0;
+        V3 p = texCoord(layer, o, h, u, v) * layer.texScale;
+        M3 rot = rotY(rad(layer.rotation.y)) * rotX(rad(layer.rotation.x)) * rotZ(rad(layer.rotation.z));
+        p = rot * p + layer.offset;
+        if (layer.tex == TexType::Image) {
+            V3 uv = rot * V3((u - 0.5f) * layer.texScale, (v - 0.5f) * layer.texScale, 0) + layer.offset;
+            u = uv.x + 0.5f; v = uv.y + 0.5f;
+        }
+        TextureSample component = evalTexture(layer, p, u, v, p.y, h.n.y, 0, true);
+        float lum = clampf(dot(component.color, V3(0.299f, 0.587f, 0.114f)), 0, 1);
+        float weight = layer.opacity;
+        if (layer.mask == TexMask::Luminance) weight *= lum;
+        else if (layer.mask == TexMask::InverseLuminance) weight *= 1 - lum;
+        else if (layer.mask == TexMask::Previous) weight *= previous;
+        previous = lum;
+        auto scalar = [&](float current, TexChannel channel, float value) {
+            float amount = weight * layer.influence[channel];
+            if (amount <= 0) return current;
+            return clampf(blendTexture(current, value, amount, layer.blend), 0, 1);
+        };
+        if (layer.influence[TexBump] > 0 && layer.opacity > 0) {
+            s.layeredBump = true;
+            s.height = scalar(s.height, TexBump, lum);
+        }
+        if (bumpOnly) continue;
+        s.color = blendTexture(s.color, component.color, weight * layer.influence[TexColor], layer.blend);
+        s.specular = scalar(s.specular, TexSpecular, lum);
+        s.reflect = scalar(s.reflect, TexReflection, lum);
+        s.trans = scalar(s.trans, TexTransparency, layer.tex == TexType::Clouds ? component.trans : lum);
+        s.ambient = scalar(s.ambient, TexAmbient, lum);
     }
     return s;
 }
@@ -151,6 +214,22 @@ static V3 bumpNormal(const Material& m, const Hit& h, V3 n) {
     g = g / (2 * e);
     g -= n * dot(g, n);
     return normalize(n - g * (m.bump * 0.08f));
+}
+
+static V3 layerNormal(const Material& m, const Object& o, const Hit& h, V3 n) {
+    V3 u = normalize(cross(h.n, std::fabs(h.n.y) < 0.9f ? V3(0, 1, 0) : V3(1, 0, 0))), v = cross(h.n, u);
+    const float e = 0.01f;
+    auto height = [&](V3 offset) {
+        Hit sample = h;
+        sample.p += offset;
+        sample.lr += o.inv * offset;
+        sample.lp = sample.lr * o.scl;
+        sample.ly = sample.lr.y;
+        return evalSurface(m, o, sample, true).height;
+    };
+    float du = (height(u * e) - height(u * -e)) / (2 * e);
+    float dv = (height(v * e) - height(v * -e)) / (2 * e);
+    return normalize(n - (u * du + v * dv) * 0.08f);
 }
 
 V3 skyColor(const Sky& k, V3 d) {
@@ -230,10 +309,10 @@ static V3 shadowRay(const Scene& s, V3 o, V3 L, float maxd) {
     V3 att(1.f);
     for (int i = 0; i < 8; i++) {
         Hit h;
-        if (!intersectScene(s, {o, L}, maxd, h)) return att;
+        if (!intersectScene(s, {o, L}, maxd, h, -1, RayPurpose::Shadow)) return att;
         const Object& ob = s.objs[h.obj];
         const Material& m = ob.mat;
-        if (m.transparency <= 0.01f && m.tex != TexType::Clouds) return V3(0.f);
+        if (m.transparency <= 0.01f && m.tex != TexType::Clouds && m.layers.empty()) return V3(0.f);
         Surf sf = evalSurface(m, ob, h);
         if (sf.trans <= 0.01f) return V3(0.f);
         att = att * lerp(V3(1.f), sf.color, 0.5f) * sf.trans;
@@ -253,24 +332,25 @@ static bool refractDir(V3 d, V3 n, float eta, V3& t) {
 
 static V3 jitterDir(V3 d, float amount, Rng& r) { return normalize(d + inSphere(r) * amount); }
 
-static V3 trace(Ctx& c, const Ray& r, int depth) {
+static V3 trace(Ctx& c, const Ray& r, int depth, RayPurpose purpose = RayPurpose::View) {
     const Scene& s = c.s;
     const Sky& k = s.sky;
     Hit h;
-    if (!intersectScene(s, r, 1e30f, h)) return atmosSky(k, r, skyColor(k, r.d));
+    if (!intersectScene(s, r, 1e30f, h, -1, purpose)) return atmosSky(k, r, skyColor(k, r.d));
     const Object& ob = s.objs[h.obj];
     const Material& m = ob.mat;
     Surf sf = evalSurface(m, ob, h);
     bool inside = dot(h.n, r.d) > 0;
     V3 nf = bumpNormal(m, h, inside ? -h.n : h.n);
-    V3 diff = sf.color * k.ambientColor * (k.ambient * m.ambient * 2.f), spec(0.f);
+    if (sf.layeredBump) nf = layerNormal(m, ob, h, nf);
+    V3 diff = sf.color * k.ambientColor * (k.ambient * sf.ambient * 2.f), spec(0.f);
     auto light = [&](V3 L, V3 li, float maxd) {
-        float ndl = m.tex == TexType::Clouds ? std::fabs(dot(h.n, L)) * 0.8f + 0.2f : dot(nf, L);
+        float ndl = m.tex == TexType::Clouds && ob.type != ObjType::Picture ? std::fabs(dot(h.n, L)) * 0.8f + 0.2f : dot(nf, L);
         if (ndl <= 0) return;
         if (k.shadows) li = li * shadowRay(s, h.p + nf * EPS, L, maxd);
         if (maxc(li) <= 0) return;
         diff += sf.color * li * (m.diffuse * ndl);
-        if (m.specular > 0) spec += li * (m.specular * std::pow(std::max(0.f, dot(nf, normalize(L - r.d))), m.shininess));
+        if (sf.specular > 0) spec += li * (sf.specular * std::pow(std::max(0.f, dot(nf, normalize(L - r.d))), m.shininess));
     };
     float sunI = smoothstep(-3, 3, k.sunAlt);
     if (sunI > 0) light(c.soft ? jitterDir(k.sunDir(), std::tan(rad(std::max(k.sunSize, 0.3f) * 1.5f)), c.rng) : k.sunDir(), k.sunColor * sunI, 1e30f);
@@ -292,7 +372,7 @@ static V3 trace(Ctx& c, const Ray& r, int depth) {
         }
         light(L, li, d - EPS);
     }
-    float reflF = m.reflect, transF = sf.trans;
+    float reflF = sf.reflect, transF = sf.trans;
     bool refr = m.ior > 1.001f;
     if (transF > 0 && refr) {
         float cc = std::fabs(dot(r.d, nf)), r0 = (m.ior - 1) / (m.ior + 1);
@@ -311,14 +391,14 @@ static V3 trace(Ctx& c, const Ray& r, int depth) {
                 rd = jitterDir(rd, m.blur * 0.35f, c.rng);
                 if (dot(rd, nf) < 0) rd = reflect(rd, nf);
             }
-            col += trace(c, {h.p + nf * EPS, rd}, depth + 1) * lerp(V3(1.f), sf.color, m.metal) * reflF;
+            col += trace(c, {h.p + nf * EPS, rd}, depth + 1, RayPurpose::Reflection) * lerp(V3(1.f), sf.color, m.metal) * reflF;
         }
         if (transF > 0.01f) {
             Ray tr{h.p + r.d * EPS, r.d};
             V3 td;
             if (refr) tr = refractDir(r.d, nf, inside ? m.ior : 1 / m.ior, td) ? Ray{h.p - nf * EPS, td} : Ray{h.p + nf * EPS, reflect(r.d, nf)};
             if (blur) tr.d = jitterDir(tr.d, m.blur * 0.25f, c.rng);
-            col += trace(c, tr, depth + 1) * lerp(V3(1.f), sf.color, 0.5f) * transF;
+            col += trace(c, tr, depth + 1, purpose) * lerp(V3(1.f), sf.color, 0.5f) * transF;
         }
     }
     return atmosHit(k, r.o, h.p, h.t, col);

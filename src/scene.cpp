@@ -19,7 +19,7 @@ const char* mapName(TexMap m) {
 }
 const char* objTypeName(ObjType t) {
     static const char* n[] = {"Sphere", "Cube", "Cylinder", "Cone", "Pyramid", "Terrain", "Ground", "Water", "Cloud", "Light",
-                              "Torus", "Disc", "Square", "Stone", "Lattice", "Mesh", "Spotlight", "Parallel"};
+                              "Torus", "Disc", "Square", "Stone", "Lattice", "Mesh", "Spotlight", "Parallel", "Metaball", "Picture"};
     return n[(int)t];
 }
 const char* boolName(BoolMode b) {
@@ -61,8 +61,18 @@ void Heightfield::computeNormals() {
 bool localBounds(const Object& o, V3& lo, V3& hi) {
     lo = V3(-1.f); hi = V3(1.f);
     switch (o.type) {
+    case ObjType::Metaball: lo = V3(-o.metaRadius); hi = V3(o.metaRadius); break;
+    case ObjType::Picture: hi = o.picture.halfExtent(); lo = -hi; break;
     case ObjType::Terrain: lo.y = 0; break;
-    case ObjType::Torus: lo.y = -0.3f; hi.y = 0.3f; break;
+    case ObjType::Torus: {
+        float radius = o.torus.major + o.torus.minor;
+        hi = {radius, o.torus.minor * o.torus.section, radius};
+        lo = -hi;
+        break;
+    }
+    case ObjType::Stone:
+        if (o.stone.irregularity > 1) { hi = V3(0.8f + 0.48f * o.stone.irregularity); lo = -hi; }
+        break;
     case ObjType::Disc: case ObjType::Square: lo.y = -0.01f; hi.y = 0.01f; break;
     case ObjType::Mesh:
         if (!o.mesh || o.mesh->v.empty()) return false;
@@ -86,8 +96,21 @@ bool worldBounds(const Object& o, V3& lo, V3& hi) {
     return true;
 }
 
-void Object::update() {
-    fwd = rotY(rad(rot.y)) * rotX(rad(rot.x)) * rotZ(rad(rot.z)) * scaleM(scl);
+void Object::update(const Camera* camera) {
+    M3 orientation = rotY(rad(rot.y)) * rotX(rad(rot.x));
+    if (type == ObjType::Picture && picture.billboard && camera) {
+        V3 n = normalize(camera->eye() - pos);
+        if (length(n) < 0.5f) n = normalize(camera->eye() - camera->target);
+        if (length(n) < 0.5f) n = {0, 0, 1};
+        V3 r = normalize(cross(std::fabs(n.y) > 0.99f ? V3(0, 0, 1) : V3(0, 1, 0), n));
+        V3 u = cross(n, r);
+        for (int i = 0; i < 3; i++) {
+            orientation.m[i][0] = r[i];
+            orientation.m[i][1] = u[i];
+            orientation.m[i][2] = n[i];
+        }
+    }
+    fwd = orientation * rotZ(rad(rot.z)) * scaleM(scl);
     inv = fwd.inverse();
     nrm = inv.transpose();
     V3 lo, hi;
@@ -100,17 +123,33 @@ void Object::update() {
 
 void Scene::updateAll() {
     std::map<int, std::vector<int>> groups;
+    std::map<int, size_t> fieldGroups;
+    metaballs.clear();
     for (size_t i = 0; i < objs.size(); i++) {
         Object& o = objs[i];
-        o.update();
+        o.update(&cam);
         o.csg = false;
         if (o.mat.tex == TexType::Image && !o.mat.image.empty() && !o.mat.img) o.mat.img = loadImageCached(o.mat.image);
-        if (o.group > 0 && !o.hidden && isCsgCapable(o.type) && o.boolMode != BoolMode::Neutral) groups[o.group].push_back((int)i);
+        for (auto& layer : o.mat.layers)
+            if (layer.tex == TexType::Image && !layer.image.empty() && !layer.img) layer.img = loadImageCached(layer.image);
+        if (o.type == ObjType::Picture && !o.picture.path.empty() && !o.picture.image) o.picture.image = loadImageCached(o.picture.path);
+        if (o.hidden) continue;
+        if (o.type == ObjType::Metaball) {
+            size_t field = metaballs.size();
+            if (o.group > 0) field = fieldGroups.emplace(o.group, field).first->second;
+            if (field == metaballs.size()) metaballs.emplace_back();
+            metaballs[field].balls.push_back((int)i);
+            o.csg = true;
+        } else if (o.group > 0 && isCsgCapable(o.type) && o.boolMode != BoolMode::Neutral) {
+            groups[o.group].push_back((int)i);
+        }
     }
     csg.clear();
     for (auto& g : groups) {
         for (int i : g.second) objs[i].csg = true;
-        csg.push_back(g.second);
+        auto field = fieldGroups.find(g.first);
+        if (field == fieldGroups.end()) csg.push_back(std::move(g.second));
+        else metaballs[field->second].operands = std::move(g.second);
     }
 }
 
@@ -352,13 +391,20 @@ static bool hitTerrain(const Heightfield& f, V3 o, V3 d, LHit& h) {
     return false;
 }
 
-static float sdTorus(V3 p) {
-    float q = std::sqrt(p.x * p.x + p.z * p.z) - 0.7f;
-    return std::sqrt(q * q + p.y * p.y) - 0.3f;
+static float sdTorus(const TorusShape& shape, V3 p, V3 start, V3 end) {
+    float radial = std::sqrt(p.x * p.x + p.z * p.z) - shape.major, y = p.y / shape.section;
+    float tube = std::sqrt(radial * radial + y * y) - shape.minor;
+    if (shape.sweep >= 360) return tube;
+    float a = dot(start, p), b = dot(end, p);
+    return std::max(tube, shape.sweep <= 180 ? std::max(a, b) : std::min(a, b));
 }
 
-static float sdStone(V3 p, V3 off) {
-    return length(p) - (0.8f + 0.2f * fbm(p * 1.6f + off, 4) + 0.04f * noise3(p * 7.f + off));
+static float sdStone(const StoneShape& shape, V3 p, V3 off) {
+    float box = maxc(V3(std::fabs(p.x), std::fabs(p.y), std::fabs(p.z)));
+    float coarse = 0.2f * fbm(p * 1.6f + off, 4);
+    float grain = 0.04f * (1 - shape.smoothing) * noise3(p * 7.f + off);
+    float radius = shape.irregularity == 1 ? 0.8f + coarse + grain : 0.8f + shape.irregularity * (coarse + grain);
+    return lerpf(length(p), box, shape.blockiness) - radius;
 }
 
 // Sphere-traces a signed distance field in local space (handles rays starting inside).
@@ -437,6 +483,31 @@ static bool intersectObj(const Object& ob, const Ray& r, float tmax, Hit& h) {
         }
         break;
     }
+    case ObjType::Metaball: {
+        if (ob.metaNegative || ob.metaStrength <= 0.25f) break;
+        float radius = ob.metaRadius * std::sqrt(1 - std::sqrt(0.25f / ob.metaStrength));
+        float tn, tf;
+        V3 nn, nf;
+        if (convexSpan(ObjType::Sphere, lo / radius, ld / radius, tn, tf, nn, nf)) {
+            if (tn > EPS && tn < tmax) { lh = {tn, nn}; ok = true; }
+            else if (tn <= EPS && tf > EPS && tf < tmax) { lh = {tf, nf}; ok = true; }
+        }
+        break;
+    }
+    case ObjType::Picture: {
+        const Picture& picture = ob.picture;
+        if (!picture.image || std::fabs(ld.z) < 1e-12f) break;
+        float t = -lo.z / ld.z;
+        if (t <= EPS || t >= tmax) break;
+        V3 p = lo + ld * t, ext = picture.halfExtent();
+        if (std::fabs(p.x) > ext.x || std::fabs(p.y) > ext.y) break;
+        V3 color = picture.image->sampleClamped(0.5f + 0.5f * p.x / ext.x, 0.5f - 0.5f * p.y / ext.y, picture.chroma);
+        if (picture.chroma && length(color - picture.keyColor) <= picture.keyTolerance) break;
+        h.pictureColor = color;
+        lh = {t, {0, 0, 1}};
+        ok = true;
+        break;
+    }
     case ObjType::Terrain: ok = ob.hf && ob.hf->res > 1 && hitTerrain(*ob.hf, lo, ld, lh); break;
     case ObjType::Lattice:
         if (ob.hf && ob.hf->res > 1) {
@@ -445,17 +516,32 @@ static bool intersectObj(const Object& ob, const Ray& r, float tmax, Hit& h) {
             if (hitTerrain(*ob.hf, V3(lo.x, -lo.y, lo.z), V3(ld.x, -ld.y, ld.z), m)) { lh = {m.t, V3(m.n.x, -m.n.y, m.n.z)}; ok = true; }
         }
         break;
-    case ObjType::Torus: ok = marchSDF(sdTorus, 0.9f, V3(-1, -0.3f, -1), V3(1, 0.3f, 1), lo, ld, lh); break;
+    case ObjType::Torus: {
+        const TorusShape& shape = ob.torus;
+        float a = rad(shape.start), b = rad(shape.start + shape.sweep);
+        V3 start, end, min, max;
+        if (shape.sweep < 360) {
+            start = {std::sin(a), 0, -std::cos(a)};
+            end = {-std::sin(b), 0, std::cos(b)};
+        }
+        localBounds(ob, min, max);
+        ok = marchSDF([&](V3 p) { return sdTorus(shape, p, start, end); },
+                      0.9f * std::min(1.f, shape.section), min, max, lo, ld, lh);
+        break;
+    }
     case ObjType::Stone: {
         V3 off((ob.seed % 97) * 3.1f, (ob.seed % 89) * 1.7f, (ob.seed % 83) * 2.3f);
-        ok = marchSDF([off](V3 p) { return sdStone(p, off); }, 0.55f, V3(-1.f), V3(1.f), lo, ld, lh);
+        V3 min, max;
+        localBounds(ob, min, max);
+        ok = marchSDF([&](V3 p) { return sdStone(ob.stone, p, off); },
+                      0.55f / std::max(1.f, ob.stone.irregularity), min, max, lo, ld, lh);
         break;
     }
     case ObjType::Disc: case ObjType::Square: ok = hitFlat(lo, ld, ob.type == ObjType::Disc, lh); break;
     case ObjType::Mesh: {
         float t;
         V3 n;
-        if (ob.mesh && ob.mesh->intersect(lo, ld, EPS, tmax, t, n)) { lh = {t, n}; ok = true; }
+        if (ob.mesh && ob.mesh->intersect(lo, ld, EPS, tmax, t, n, ob.flatMesh)) { lh = {t, n}; ok = true; }
         break;
     }
     default: ok = hitPlane(lo, ld, lh); break;
@@ -515,12 +601,154 @@ static bool intersectCsg(const Scene& s, const std::vector<int>& g, const Ray& r
     return false;
 }
 
+struct FieldRay {
+    int obj;
+    double center, peak, curvature, strength;
+
+    double kernel(double t) const {
+        double d = t - center;
+        double q = std::max(0.0, peak - curvature * d * d);
+        return q * q;
+    }
+};
+
+static double fieldAt(const std::vector<FieldRay>& parts, double t) {
+    double value = -0.25;
+    for (const auto& p : parts) value += p.strength * p.kernel(t);
+    return value;
+}
+
+// Each kernel is monotone on either side of its closest point on the ray.
+// Bound the sum on an interval so thin bridges and cavities need no fixed sampling grid.
+static bool fieldCrossing(const std::vector<FieldRay>& parts, double a, double b, double fa, double fb, double& t) {
+    double lo = -0.25, hi = -0.25;
+    for (const auto& p : parts) {
+        double v0 = p.strength * p.kernel(a), v1 = p.strength * p.kernel(b);
+        double v2 = p.strength * p.kernel(std::clamp(p.center, a, b));
+        lo += std::min({v0, v1, v2});
+        hi += std::max({v0, v1, v2});
+    }
+    if (lo > 0 || hi <= 0) return false;
+    double mid = (a + b) * 0.5;
+    if (b - a < 0.00005 || mid == a || mid == b) {
+        if ((fa > 0) == (fb > 0)) return false;
+        t = mid;
+        return true;
+    }
+    double fm = fieldAt(parts, mid);
+    return fieldCrossing(parts, a, mid, fa, fm, t) || fieldCrossing(parts, mid, b, fm, fb, t);
+}
+
+static bool intersectMetaballs(const Scene& s, const MetaballGroup& g, const Ray& r, float tmax, Hit& h, int skip) {
+    for (int i : g.balls) if (i == skip) return false;
+    for (int i : g.operands) if (i == skip) return false;
+    if (g.balls.size() == 1 && g.operands.empty()) {
+        h.obj = g.balls.front();
+        return intersectObj(s.objs[h.obj], r, tmax, h);
+    }
+
+    std::vector<FieldRay> parts;
+    double start = tmax, end = EPS;
+    int material = -1;
+    for (int i : g.balls) {
+        const Object& o = s.objs[i];
+        if (!o.metaNegative && material < 0) material = i;
+        if (sphereReject(o, r, tmax)) continue;
+        V3 a = o.inv * (r.o - o.pos) / o.metaRadius, d = o.inv * r.d / o.metaRadius;
+        double curvature = dot(d, d);
+        if (curvature <= 0) continue;
+        double center = -dot(a, d) / curvature;
+        V3 closest = a + d * (float)center;
+        double peak = 1 - dot(closest, closest);
+        if (peak <= 0) continue;
+        double span = std::sqrt(peak / curvature);
+        if (center + span <= EPS || center - span >= tmax) continue;
+        parts.push_back({i, center, peak, curvature, o.metaNegative ? -o.metaStrength : o.metaStrength});
+        if (!o.metaNegative) {
+            start = std::min(start, center - span);
+            end = std::max(end, center + span);
+        }
+    }
+
+    struct Event { float t; int obj; int delta; V3 normal; };
+    std::vector<Event> events;
+    int positive = 0, negative = 0, insideMasks = 0, masks = 0;
+    auto count = [&](BoolMode mode) -> int& {
+        if (mode == BoolMode::Positive) return positive;
+        if (mode == BoolMode::Negative) return negative;
+        return insideMasks;
+    };
+    for (int i : g.operands) {
+        const Object& o = s.objs[i];
+        if (o.boolMode == BoolMode::Positive && material < 0) material = i;
+        if (o.boolMode == BoolMode::Intersect) masks++;
+        float tn, tf;
+        V3 nn, nf;
+        if (sphereReject(o, r, tmax) || !convexSpan(o.type, o.inv * (r.o - o.pos), o.inv * r.d, tn, tf, nn, nf)) continue;
+        if (tf <= EPS || tn >= tmax || tn >= tf) continue;
+        if (tn <= EPS) count(o.boolMode)++;
+        else events.push_back({tn, i, 1, nn});
+        if (tf < tmax) events.push_back({tf, i, -1, nf});
+    }
+    if (material < 0) return false;
+    std::sort(events.begin(), events.end(), [](const Event& a, const Event& b) { return a.t < b.t; });
+    auto allowed = [&] { return negative == 0 && insideMasks == masks; };
+    auto ballSurface = [&](double a, double b) {
+        a = std::max(a, start);
+        b = std::min(b, end);
+        double t;
+        if (!allowed() || positive || a >= b || !fieldCrossing(parts, a, b, fieldAt(parts, a), fieldAt(parts, b), t)) return false;
+        V3 point = r.o + r.d * (float)t, n;
+        double strongest = 0;
+        int contributor = material;
+        for (const auto& p : parts) {
+            const Object& o = s.objs[p.obj];
+            V3 local = o.inv * (point - o.pos) / o.metaRadius;
+            float q = std::max(0.f, 1 - dot(local, local));
+            n += o.nrm * local * (q * (float)p.strength / o.metaRadius);
+            double weight = q * q * p.strength;
+            if (weight > strongest) { strongest = weight; contributor = p.obj; }
+        }
+        fillHit(s.objs[contributor], r, (float)t, {}, h);
+        h.n = normalize(n);
+        h.obj = contributor;
+        return true;
+    };
+    float from = EPS;
+    for (size_t i = 0; i < events.size();) {
+        float t = events[i].t;
+        if (ballSurface(from, t)) return true;
+        bool ball = t > start && t < end && fieldAt(parts, t) > 0;
+        auto inside = [&] { return allowed() && (positive > 0 || ball); };
+        bool before = inside();
+        const Event* surface = &events[i];
+        do {
+            const Event& e = events[i++];
+            bool old = inside();
+            count(s.objs[e.obj].boolMode) += e.delta;
+            if (inside() != old) surface = &e;
+        } while (i < events.size() && events[i].t == t);
+        if (inside() != before) {
+            const Object& o = s.objs[surface->obj];
+            h.obj = o.boolMode == BoolMode::Negative ? material : surface->obj;
+            fillHit(s.objs[h.obj], r, t, {}, h);
+            h.n = normalize(o.nrm * surface->normal);
+            if ((dot(h.n, r.d) < 0) != inside()) h.n = -h.n;
+            return true;
+        }
+        from = t;
+    }
+    return ballSurface(from, tmax);
+}
+
 bool intersectObject(const Object& o, const Ray& r, float tmax, Hit& h) { return intersectObj(o, r, tmax, h); }
 
-bool intersectScene(const Scene& s, const Ray& r, float tmax, Hit& h, int skip) {
+bool intersectScene(const Scene& s, const Ray& r, float tmax, Hit& h, int skip, RayPurpose purpose) {
     bool any = false;
     for (size_t i = 0; i < s.objs.size(); ++i) {
         const Object& o = s.objs[i];
+        if (o.type == ObjType::Picture && ((purpose == RayPurpose::Shadow && !o.picture.shadows) ||
+                                           (purpose == RayPurpose::Reflection && !o.picture.reflections))) continue;
         Hit t;
         if ((int)i != skip && !o.hidden && !o.csg && intersectObj(o, r, tmax, t)) {
             tmax = t.t;
@@ -544,16 +772,34 @@ bool intersectScene(const Scene& s, const Ray& r, float tmax, Hit& h, int skip) 
             any = true;
         }
     }
+    for (const auto& g : s.metaballs) {
+        Hit t;
+        if (intersectMetaballs(s, g, r, tmax, t, skip)) {
+            tmax = t.t;
+            h = t;
+            any = true;
+        }
+    }
     return any;
 }
 
 // ---------------------------------------------------------------- wireframes
 
 void wireframe(const Object& o, std::vector<V3>& s) {
-    auto L = [&](V3 a, V3 b) { s.push_back(o.pos + o.fwd * a); s.push_back(o.pos + o.fwd * b); };
-    auto ring = [&](float y, float r, int segs) {
+    auto L = [&](V3 a, V3 b) {
+        if (o.type == ObjType::Stone && o.stone.blockiness > 0) {
+            auto shape = [&](V3 p) {
+                float maxAxis = maxc(V3(std::fabs(p.x), std::fabs(p.y), std::fabs(p.z)));
+                return p * (0.9f / lerpf(0.9f, maxAxis, o.stone.blockiness));
+            };
+            a = shape(a); b = shape(b);
+        }
+        s.push_back(o.pos + o.fwd * a);
+        s.push_back(o.pos + o.fwd * b);
+    };
+    auto ring = [&](float y, float r, int segs, float start = 0.f, float sweep = 2 * PI) {
         for (int i = 0; i < segs; i++) {
-            float a0 = 2 * PI * i / segs, a1 = 2 * PI * (i + 1) / segs;
+            float a0 = start + sweep * i / segs, a1 = start + sweep * (i + 1) / segs;
             L(V3(std::cos(a0) * r, y, std::sin(a0) * r), V3(std::cos(a1) * r, y, std::sin(a1) * r));
         }
     };
@@ -580,6 +826,14 @@ void wireframe(const Object& o, std::vector<V3>& s) {
     };
     switch (o.type) {
     case ObjType::Sphere: sphere(1, 2, 6); break;
+    case ObjType::Metaball: sphere(o.metaRadius * std::sqrt(std::max(0.05f, 1 - std::sqrt(0.25f / o.metaStrength))), 2, 6); break;
+    case ObjType::Picture: {
+        V3 e = o.picture.halfExtent();
+        V3 corners[] = {{-e.x, -e.y, 0}, {e.x, -e.y, 0}, {e.x, e.y, 0}, {-e.x, e.y, 0}};
+        for (int i = 0; i < 4; i++) L(corners[i], corners[(i + 1) % 4]);
+        L(corners[0], corners[2]); L(corners[1], corners[3]);
+        break;
+    }
     case ObjType::Stone: sphere(0.9f, 1, 4); break;
     case ObjType::Cube:
         for (int i = 0; i < 4; i++) {
@@ -602,17 +856,24 @@ void wireframe(const Object& o, std::vector<V3>& s) {
         for (int i = 0; i < 4; i++) { L(c[i], c[(i + 1) % 4]); L(c[i], V3(0, 1, 0)); }
         break;
     }
-    case ObjType::Torus:
-        ring(0, 1, 32); ring(0, 0.4f, 24); ring(0.3f, 0.7f, 28); ring(-0.3f, 0.7f, 28);
-        for (int i = 0; i < 12; i++) {
-            float a = i * PI / 6;
+    case ObjType::Torus: {
+        const TorusShape& t = o.torus;
+        float start = rad(t.start), sweep = rad(t.sweep), h = t.minor * t.section;
+        ring(0, t.major + t.minor, 32, start, sweep);
+        ring(0, t.major - t.minor, 24, start, sweep);
+        ring(h, t.major, 28, start, sweep); ring(-h, t.major, 28, start, sweep);
+        int sections = t.sweep < 360 ? 13 : 12;
+        for (int i = 0; i < sections; i++) {
+            float a = start + sweep * i / 12;
             V3 c(std::cos(a), 0, std::sin(a));
             for (int k = 0; k < 12; k++) {
                 float b0 = k * PI / 6, b1 = (k + 1) * PI / 6;
-                L(c * (0.7f + 0.3f * std::cos(b0)) + V3(0, 0.3f * std::sin(b0), 0), c * (0.7f + 0.3f * std::cos(b1)) + V3(0, 0.3f * std::sin(b1), 0));
+                L(c * (t.major + t.minor * std::cos(b0)) + V3(0, h * std::sin(b0), 0),
+                  c * (t.major + t.minor * std::cos(b1)) + V3(0, h * std::sin(b1), 0));
             }
         }
         break;
+    }
     case ObjType::Disc: ring(0, 1, 32); ring(0, 0.5f, 20); L(V3(-1, 0, 0), V3(1, 0, 0)); L(V3(0, 0, -1), V3(0, 0, 1)); break;
     case ObjType::Square:
         for (int k = -2; k <= 2; k++) { L(V3(k * 0.5f, 0, -1), V3(k * 0.5f, 0, 1)); L(V3(-1, 0, k * 0.5f), V3(1, 0, k * 0.5f)); }
@@ -688,7 +949,8 @@ Object makeObject(ObjType t, int n) {
     o.name = std::string(objTypeName(t)) + " " + std::to_string(n);
     o.seed = (uint32_t)n * 7919u + 17u;
     switch (t) {
-    case ObjType::Sphere: case ObjType::Cube: o.pos = {0, 2, 0}; o.scl = V3(2.f); break;
+    case ObjType::Sphere: case ObjType::Cube: case ObjType::Metaball: o.pos = {0, 2, 0}; o.scl = V3(2.f); break;
+    case ObjType::Picture: o.pos = {0, 2, 0}; o.scl = V3(2.f); o.mat.specular = 0; break;
     case ObjType::Cylinder: o.pos = {0, 3, 0}; o.scl = {1.5f, 3, 1.5f}; break;
     case ObjType::Cone: o.pos = {0, 3, 0}; o.scl = {2, 3, 2}; break;
     case ObjType::Pyramid: o.pos = {0, 3, 0}; o.scl = V3(3.f); break;
@@ -817,6 +1079,47 @@ static void readSky(std::istream& f, Sky& k, int ver) {
     f >> k.moonAlt >> k.moonAz >> k.moonPhase >> k.moonSize >> k.rainbow;
 }
 
+static void writeLayer(std::ostream& f, const TextureLayer& l) {
+    f << (int)l.tex << ' ' << (int)l.map << ' ' << (int)l.blend << ' ' << (int)l.mask << ' ' << l.texScale << ' ' << l.opacity << ' ';
+    wv(f, l.color1); wv(f, l.color2); wv(f, l.offset); wv(f, l.rotation);
+    for (float value : l.influence) f << value << ' ';
+    ws(f, l.image);
+}
+
+static bool readLayer(std::istream& f, TextureLayer& l) {
+    int tex = 0, map = 0, blend = 0, mask = 0;
+    if (!(f >> tex >> map >> blend >> mask >> l.texScale >> l.opacity)) return false;
+    if (tex < 0 || tex >= (int)TexType::COUNT || map < 0 || map >= (int)TexMap::COUNT ||
+        blend < 0 || blend >= (int)TexBlend::COUNT || mask < 0 || mask >= (int)TexMask::COUNT ||
+        l.texScale < 0.01f || l.texScale > 20 || l.opacity < 0 || l.opacity > 1) return false;
+    l.tex = (TexType)tex; l.map = (TexMap)map; l.blend = (TexBlend)blend; l.mask = (TexMask)mask;
+    rv(f, l.color1); rv(f, l.color2); rv(f, l.offset); rv(f, l.rotation);
+    for (float& value : l.influence)
+        if (!(f >> value) || value < 0 || value > 1) return false;
+    rs(f, l.image, 2);
+    if (!f) return false;
+    l.img.reset();
+    return true;
+}
+
+bool TextureLayer::save(const std::string& path) const {
+    std::ofstream f(path);
+    f << std::setprecision(7) << "CANYONTEX 1\n";
+    writeLayer(f, *this);
+    f << '\n';
+    return (bool)f;
+}
+
+bool TextureLayer::load(const std::string& path) {
+    std::ifstream f(path);
+    std::string header;
+    int version = 0;
+    TextureLayer layer;
+    if (!(f >> header >> version) || header != "CANYONTEX" || version != 1 || !readLayer(f, layer)) return false;
+    *this = std::move(layer);
+    return true;
+}
+
 static void writeMat(std::ostream& f, const Material& m) {
     ws(f, m.name);
     f << (int)m.tex << ' ';
@@ -826,6 +1129,8 @@ static void writeMat(std::ostream& f, const Material& m) {
     ws(f, m.category);
     f << (int)m.map << ' ' << m.emission << ' ' << m.blur << ' ';
     ws(f, m.image);
+    f << m.layers.size() << ' ';
+    for (const auto& layer : m.layers) writeLayer(f, layer);
 }
 static bool readMat(std::istream& f, Material& m, int ver) {
     int t = 0;
@@ -843,13 +1148,19 @@ static bool readMat(std::istream& f, Material& m, int ver) {
     m.map = (TexMap)mp;
     rs(f, m.image, ver);
     m.img.reset();
-    return true;
+    if (ver < 3) return (bool)f;
+    int count = 0;
+    if (!(f >> count) || count < 0 || count > MAX_TEXTURE_LAYERS) return false;
+    m.layers.resize(count);
+    for (auto& layer : m.layers)
+        if (!readLayer(f, layer)) return false;
+    return (bool)f;
 }
 
 bool Scene::save(const std::string& path) const {
     std::ofstream f(path);
     if (!f) return false;
-    f << std::setprecision(7) << "CANYON3D 2\ncamera ";
+    f << std::setprecision(7) << "CANYON3D 3\ncamera ";
     writeCam(f, cam);
     f << "\nsky ";
     writeSky(f, sky);
@@ -869,6 +1180,17 @@ bool Scene::save(const std::string& path) const {
           << o.hidden << ' ' << o.locked << ' ' << o.seed << ' ' << o.treePart << "\nmaterial ";
         writeMat(f, o.mat);
         f << "\n";
+        if (o.type == ObjType::Metaball) f << "metaball " << o.metaRadius << ' ' << o.metaStrength << ' ' << o.metaNegative << "\n";
+        if (o.type == ObjType::Picture) {
+            const Picture& p = o.picture;
+            f << "picture "; ws(f, p.path); wv(f, p.keyColor);
+            f << p.aspect << ' ' << p.keyTolerance << ' ' << p.billboard << ' ' << p.chroma << ' ' << p.shadows << ' ' << p.reflections << "\n";
+        }
+        if (o.type == ObjType::Torus)
+            f << "torus " << o.torus.major << ' ' << o.torus.minor << ' ' << o.torus.section << ' ' << o.torus.start << ' ' << o.torus.sweep << "\n";
+        if (o.type == ObjType::Stone)
+            f << "stone " << o.stone.irregularity << ' ' << o.stone.blockiness << ' ' << o.stone.smoothing << "\n";
+        if (o.type == ObjType::Mesh && o.flatMesh) f << "flatmesh\n";
         if (o.treePart) {
             const TreeParams& t = o.tree;
             f << "tree " << t.height << ' ' << t.spread << ' ' << t.trunkRadius << ' ' << t.leafSize << ' ' << t.leafDensity << ' ' << t.levels
@@ -895,7 +1217,7 @@ bool Scene::load(const std::string& path) {
     std::ifstream f(path);
     std::string tok;
     int ver = 0;
-    if (!(f >> tok >> ver) || tok != "CANYON3D" || ver < 1 || ver > 2) return false;
+    if (!(f >> tok >> ver) || tok != "CANYON3D" || ver < 1 || ver > 3) return false;
     Scene s;
     s.sky = skyPresets()[0];
     while (f >> tok) {
@@ -932,7 +1254,7 @@ bool Scene::load(const std::string& path) {
             Object o;
             int t = 0;
             f >> t;
-            if (t < 0 || t >= (int)ObjType::COUNT) return false;
+            if (t < 0 || t >= (int)(ver < 3 ? ObjType::Metaball : ObjType::COUNT)) return false;
             o.type = (ObjType)t;
             rs(f, o.name, ver);
             rv(f, o.pos); rv(f, o.rot); rv(f, o.scl); rv(f, o.lightColor);
@@ -949,6 +1271,34 @@ bool Scene::load(const std::string& path) {
             s.objs.push_back(o);
         } else if (tok == "material") {
             if (s.objs.empty() || !readMat(f, s.objs.back().mat, ver)) return false;
+        } else if (tok == "metaball") {
+            if (ver < 3 || s.objs.empty() || s.objs.back().type != ObjType::Metaball) return false;
+            Object& o = s.objs.back();
+            f >> o.metaRadius >> o.metaStrength;
+            rb(f, o.metaNegative);
+            if (o.metaRadius < 0.2f || o.metaRadius > 4 || o.metaStrength < 0.1f || o.metaStrength > 4) return false;
+        } else if (tok == "picture") {
+            if (ver < 3 || s.objs.empty() || s.objs.back().type != ObjType::Picture) return false;
+            Picture& p = s.objs.back().picture;
+            rs(f, p.path, ver); rv(f, p.keyColor);
+            f >> p.aspect >> p.keyTolerance;
+            rb(f, p.billboard); rb(f, p.chroma); rb(f, p.shadows); rb(f, p.reflections);
+            if (p.aspect < 1.f / 16385 || p.aspect > 16385 || p.keyTolerance < 0 || p.keyTolerance > 1) return false;
+        } else if (tok == "torus") {
+            if (ver < 3 || s.objs.empty() || s.objs.back().type != ObjType::Torus) return false;
+            TorusShape& t = s.objs.back().torus;
+            f >> t.major >> t.minor >> t.section >> t.start >> t.sweep;
+            if (t.major < 0.1f || t.major > 3 || t.minor < 0.04f || t.minor >= t.major || t.section < 0.2f || t.section > 3 ||
+                t.start < 0 || t.start > 360 || t.sweep < 5 || t.sweep > 360) return false;
+        } else if (tok == "stone") {
+            if (ver < 3 || s.objs.empty() || s.objs.back().type != ObjType::Stone) return false;
+            StoneShape& shape = s.objs.back().stone;
+            f >> shape.irregularity >> shape.blockiness >> shape.smoothing;
+            if (shape.irregularity < 0 || shape.irregularity > 2 || shape.blockiness < 0 || shape.blockiness > 1 ||
+                shape.smoothing < 0 || shape.smoothing > 1) return false;
+        } else if (tok == "flatmesh") {
+            if (ver < 3 || s.objs.empty() || s.objs.back().type != ObjType::Mesh) return false;
+            s.objs.back().flatMesh = true;
         } else if (tok == "tree") {
             if (s.objs.empty()) return false;
             TreeParams& t = s.objs.back().tree;
@@ -1014,7 +1364,7 @@ bool Scene::merge(const std::string& path) {
 bool Library::save(const std::string& path) const {
     std::ofstream f(path);
     if (!f) return false;
-    f << std::setprecision(7) << "CANYONLIB 2\n";
+    f << std::setprecision(7) << "CANYONLIB 3\n";
     for (auto& m : mats) { f << "material "; writeMat(f, m); f << "\n"; }
     for (auto& k : skies) { f << "sky "; writeSky(f, k); f << "\n"; }
     return (bool)f;
@@ -1024,7 +1374,7 @@ bool Library::load(const std::string& path) {
     std::ifstream f(path);
     std::string tok;
     int ver = 0;
-    if (!(f >> tok >> ver) || tok != "CANYONLIB" || ver != 2) return false;
+    if (!(f >> tok >> ver) || tok != "CANYONLIB" || ver < 2 || ver > 3) return false;
     Library l;
     while (f >> tok) {
         if (tok == "material") {

@@ -54,6 +54,190 @@ static int fails = 0;
 #define CHECK(c) do { if (!(c)) { printf("  FAIL %s:%d %s\n", __FILE__, __LINE__, #c); fails++; } } while (0)
 
 int main() {
+    printf("metaball fields and Booleans\n");
+    {
+        Scene s;
+        Object ball = makeObject(ObjType::Metaball, 1);
+        ball.scl = V3(1);
+        ball.pos = {-1.04f, 0, 0};
+        s.objs.push_back(ball);
+        ball.pos.x = 1.04f;
+        s.objs.push_back(ball);
+        Ray ray{{0, 0, 4}, {0, 0, -1}};
+        Hit hit;
+        s.updateAll();
+        CHECK(!intersectScene(s, ray, 10, hit));
+        s.objs[0].group = s.objs[1].group = 1;
+        s.updateAll();
+        CHECK(intersectScene(s, ray, 10, hit) && hit.n.z > 0.9f);
+        float outside = hit.t;
+
+        ball.pos = {};
+        ball.group = 1;
+        ball.metaRadius = 0.22f;
+        ball.metaNegative = true;
+        s.objs.push_back(ball);
+        s.updateAll();
+        CHECK(intersectScene(s, {{}, {0, 0, 1}}, 10, hit) && hit.n.z < -0.9f);
+
+        Object cutter = makeObject(ObjType::Cube, 1);
+        cutter.group = 1;
+        cutter.pos = {0, 0, 0.55f};
+        cutter.scl = V3(0.35f);
+        cutter.boolMode = BoolMode::Negative;
+        s.objs.push_back(cutter);
+        s.updateAll();
+        CHECK(intersectScene(s, ray, 10, hit) && hit.t > outside && hit.n.z > 0.9f);
+
+        cutter.boolMode = BoolMode::Intersect;
+        s.objs.back() = cutter;
+        s.updateAll();
+        CHECK(intersectScene(s, ray, 10, hit) && std::fabs(hit.t - outside) < 0.001f);
+        CHECK(s.save("build/t/metaballs.c3d"));
+        Scene copy;
+        CHECK(copy.load("build/t/metaballs.c3d"));
+        CHECK(copy.objs.size() == 4 && copy.objs[2].metaNegative && copy.objs[2].metaRadius == ball.metaRadius);
+        CHECK(intersectScene(copy, ray, 10, hit) && std::fabs(hit.t - outside) < 0.001f);
+        std::remove("build/t/metaballs.c3d");
+    }
+    printf("picture planes, cutouts and ray visibility\n");
+    {
+        const char* imagePath = "build/t/picture fixture.bmp";
+        const char* scenePath = "build/t/picture fixture.c3d";
+        CHECK(saveBMP(imagePath, 2, 1, {0xff00ff, 0xff0000}));
+        Scene s;
+        Object card = makeObject(ObjType::Picture, 1);
+        card.pos = {};
+        card.scl = V3(1);
+        card.picture.path = imagePath;
+        card.picture.aspect = 2;
+        card.picture.chroma = true;
+        card.picture.shadows = card.picture.reflections = false;
+        s.objs.push_back(card);
+        s.updateAll();
+        Hit hit;
+        Ray opaque{{0.5f, 0, 2}, {0, 0, -1}};
+        CHECK(intersectScene(s, opaque, 10, hit) && hit.pictureColor.x > 0.99f && hit.pictureColor.z < 0.01f);
+        CHECK(!intersectScene(s, {{-0.5f, 0, 2}, opaque.d}, 10, hit));
+        CHECK(!intersectScene(s, {{0.5f, 0.75f, 2}, opaque.d}, 10, hit));
+        CHECK(!intersectScene(s, opaque, 10, hit, -1, RayPurpose::Shadow));
+        CHECK(!intersectScene(s, opaque, 10, hit, -1, RayPurpose::Reflection));
+        s.cam.target = {};
+        s.cam.yaw = 90;
+        s.cam.pitch = 0;
+        s.objs.front().picture.billboard = true;
+        s.updateAll();
+        CHECK(dot(normalize(s.objs.front().fwd.col(2)), V3(1, 0, 0)) > 0.99f);
+        CHECK(s.save(scenePath));
+        Scene copy;
+        CHECK(copy.load(scenePath));
+        CHECK(copy.objs.size() == 1 && copy.objs[0].picture.image && copy.objs[0].picture.billboard &&
+              copy.objs[0].picture.chroma && !copy.objs[0].picture.reflections);
+        std::remove(imagePath);
+        std::remove(scenePath);
+    }
+    printf("layered materials and texture presets\n");
+    {
+        const char* scenePath = "build/t/layers fixture.c3d";
+        const char* texturePath = "build/t/layers fixture.c3tex";
+        const char* libraryPath = "build/t/layers fixture.txt";
+        Scene s;
+        s.cam.target = {};
+        s.cam.yaw = s.cam.pitch = 0;
+        s.cam.dist = 4;
+        s.sky.mode = 3;
+        s.sky.sunAlt = -90;
+        s.sky.ambient = 0.5f;
+        s.sky.ambientColor = V3(1);
+        Object sphere = makeObject(ObjType::Sphere, 1);
+        sphere.pos = {};
+        sphere.scl = V3(1);
+        sphere.mat.ambient = 1;
+        sphere.mat.color1 = V3(0.2f);
+        s.objs.push_back(sphere);
+        uint32_t base = 0, layered = 0, masked = 0;
+        renderImage(s, 1, 1, &base, 0);
+        TextureLayer layer;
+        layer.color1 = {0.9f, 0.1f, 0.1f};
+        layer.map = TexMap::World;
+        layer.offset = {1, 2, 3};
+        layer.rotation.z = 45;
+        s.objs[0].mat.layers = {layer};
+        renderImage(s, 1, 1, &layered, 0);
+        CHECK(((layered >> 16) & 255) > ((base >> 16) & 255));
+        CHECK((layered & 255) < (base & 255));
+
+        TextureLayer mask;
+        mask.color1 = V3(0);
+        mask.influence.fill(0);
+        layer.mask = TexMask::Previous;
+        layer.blend = TexBlend::Multiply;
+        layer.influence[TexReflection] = 0.35f;
+        s.objs[0].mat.layers = {mask, layer};
+        renderImage(s, 1, 1, &masked, 0);
+        CHECK(masked == base);
+
+        CHECK(layer.save(texturePath));
+        TextureLayer restored;
+        CHECK(restored.load(texturePath) && restored.map == TexMap::World && restored.rotation.z == 45 &&
+              restored.offset.y == 2 && restored.influence[TexReflection] == 0.35f &&
+              restored.mask == TexMask::Previous && restored.blend == TexBlend::Multiply);
+        CHECK(s.save(scenePath));
+        Scene copy;
+        CHECK(copy.load(scenePath) && copy.objs.size() == 1 && copy.objs[0].mat.layers.size() == 2);
+        Library lib, recovered;
+        lib.mats.push_back(s.objs[0].mat);
+        CHECK(lib.save(libraryPath) && recovered.load(libraryPath) && recovered.mats.size() == 1 &&
+              recovered.mats[0].layers.size() == 2);
+        std::remove(scenePath);
+        std::remove(texturePath);
+        std::remove(libraryPath);
+    }
+    printf("object editor geometry and persistence\n");
+    {
+        Scene s;
+        Object torus = makeObject(ObjType::Torus, 1);
+        torus.pos = {};
+        torus.scl = V3(1);
+        torus.torus = {0.8f, 0.2f, 1.5f, 0, 90};
+        torus.update();
+        Hit hit;
+        CHECK(intersectObject(torus, {{0.8f, 2, 0.2f}, {0, -1, 0}}, 10, hit) && hit.p.y > 0.26f);
+        CHECK(!intersectObject(torus, {{-0.8f, 2, 0.2f}, {0, -1, 0}}, 10, hit));
+        CHECK(intersectObject(torus, {{0.8f, 0, -1}, {0, 0, 1}}, 10, hit) &&
+              std::fabs(hit.p.z) < 0.001f && hit.n.z < -0.99f);
+
+        Object stone = makeObject(ObjType::Stone, 1);
+        stone.pos = {};
+        stone.scl = V3(1);
+        stone.stone = {0, 0, 0.8f};
+        stone.update();
+        Ray corner{{0.72f, 0.72f, 3}, {0, 0, -1}};
+        CHECK(!intersectObject(stone, corner, 10, hit));
+        stone.stone.blockiness = 1;
+        CHECK(intersectObject(stone, corner, 10, hit) && std::fabs(hit.p.z - 0.8f) < 0.001f);
+
+        Object mesh = makeObject(ObjType::Mesh, 1);
+        auto data = std::make_shared<Mesh>();
+        data->v = {{-1, -1, 0}, {1, -1, 0}, {0, 1, 0}};
+        data->n.assign(3, V3(0, 1, 0));
+        data->tri = {0, 1, 2};
+        data->build();
+        mesh.mesh = data;
+        mesh.update();
+        Ray front{{0, 0, 2}, {0, 0, -1}};
+        CHECK(intersectObject(mesh, front, 10, hit) && hit.n.y > 0.99f);
+        mesh.flatMesh = true;
+        CHECK(intersectObject(mesh, front, 10, hit) && hit.n.z > 0.99f);
+
+        s.objs = {torus, stone, mesh};
+        const char* path = "build/t/object editors.c3d";
+        CHECK(s.save(path));
+        Scene copy;
+        CHECK(copy.load(path) && copy.objs.size() == 3 && copy.objs[0].torus.sweep == 90 &&
+              copy.objs[1].stone.blockiness == 1 && copy.objs[2].flatMesh);
+        std::remove(path);
+    }
     printf("premium / dof / soft shadows\n");
     {
         Scene s = makeExample(3);
