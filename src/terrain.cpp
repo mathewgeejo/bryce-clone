@@ -20,7 +20,8 @@ const char* brushName(BrushMode m) {
 }
 
 const char* terrainKindName(TerrainKind k) {
-    static const char* n[] = {"Mountains", "Alpine", "Rolling Hills", "Canyon", "Dunes", "Volcano", "Mesas", "Archipelago", "Crags"};
+    static const char* n[] = {"Mountains", "Alpine", "Rolling Hills", "Canyon", "Dunes", "Volcano", "Mesas",
+                              "Archipelago", "Crags", "Badlands", "Salt Flats", "Glacial Bowl"};
     return n[(int)k];
 }
 
@@ -146,6 +147,24 @@ void hfGenerate(Heightfield& f, TerrainKind k, uint32_t seed, float rough) {
                 gamma = 1.8f;
                 break;
             }
+            case TerrainKind::Badlands: {
+                V3 q = warp(p * 1.25f, 0.38f);
+                q.z *= 2.7f;
+                h = std::pow(ridgedMF(q, 7, rough), 2.4f) + 0.22f * std::fabs(fbmR(q * 6, 4, 0.55f));
+                break;
+            }
+            case TerrainKind::SaltFlats: {
+                float cracks = std::fabs(noise3(p * 14));
+                h = 0.4f + fbmR(p * 1.1f, 4, rough) * 0.15f + smoothstep(0.008f, 0.06f, cracks) * 0.09f;
+                scale = 0.14f;
+                masked = false;
+                break;
+            }
+            case TerrainKind::Glacial: {
+                float valley = std::fabs(u - 0.47f + fbmR(p * 0.6f, 4, rough) * 0.19f);
+                h = smoothstep(0.12f, 0.46f, valley) * (0.42f + 0.65f * ridgedMF(warp(p, 0.2f), 7, rough));
+                break;
+            }
             default: break;
             }
             f.h[z * N + x] = h;
@@ -164,6 +183,20 @@ void hfGenerate(Heightfield& f, TerrainKind k, uint32_t seed, float rough) {
 
 void hfFractal(Heightfield& f, uint32_t seed, float rough, bool ridged) {
     hfGenerate(f, ridged ? TerrainKind::Alpine : TerrainKind::Mountains, seed, rough);
+}
+
+void hfCustomFractal(Heightfield& f, uint32_t seed, float rough, bool ridged, float frequency, int octaves) {
+    Rng random(seed);
+    V3 offset(random.f() * 128, random.f() * 128, random.f() * 128);
+    int n = f.res;
+    for (int z = 0; z < n; ++z)
+        for (int x = 0; x < n; ++x) {
+            float u = x / (float)(n - 1), v = z / (float)(n - 1);
+            V3 p = offset + V3(u * frequency, 0, v * frequency);
+            float value = ridged ? ridgedMF(p, octaves, rough) : 0.5f + 0.7f * fbmR(p, octaves, rough);
+            f.h[z * n + x] = clampf(value * organicMask(u, v, offset, 0.99f), 0, 1);
+        }
+    f.computeNormals();
 }
 
 void hfSmooth(Heightfield& f) {
@@ -273,12 +306,37 @@ void hfPlateau(Heightfield& f, float level) {
     f.computeNormals();
 }
 
-void hfBrush(Heightfield& f, float u, float v, float radius, float amount, BrushMode mode) {
+TerrainPatch hfCopyRegion(const Heightfield& f, HeightRegion area) {
+    TerrainPatch p{area.x1 - area.x0 + 1, area.z1 - area.z0 + 1, {}};
+    for (int z = area.z0; z <= area.z1; ++z)
+        p.values.insert(p.values.end(), f.h.begin() + z * f.res + area.x0, f.h.begin() + z * f.res + area.x1 + 1);
+    return p;
+}
+
+void hfPasteRegion(Heightfield& f, HeightRegion area, const TerrainPatch& p) {
+    if (p.values.empty()) return;
+    for (int z = area.z0; z <= area.z1; ++z)
+        for (int x = area.x0; x <= area.x1; ++x) {
+            int u = (x - area.x0) * (p.width - 1) / std::max(1, area.x1 - area.x0);
+            int v = (z - area.z0) * (p.height - 1) / std::max(1, area.z1 - area.z0);
+            f.h[z * f.res + x] = p.values[v * p.width + u];
+        }
+    f.computeNormals(area.x0 - 1, area.z0 - 1, area.x1 + 1, area.z1 + 1);
+}
+
+void hfBrush(Heightfield& f, float u, float v, float radius, float amount, BrushMode mode, const HeightRegion* mask) {
     int N = f.res;
     float cx = u * (N - 1), cz = v * (N - 1), rp = std::max(1.f, radius * (N - 1));
     int x0 = std::max(0, (int)(cx - rp)), x1 = std::min(N - 1, (int)(cx + rp) + 1);
     int z0 = std::max(0, (int)(cz - rp)), z1 = std::min(N - 1, (int)(cz + rp) + 1);
-    std::vector<float> o = f.h;
+    if (mask) {
+        x0 = std::max(x0, mask->x0); x1 = std::min(x1, mask->x1);
+        z0 = std::max(z0, mask->z0); z1 = std::min(z1, mask->z1);
+    }
+    if (x0 > x1 || z0 > z1) return;
+    std::vector<float> copy;
+    if (mode == BrushMode::Smooth || mode == BrushMode::Erode) copy = f.h;
+    const auto& o = copy.empty() ? f.h : copy;
     float centre = o[std::min(N - 1, std::max(0, (int)cz)) * N + std::min(N - 1, std::max(0, (int)cx))];
     float top = 0;
     if (mode == BrushMode::Plateau)
@@ -307,13 +365,15 @@ void hfBrush(Heightfield& f, float u, float v, float radius, float amount, Brush
                 for (int dz = -1; dz <= 1; dz++)
                     for (int dx = -1; dx <= 1; dx++) {
                         int xx = x + dx, zz = z + dz;
-                        if (xx >= 0 && zz >= 0 && xx < N && zz < N && o[zz * N + xx] < lo) { lo = o[zz * N + xx]; lx = xx; lz = zz; }
+                        if (xx >= 0 && zz >= 0 && xx < N && zz < N &&
+                            (!mask || (xx >= mask->x0 && xx <= mask->x1 && zz >= mask->z0 && zz <= mask->z1)) &&
+                            o[zz * N + xx] < lo) { lo = o[zz * N + xx]; lx = xx; lz = zz; }
                     }
                 float drop = o[z * N + x] - lo, talus = 1.5f / N;
                 if (drop > talus) {
                     float m = (drop - talus) * clampf(amount * 10 * w, 0, 0.5f);
                     hv -= m;
-                    f.h[lz * N + lx] += m * 0.6f;
+                    f.h[lz * N + lx] = std::min(1.f, f.h[lz * N + lx] + m * 0.6f);
                 }
                 float n = std::fabs(noise3(V3(x * 0.5f, 2.5f, z * 0.5f)));
                 hv -= amount * 0.15f * w * smoothstep(0.f, 0.2f, n) * clampf(drop * N, 0, 1);
@@ -329,7 +389,7 @@ void hfBrush(Heightfield& f, float u, float v, float radius, float amount, Brush
             }
             hv = clampf(hv, 0, 1);
         }
-    f.computeNormals();
+    f.computeNormals(x0 - 2, z0 - 2, x1 + 2, z1 + 2);
 }
 
 void hfTerrace(Heightfield& f, int levels) {

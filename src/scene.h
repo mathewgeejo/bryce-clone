@@ -1,6 +1,7 @@
 #pragma once
 #include <array>
 #include <memory>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -41,6 +42,7 @@ struct Material : Texture {
     std::string name = "Default Gray", category = "Basic";
     float diffuse = 0.85f, ambient = 0.3f, specular = 0.25f, shininess = 30.f;
     float reflect = 0.f, transparency = 0.f, ior = 1.f, bump = 0.f, metal = 0.f, emission = 0.f, blur = 0.f;
+    float absorption = 0, volumeDensity = 0, volumeScatter = 0.8f, volumeNoise = 0;
     std::vector<TextureLayer> layers;
 };
 const std::vector<Material>& materialPresets();
@@ -65,6 +67,8 @@ struct Sky {
     bool moon = false;
     float moonAlt = 30, moonAz = 300, moonPhase = 0.5f, moonSize = 1.6f;
     float rainbow = 0;
+    float cloudAltitude = 12, cloudThickness = 2, cloudShadow = 0, skylight = 0;
+    V3 stratusColor{1, 1, 1}, moonColor{0.95f, 0.93f, 0.88f};
     V3 sunDir() const { return dirFrom(sunAlt, sunAz); }
     V3 moonDir() const { return dirFrom(moonAlt, moonAz); }
     static V3 dirFrom(float alt, float az) {
@@ -81,7 +85,18 @@ const char* objTypeName(ObjType t);
 inline bool isInfinite(ObjType t) { return t == ObjType::Ground || t == ObjType::Water || t == ObjType::Cloud; }
 inline bool isLight(ObjType t) { return t == ObjType::Light || t == ObjType::Spotlight || t == ObjType::Parallel; }
 inline bool isHeightfield(ObjType t) { return t == ObjType::Terrain || t == ObjType::Lattice; }
-inline bool isCsgCapable(ObjType t) { return t <= ObjType::Pyramid; }
+inline bool isCsgCapable(ObjType t) { return t <= ObjType::Pyramid || t == ObjType::Lattice; }
+inline bool canVolume(ObjType t) { return t <= ObjType::Pyramid; }
+
+enum class Falloff { Soft, None, Linear, InverseSquare, COUNT };
+struct LightSettings {
+    Falloff falloff = Falloff::Soft;
+    float range = 20;
+    int samples = 1;
+    bool casts = true, disk = false, enabled = true, visible = false;
+    std::string gel;
+    std::shared_ptr<const Image> gelImage;
+};
 
 enum class BoolMode { Neutral, Positive, Negative, Intersect, COUNT };
 const char* boolName(BoolMode b);
@@ -91,10 +106,12 @@ struct Heightfield {
     std::vector<float> h;
     std::vector<V3> n;
     float at(int x, int z) const { return h[z * res + x]; }
-    void computeNormals();
+    void computeNormals(int x0 = 0, int z0 = 0, int x1 = -1, int z1 = -1);
 };
 
-struct Key { int frame = 0; V3 pos, rot, scl{1, 1, 1}; };
+enum class Ease { Spline, Linear, Smooth, Hold, COUNT };
+const char* easeName(Ease ease);
+struct Key { int frame = 0; V3 pos, rot, scl{1, 1, 1}; Ease ease = Ease::Spline; };
 struct Camera;
 
 struct Picture {
@@ -115,6 +132,19 @@ struct StoneShape {
     float irregularity = 1.f, blockiness = 0.f, smoothing = 0.f;
 };
 
+struct TerrainShape { float height = 1, clip = 0, thickness = 0; };
+
+struct AppearanceKey {
+    int frame = 0;
+    Material material;
+    Picture picture;
+    TerrainShape terrain;
+    V3 lightColor;
+    std::array<float, 4> light{};
+    bool hidden = false;
+    Ease ease = Ease::Linear;
+};
+
 struct Object {
     ObjType type = ObjType::Sphere;
     std::string name;
@@ -122,7 +152,12 @@ struct Object {
     Material mat;
     V3 lightColor{1, 1, 1};
     float lightPower = 1, spotAngle = 30, spotSoft = 0.3f, lightSize = 0;
+    LightSettings lighting;
     int group = 0;
+    int parent = -1;
+    M3 bind;
+    V3 bindOffset;
+    bool hasBind = false;
     BoolMode boolMode = BoolMode::Neutral;
     bool hidden = false, locked = false;
     float metaRadius = 1.4f, metaStrength = 1.f;
@@ -130,6 +165,7 @@ struct Object {
     Picture picture;
     TorusShape torus;
     StoneShape stone;
+    TerrainShape terrain;
     bool flatMesh = false;
     uint32_t seed = 1;
     int treePart = 0;  // 0 none, 1 trunk, 2 foliage (mesh regenerated from `tree`)
@@ -137,21 +173,29 @@ struct Object {
     std::shared_ptr<Heightfield> hf;
     std::shared_ptr<const Mesh> mesh;
     std::vector<Key> keys;
+    std::vector<AppearanceKey> appearances;
     // derived by update()
-    M3 fwd, inv, nrm;
-    V3 bcenter;
+    M3 fwd, inv, nrm, parentSpace, parentInv;
+    V3 bcenter, worldPos;
     float bradius = -1;
     bool csg = false;
-    void update(const Camera* camera = nullptr);
+    void update(const Camera* camera = nullptr, const Object* ancestor = nullptr);
+    void moveWorld(V3 delta) { pos += parentInv * delta; }
+    float terrainAt(int x, int z) const { return std::max(terrain.clip, hf->at(x, z)) * terrain.height; }
+    AppearanceKey appearance(int frame) const;
     V3 lightAxis() const { return normalize(fwd * V3(0, -1, 0)); }
 };
 
 struct Camera {
     V3 target{0, 4, 0};
     float yaw = 20, pitch = 8, dist = 48, fov = 50;
+    bool orthographic = false;
+    float orthoScale = 20;
+    int lookAt = -1;
     V3 eye() const;
 };
-struct CamKey { int frame = 0; Camera cam; };
+struct CamKey { int frame = 0; Camera cam; Ease ease = Ease::Spline; };
+struct NamedCamera { std::string name; Camera view; std::vector<CamKey> keys; };
 struct SkyKey { int frame = 0; Sky sky; };
 
 struct RenderSettings {
@@ -160,6 +204,10 @@ struct RenderSettings {
     int samples = 16;
     bool dof = false, panorama = false, softShadows = true, blurReflections = true;
     float focusDist = 40, aperture = 0.4f, gamma = 1, brightness = 0, contrast = 1, saturation = 1;
+    int bounces = 0, seed = 1;
+    bool transparentShadows = true, adaptive = false, denoise = false, region = false;
+    bool alpha = false, depthOutput = false, idOutput = false;
+    float cropX = 0, cropY = 0, cropW = 0.5f, cropH = 0.5f;
 };
 
 struct ViewBasis {
@@ -175,26 +223,47 @@ ViewBasis orthoBasis(int mode, V3 center, float halfH);
 struct Hit {
     float t = 0;
     V3 p, n, lp, lr, pictureColor;
+    float pictureOpacity = 1;
     float ly = 0;
     int obj = -1;
 };
 
 struct MetaballGroup {
     std::vector<int> balls, operands;
+    bool nested = false;
 };
+
+struct BooleanLink { int child, parent; BoolMode mode; };
+struct BooleanNode {
+    int field = -1;
+    bool nested = false;
+    std::vector<int> parts;
+    std::vector<std::pair<int, BoolMode>> children;
+};
+struct SceneNode { V3 lower, upper; int left = -1, right = -1, first = 0, count = 0; };
 
 struct Scene {
     std::vector<Object> objs;
+    std::string title, description;
+    std::map<std::string, std::shared_ptr<const Image>> embeddedImages;
     Sky sky;
     Camera cam;
     RenderSettings render;
     int frames = 120, fps = 15, frame = 0;
     std::vector<CamKey> camKeys;
+    std::vector<NamedCamera> cameras;
+    int activeCamera = -1;
     std::vector<SkyKey> skyKeys;
     Camera memory[6];
     bool memorySet[6] = {};
     std::vector<std::vector<int>> csg;  // derived: boolean groups
     std::vector<MetaballGroup> metaballs;
+    std::vector<BooleanLink> booleanLinks;
+    std::vector<BooleanNode> booleanNodes;
+    std::vector<int> lights, volumes;
+    std::vector<SceneNode> rayNodes;
+    std::vector<int> rayOrder, unbounded;
+    bool cutterMaterial = false;
     void updateAll();
     Scene snapshot() const;
     void applyFrame(int f);
@@ -202,6 +271,19 @@ struct Scene {
     bool save(const std::string& path) const;
     bool load(const std::string& path);
     bool merge(const std::string& path);
+    bool package(const std::string& path, std::string& error) const;
+    bool embedAssets(std::string& error);
+    std::vector<std::string> missingAssets() const;
+    bool relinkAsset(const std::string& source, const std::string& replacement);
+    void reloadAssets();
+    void append(Scene other);
+    Camera viewCamera() const;
+    void selectCamera(int index);
+    bool setParent(int child, int newParent);
+    bool setBooleanParent(int child, int parent, BoolMode mode);
+    Scene subset(const std::vector<int>& indices) const;
+private:
+    bool writeFile(const std::string& path) const;
 };
 
 template <class K> void putKey(std::vector<K>& v, const K& k) {
@@ -226,12 +308,13 @@ struct Library {
 Object makeObject(ObjType t, int counter);
 Scene makeDefaultScene();
 Scene makeEmptyScene();
-enum class RayPurpose { View, Shadow, Reflection };
+enum class RayPurpose { View, Surface, Shadow, Reflection };
 bool intersectScene(const Scene& s, const Ray& r, float tmax, Hit& h, int skip = -1, RayPurpose purpose = RayPurpose::View);
 bool intersectObject(const Object& o, const Ray& r, float tmax, Hit& h);
 void wireframe(const Object& o, std::vector<V3>& segs);
 bool localBounds(const Object& o, V3& lo, V3& hi);
 bool worldBounds(const Object& o, V3& lo, V3& hi);
+std::vector<MeshLayer> meshSelection(const Scene& scene, const std::vector<int>& indices, int resolution);
 void regenTree(Object& o);
 void addTree(Scene& s, const TreeParams& p, V3 pos, float size, const Material& trunk, const Material& foliage, int counter);
 const std::vector<std::string>& exampleNames();

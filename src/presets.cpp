@@ -15,6 +15,17 @@ Material M(const char* cat, const char* n, T t, V3 a, V3 b, float diff, float am
     return m;
 }
 
+Material atmosphere(const char* name, V3 color, float density, float scatter, float noise) {
+    Material m;
+    m.category = "Atmosphere";
+    m.name = name;
+    m.color1 = color;
+    m.volumeDensity = density;
+    m.volumeScatter = scatter;
+    m.volumeNoise = noise;
+    return m;
+}
+
 struct SkyB {
     Sky s;
     SkyB(const char* cat, const char* n, V3 zen, V3 hor, V3 sun, float alt, float az) {
@@ -81,6 +92,7 @@ const std::vector<Material>& materialPresets() {
         M("Terrains", "Red Mesa", T::Strata, {.8f, .38f, .2f}, {.5f, .2f, .1f}, .9f, .3f, .05f, 10, 0, 0, 1, .5f, 1.5f),
         M("Terrains", "Tundra", T::Altitude, {.85f, .87f, .9f}, {.4f, .4f, .38f}, .9f, .3f, .05f, 10, 0, 0, 1, .4f, 2),
         M("Terrains", "Lunar Dust", T::Spots, {.62f, .62f, .6f}, {.42f, .42f, .41f}, .9f, .25f, .02f, 10, 0, 0, 1, .7f, 1.2f),
+        M("Terrains", "Salt Crust", T::Granite, {.92f, .88f, .81f}, {.62f, .55f, .47f}, .9f, .3f, .05f, 10, 0, 0, 1, .22f, 2.6f),
         // Waters
         M("Waters", "Water", T::Waves, {.12f, .32f, .42f}, {0, 0, 0}, .25f, .3f, .9f, 120, .35f, .55f, 1.33f, .5f, .6f),
         M("Waters", "Tropical Lagoon", T::Waves, {.1f, .6f, .6f}, {0, 0, 0}, .3f, .35f, .9f, 120, .25f, .7f, 1.33f, .35f, .5f),
@@ -94,6 +106,8 @@ const std::vector<Material>& materialPresets() {
         M("Clouds", "Storm Clouds", T::Clouds, {.55f, .57f, .6f}, {.25f, .26f, .3f}, .8f, .5f, 0, 10, 0, 0, 1, 0, .03f),
         M("Clouds", "Wispy Clouds", T::Clouds, {1, 1, 1}, {.85f, .88f, .92f}, .8f, .8f, 0, 10, 0, 0, 1, 0, .08f),
         M("Clouds", "Sunset Clouds", T::Clouds, {1, .7f, .45f}, {.65f, .35f, .4f}, .8f, .7f, 0, 10, 0, 0, 1, 0, .04f),
+        atmosphere("Basin Mist", {.75f, .87f, .94f}, .25f, .8f, .7f),
+        atmosphere("Volcanic Smoke", {.49f, .44f, .4f}, .7f, .38f, .85f),
         // Woods
         M("Woods", "Wood", T::Wood, {.78f, .52f, .27f}, {.45f, .25f, .1f}, .85f, .3f, .3f, 30, 0, 0, 1, .1f, 1),
         M("Woods", "Dark Walnut", T::Wood, {.42f, .26f, .14f}, {.2f, .11f, .05f}, .85f, .3f, .5f, 50, .05f, 0, 1, .1f, 1.5f),
@@ -149,6 +163,8 @@ const std::vector<Sky>& skyPresets() {
             SkyB("Weather", "Smog", {.55f, .52f, .45f}, {.75f, .68f, .55f}, {1, .8f, .55f}, 30, 210).haze(.7f, {.72f, .65f, .52f}).clouds(.1f, .3f, {.8f, .75f, .65f}).amb(.5f, {.6f, .55f, .5f}),
             SkyB("Weather", "Desert Heat", {.3f, .5f, .85f}, {.95f, .88f, .72f}, {1, .95f, .82f}, 60, 180).haze(.45f, {.95f, .88f, .75f}).clouds(.05f, .1f, white).amb(.6f, {.75f, .72f, .7f}),
             SkyB("Weather", "Arctic", {.45f, .6f, .85f}, {.88f, .92f, .98f}, {1, .98f, .95f}, 12, 160).haze(.3f, {.9f, .93f, .98f}).fog(.25f, 2, {.9f, .93f, .97f}).clouds(.2f, .2f, white).amb(.7f, {.75f, .82f, .95f}),
+            SkyB("Weather", "Windward Cloud Shelf", {.13f, .28f, .49f}, {.65f, .76f, .79f}, {.95f, .9f, .75f}, 29, 205)
+                .haze(.26f, {.67f, .78f, .82f}).clouds(.8f, .35f, {.81f, .87f, .93f}).amb(.57f, {.62f, .77f, .88f}),
             SkyB("Night", "Night", {.01f, .02f, .08f}, {.08f, .1f, .25f}, {.5f, .55f, .8f}, 35, 100).haze(.1f, {.1f, .12f, .25f}).clouds(.1f, 0, {.3f, .32f, .4f}).amb(.3f, {.15f, .2f, .4f}).stars(1).hideSun().moon(35, 100, .5f),
             SkyB("Night", "Moonrise", {.02f, .03f, .12f}, {.2f, .18f, .3f}, {.55f, .55f, .7f}, 8, 80).haze(.15f, {.2f, .18f, .3f}).clouds(.15f, .2f, {.3f, .3f, .4f}).amb(.25f, {.2f, .2f, .4f}).stars(.8f).hideSun().moon(8, 80, .45f, 3),
             SkyB("Night", "Crescent Night", {0, .01f, .05f}, {.05f, .07f, .18f}, {.3f, .32f, .45f}, 25, 240).haze(.08f, {.05f, .07f, .18f}).amb(.2f, {.1f, .12f, .3f}).stars(1).hideSun().moon(25, 240, .15f, 2),
@@ -161,6 +177,9 @@ const std::vector<Sky>& skyPresets() {
         };
         std::vector<Sky> out;
         for (auto& x : b) out.push_back(x.s);
+        for (auto& sky : out) if (sky.name == "Windward Cloud Shelf") {
+            sky.cloudAltitude = 16; sky.cloudThickness = 9; sky.cloudShadow = 0.6f; sky.skylight = 0.5f;
+        }
         return out;
     }();
     return p;
@@ -170,7 +189,8 @@ const std::vector<Sky>& skyPresets() {
 
 const std::vector<std::string>& exampleNames() {
     static const std::vector<std::string> n = {"Snowy Island", "Desert Canyon", "Moonlit Lake", "Boolean Studio", "Forest Glade", "Alien World",
-                                               "Chrome Dreams", "Floating Isles", "Ringed Planet", "Monolith Lake", "Stone Arch", "Volcano Isle"};
+                                               "Chrome Dreams", "Floating Isles", "Ringed Planet", "Monolith Lake", "Stone Arch", "Volcano Isle",
+                                               "Salt Road", "Boolean Observatory", "Windward Basin"};
     return n;
 }
 
@@ -181,7 +201,10 @@ const std::vector<std::string>& exampleDescriptions() {
         "Generated trees in golden-hour light with ground fog.", "A floating lattice, hologram ring and gas giant on an alien world.",
         "Chrome and glass spheres on an endless checkerboard at sunset.", "Rock islands with trees drifting above a sea of clouds.",
         "A ringed giant rising over jagged crags under a starfield.", "A black monolith standing in mirror-still water at dusk.",
-        "A weathered sandstone arch among dunes and distant mesas.", "A smoking volcano island glowing over a deep ocean."};
+        "A weathered sandstone arch among dunes and distant mesas.", "A smoking volcano island glowing over a deep ocean.",
+        "Salt flats and badlands with a freestanding survey-marker cutout.",
+        "A carved and nested stone observatory over a reflective floor.",
+        "A glacial bowl, cloud shadows and low drifting mist."};
     return d;
 }
 
@@ -458,6 +481,48 @@ Scene makeExample(int i) {
         s.objs.push_back(glow);
         s.objs.push_back(kindTerrain(2, {40, -3, -50}, {14, 5, 14}, "Alpine Meadow", TerrainKind::Archipelago, 112));
         s.cam.target = {0, 8, -20}; s.cam.dist = 58; s.cam.pitch = 17; s.cam.yaw = 330; s.cam.fov = 50;
+        break;
+    }
+    case 12: {
+        s.sky = skyNamed("Desert Heat");
+        s.objs.push_back(prim(ObjType::Ground, 1, {}, V3(1), "Desert Sand"));
+        s.objs.push_back(kindTerrain(1, {0, 0, -15}, {40, 2, 32}, "Salt Crust", TerrainKind::SaltFlats, 439));
+        s.objs.push_back(kindTerrain(2, {7, 0, -27}, {30, 14, 24}, "Sandstone", TerrainKind::Badlands, 63));
+        Object marker = makeObject(ObjType::Picture, 1);
+        marker.name = "Survey Marker";
+        marker.pos = {-3, 2.5f, 3};
+        marker.scl = V3(3);
+        marker.picture.path = "builtin:survey-marker";
+        marker.picture.aspect = 1.5f;
+        marker.picture.billboard = true;
+        s.objs.push_back(marker);
+        s.cam.target = {0, 4, -10}; s.cam.dist = 22; s.cam.pitch = 9; s.cam.yaw = 6;
+        break;
+    }
+    case 13: {
+        s.sky = skyNamed("High Cirrus");
+        s.objs.push_back(prim(ObjType::Ground, 1, {}, V3(1), "Checker"));
+        auto solid = prim(ObjType::Cube, 1, {0, 3.75f, 0}, {4.5f, 3.75f, 4.5f}, "Marble");
+        solid.group = 1; solid.boolMode = BoolMode::Positive;
+        s.objs.push_back(solid);
+        auto cutter = prim(ObjType::Sphere, 1, {0, 4, 0}, V3(5), "Sandstone");
+        cutter.group = 2; cutter.boolMode = BoolMode::Positive;
+        s.objs.push_back(cutter);
+        auto cutout = prim(ObjType::Cylinder, 1, {0, 5, 0}, {1, 4, 1}, "Sandstone");
+        cutout.group = 2; cutout.boolMode = BoolMode::Negative;
+        s.objs.push_back(cutout);
+        s.setBooleanParent(2, 1, BoolMode::Negative);
+        s.cam.target = {0, 3, 0}; s.cam.dist = 16; s.cam.pitch = 23; s.cam.yaw = 32;
+        break;
+    }
+    case 14: {
+        s.sky = skyNamed("Windward Cloud Shelf");
+        s.objs.push_back(prim(ObjType::Ground, 1, {}, V3(1), "Earth"));
+        s.objs.push_back(kindTerrain(1, {0, 0, -20}, {44, 19, 32}, "Snowy Peaks", TerrainKind::Glacial, 217));
+        auto mist = prim(ObjType::Sphere, 1, {0, 1.8f, -16}, {13, 1.7f, 11}, "Basin Mist");
+        mist.name = "Drifting Mist";
+        s.objs.push_back(mist);
+        s.cam.target = {0, 5, -20}; s.cam.dist = 48; s.cam.pitch = 12; s.cam.yaw = 9;
         break;
     }
     default: {

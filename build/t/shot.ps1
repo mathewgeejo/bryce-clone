@@ -1,4 +1,4 @@
-param([string]$out, [string]$title = "", [string]$proc = "Canyon3D")
+param([string]$out, [string]$title = "", [string]$proc = "Brycescape")
 Add-Type -AssemblyName System.Drawing
 Add-Type @"
 using System; using System.Runtime.InteropServices;

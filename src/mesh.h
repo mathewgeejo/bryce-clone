@@ -20,6 +20,9 @@ private:
 };
 
 bool loadOBJ(const std::string& path, Mesh& m, std::string& err);
+struct MeshLayer { std::string name; Mesh mesh; };
+bool loadDXF(const std::string& path, std::vector<MeshLayer>& layers, float scale, bool zUp, bool split, std::string& err);
+bool saveGeometry(const std::string& path, const std::vector<MeshLayer>& layers, bool dxf);
 
 struct TreeParams {
     float height = 1.f, spread = 38.f, trunkRadius = 0.05f, leafSize = 0.07f, leafDensity = 1.f;

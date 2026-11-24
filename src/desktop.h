@@ -20,7 +20,7 @@ constexpr uint8_t blue(Color c) { return c & 255; }
 enum class Font { Regular, Small, Bold, Title };
 enum TextFlags { TextCenter = 0, TextLeft = 1, TextRight = 2, TextMiddle = 4, TextWrap = 8 };
 enum class Mouse { Left, Middle, Right };
-enum KeyCode { Backspace = 8, Enter = 13, Escape = 27, Delete = 127, LeftBracket = '[', RightBracket = ']' };
+enum KeyCode { Backspace = 8, Enter = 13, Escape = 27, Delete = 127, LeftBracket = '[', RightBracket = ']', Help = 1001 };
 struct Modifiers { bool shift = false, ctrl = false, alt = false; };
 
 int run(const char* title);

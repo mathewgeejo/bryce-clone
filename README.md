@@ -1,4 +1,4 @@
-# Two Hoodoos and a Floppy
+# Brycescape
 
 A native Windows and Linux landscape studio for sculpting terrain, staging little worlds, and software ray tracing. For anyone who remembers when a chrome sphere over a checkerboard was a perfectly good evening.
 
@@ -8,18 +8,18 @@ A native Windows and Linux landscape studio for sculpting terrain, staging littl
 
 ### Linux
 
-Install the C++ build tools, CMake, and GTK 3 development packages.
+Install the C++ build tools, CMake, GTK 3 and LibTIFF development packages.
 
 **Linux Mint and Ubuntu**
 
 ```bash
-sudo apt install build-essential cmake pkg-config libgtk-3-dev
+sudo apt install build-essential cmake pkg-config libgtk-3-dev libtiff-dev
 ```
 
 **Arch Linux**
 
 ```bash
-sudo pacman -S --needed base-devel cmake pkgconf gtk3
+sudo pacman -S --needed base-devel cmake pkgconf gtk3 libtiff
 ```
 
 From the repository root, build and launch the studio.
@@ -27,10 +27,10 @@ From the repository root, build and launch the studio.
 ```bash
 cmake -S . -B out/linux -DCMAKE_BUILD_TYPE=Release
 cmake --build out/linux --parallel
-./out/linux/Canyon3D
+./out/linux/Brycescape
 ```
 
-The desktop uses GTK 3 on X11 and Wayland. On other Linux distributions, install a C++17 compiler, CMake, and the package that supplies `gtk+-3.0` to pkg-config. The materials and skies library lives at `$XDG_CONFIG_HOME/two-hoodoos-and-a-floppy/canyon3d_library.txt` and uses `~/.config` by default.
+The desktop uses GTK 3 on X11 and Wayland. On other Linux distributions, install a C++17 compiler, CMake, LibTIFF development files, and the GTK package that supplies `gtk+-3.0` to pkg-config. The materials and skies library lives at `$XDG_CONFIG_HOME/brycescape/canyon3d_library.txt` and uses `~/.config` by default.
 
 ### Windows
 
@@ -38,39 +38,44 @@ Install Visual Studio 2019 or later with the **Desktop development with C++** wo
 
 ```powershell
 .\build.bat
-.\build\Canyon3D.exe
+.\build\Brycescape.exe
 ```
 
-Close the studio before rebuilding so the linker can replace `Canyon3D.exe`. The Windows desktop uses Win32 and GDI.
+Close the studio before rebuilding so the linker can replace `Brycescape.exe`. The Windows desktop uses Win32 and GDI.
 
 ### First scene
 
 1. Open **Examples** to load a complete scene, or use **Create** to start placing objects.
 2. Use **Edit** to move, rotate, resize, or sculpt. Open **Materials Lab** and **Sky & Fog** to set the look of the scene.
-3. Press **Ctrl+R** to render. Use **Save Image** to write a BMP, or **Ctrl+S** to save an editable `.c3d` scene.
+3. Press **Ctrl+R** to render. Use **Save Image** to write PNG, TIFF or BMP, or **Ctrl+S** to save an editable `.c3d` scene.
 
 ## What you can make
 
-- Sculpt heightfields and symmetric lattices with brushes, procedural generators, erosion, terraces, and BMP heightmaps.
+- Sculpt heightfields and symmetric lattices with brushes, procedural generators, erosion, terraces, and imported heightmaps.
 - Fuse positive metaballs and carve the shared surface with subtractive balls or Boolean primitives.
-- Add BMP picture cards with chroma cutouts. Use fixed planes or cards that face the camera.
-- Combine primitives with Boolean operations, generate trees, and import Wavefront OBJ meshes.
-- Layer procedural and BMP textures across material channels, and save individual texture layers as `.c3tex` presets.
+- Add picture cards with PNG alpha or chroma cutouts. Use fixed planes or cards that face the camera.
+- Combine primitives with Boolean operations, generate trees, import OBJ or layered DXF meshes, and export selections as OBJ or DXF.
+- Parent objects through **Edit Tools → Parent to Active** and inspect the relationships in the scene hierarchy.
+- Layer procedural and image textures across material channels, and save individual texture layers as `.c3tex` presets.
 - Place point, spot, and directional lights, and tune fog, clouds, sunlight, and moonlight.
-- Keyframe object transforms, the camera, and the sky. Render a still, a panorama, or an animation as numbered BMP frames.
+- Animate transforms and appearance tracks, switch between named cameras, and render stills, panoramas or numbered animation frames.
+- Save scene fragments in the thumbnail library. Package, embed or relink image assets through **Commands**.
 
 ## Render from the command line
 
 ```bash
-./out/linux/Canyon3D --render out.bmp 640 400
-./out/linux/Canyon3D --render out.bmp 640 400 "my scene.c3d"
-./out/linux/Canyon3D --example 0 example.bmp 640 400
-./out/linux/Canyon3D --export-example 0 example.c3d
+./out/linux/Brycescape --render out.bmp 640 400
+./out/linux/Brycescape --render out.png 640 400 "my scene.c3d"
+./out/linux/Brycescape --example 0 example.bmp 640 400
+./out/linux/Brycescape --export-example 0 example.c3d
+./out/linux/Brycescape --batch "render queue.txt"
 ```
 
-On Windows, use `.\build\Canyon3D.exe` with the same arguments.
+On Windows, use `.\build\Brycescape.exe` with the same arguments.
 
 `--render` opens the default scene when no scene file is supplied. Example indices start at zero. The command-line renderer also works on Linux without a running desktop session.
+
+A queue file contains one scene and output pair per line, such as `"my scene.c3d" "output.tiff"`. Relative paths resolve from the queue file. In the desktop, use **Render Options → Start Render Queue**. Animation output can use a name such as `walk_{frame}.png`.
 
 ## Useful keys
 
@@ -79,6 +84,7 @@ On Windows, use `.\build\Canyon3D.exe` with the same arguments.
 | `1`–`4` | Switch between perspective, top, front, and side views |
 | `A` / `M` / `E` | Open attributes, materials, or the selected object's editor |
 | `F` | Frame the selection or the whole scene |
+| `F1` | Open the command palette |
 | `Ctrl+G` / `Ctrl+U` | Group / ungroup the selection |
 | `Ctrl+D` / `Delete` | Duplicate / delete the selection |
 | `Ctrl+Z` / `Ctrl+Y` | Undo / redo |
@@ -87,6 +93,8 @@ On Windows, use `.\build\Canyon3D.exe` with the same arguments.
 | `Esc` | Close the active lab or stop a render |
 
 Select an object to reveal its viewport handles. Drag **Move**, **Rotate**, or **Scale** to transform it. Use **E** to shape stones and tori, edit imported meshes and picture cards, or tune lights and metaballs. To fuse metaballs, position them so their fields overlap, select both, and press **Ctrl+G**.
+
+**Display** opens the viewport palette. Double-click a hierarchy row to rename it. Drag a row to reorder it, or Alt-drag it onto a parent. Terrain regions and strokes have separate undo and redo controls in the Terrain Editor.
 
 ## Source and checks
 

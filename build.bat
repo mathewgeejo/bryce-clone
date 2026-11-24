@@ -7,5 +7,5 @@ if not defined VSPATH set "VSPATH=%ProgramFiles(x86)%\Microsoft Visual Studio\20
 call "%VSPATH%\VC\Auxiliary\Build\vcvars64.bat" >nul || exit /b 1
 cd /d "%~dp0"
 if not exist build mkdir build
-cl /nologo /std:c++17 /O2 /fp:fast /EHsc /W3 /MP /DNDEBUG src\*.cpp /Fobuild\ /Febuild\Canyon3D.exe /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib comdlg32.lib || exit /b 1
-echo Built build\Canyon3D.exe
+cl /nologo /std:c++17 /O2 /fp:fast /EHsc /W3 /MP /DNDEBUG src\*.cpp /Fobuild\ /Febuild\Brycescape.exe /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib comdlg32.lib windowscodecs.lib ole32.lib || exit /b 1
+echo Built build\Brycescape.exe

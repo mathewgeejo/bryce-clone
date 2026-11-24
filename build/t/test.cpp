@@ -1,6 +1,8 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include <chrono>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -54,6 +56,138 @@ static int fails = 0;
 #define CHECK(c) do { if (!(c)) { printf("  FAIL %s:%d %s\n", __FILE__, __LINE__, #c); fails++; } } while (0)
 
 int main() {
+    printf("DXF import/export and implicit geometry\n");
+    {
+        const char* path = "build/t/brycescape-format.dxf";
+        Mesh m;
+        m.v = {{2, 3, 4}, {5, 3, 4}, {2, 3, 1}};
+        m.tri = {0, 1, 2};
+        std::vector<MeshLayer> layers{{"Survey", m}}, loaded;
+        std::string error;
+        CHECK(saveGeometry(path, layers, true));
+        CHECK(loadDXF(path, loaded, 0.5f, true, true, error));
+        CHECK(loaded.size() == 1 && loaded[0].name == "Survey" && loaded[0].mesh.triCount() == 1 &&
+              length(loaded[0].mesh.v[0] - V3(1, 1.5f, 2)) < 0.001f);
+        std::ofstream(path) << "0\nSECTION\n2\nENTITIES\n0\n3DFACE\n8\nBroken\n0\nEOF\n";
+        CHECK(!loadDXF(path, loaded, 1, true, true, error) && loaded.size() == 1);
+        std::remove(path);
+        Scene s;
+        s.objs = {makeObject(ObjType::Sphere, 1)};
+        s.updateAll();
+        auto baked = meshSelection(s, {0}, 12);
+        CHECK(baked.size() == 1 && baked[0].mesh.triCount() > 100);
+    }
+    printf("hierarchies, nested CSG, cameras and linked heightfields\n");
+    {
+        Scene s;
+        Object parent = makeObject(ObjType::Cube, 1), child = makeObject(ObjType::Sphere, 1);
+        parent.pos = {}; parent.scl = V3(1);
+        child.pos = {3, 2, 1};
+        s.objs = {parent, child};
+        s.updateAll();
+        CHECK(s.setParent(1, 0) && !s.setParent(0, 1));
+        putKey(s.objs[0].keys, Key{0, {}, {}, V3(1), Ease::Hold});
+        putKey(s.objs[0].keys, Key{10, {4, 0, 0}, {}, V3(1), Ease::Linear});
+        AppearanceKey a = s.objs[1].appearance(0), b = a;
+        b.frame = 10; b.material.reflect = 1; b.hidden = true;
+        s.objs[1].appearances = {a, b};
+        s.applyFrame(5);
+        CHECK(length(s.objs[1].worldPos - V3(3, 2, 1)) < 0.001f && !s.objs[1].hidden);
+        CHECK(std::fabs(s.objs[1].mat.reflect - 0.5f) < 0.001f);
+        s.applyFrame(10);
+        CHECK(length(s.objs[1].worldPos - V3(7, 2, 1)) < 0.001f && s.objs[1].hidden);
+        Scene single = s.subset({1});
+        CHECK(single.objs.size() == 1 && single.objs[0].parent == -1 && length(single.objs[0].worldPos - V3(7, 2, 1)) < 0.001f);
+        Object lattice;
+        lattice.type = ObjType::Lattice;
+        lattice.hf = std::make_shared<Heightfield>();
+        hfInit(*lattice.hf, 9);
+        s.objs.push_back(lattice); s.objs.push_back(lattice);
+        s.cam.orthographic = true;
+        s.cam.lookAt = 0;
+        s.cameras = {{"Ortho", s.cam, {}}};
+        s.activeCamera = 0;
+        s.updateAll();
+        const char* path = "build/t/brycescape-hierarchy.c3d";
+        CHECK(s.save(path));
+        s.title = "Saved again";
+        CHECK(s.save(path));
+        Scene copy;
+        CHECK(copy.load(path) && copy.objs.size() == 4 && copy.objs[1].parent == 0 &&
+              copy.objs[2].hf == copy.objs[3].hf && copy.activeCamera == 0 && cameraBasis(copy.viewCamera()).ortho && copy.title == "Saved again");
+        std::remove(path);
+        Camera top;
+        top.pitch = 90; top.yaw = 0; top.dist = 2000; top.orthographic = true;
+        ViewBasis matched = cameraBasis(top), editor = orthoBasis(1, top.target, top.orthoScale);
+        CHECK(length(matched.f - editor.f) < 0.001f && length(matched.r - editor.r) < 0.001f &&
+              length(matched.u - editor.u) < 0.001f && matched.k == editor.k);
+
+        parent.scl = V3(2); parent.group = 1; parent.boolMode = BoolMode::Positive;
+        child.pos = {0, 0, 1.5f}; child.scl = V3(1.25f);
+        child.group = 2; child.boolMode = BoolMode::Positive;
+        Scene csg;
+        csg.objs = {parent, child};
+        CHECK(csg.setBooleanParent(2, 1, BoolMode::Negative));
+        CHECK(!csg.setBooleanParent(1, 2, BoolMode::Positive));
+        csg.updateAll();
+        Hit hit;
+        CHECK(intersectScene(csg, {{0, 0, 5}, {0, 0, -1}}, 10, hit) && std::fabs(hit.t - 4.75f) < 0.002f && hit.n.z > 0.9f);
+    }
+    printf("image codecs and portable scene assets\n");
+    {
+        const std::string png = "build/t/brycescape-source.png", tiff = "build/t/brycescape-source.tiff";
+        std::vector<uint32_t> rgba{0xffaa0000, 0x0000ff00};
+        CHECK(saveRaster(png, 2, 1, rgba, true));
+        auto picture = loadImage(png);
+        CHECK(picture && picture->w == 2 && picture->alpha.size() == 2 && picture->opacity(0.75f, 0) == 0);
+        CHECK(saveRaster(tiff, 2, 1, rgba, false));
+        auto proof = loadImage(tiff);
+        CHECK(proof && proof->w == 2 && proof->px[0].x > 0.6f);
+        Scene s;
+        Object card = makeObject(ObjType::Picture, 1);
+        card.picture.path = png;
+        s.objs.push_back(card);
+        s.updateAll();
+        const std::string packaged = "build/t/brycescape-packaged.c3d", embedded = "build/t/brycescape-embedded.c3d";
+        std::string error;
+        CHECK(s.package(packaged, error));
+        CHECK(s.embedAssets(error) && s.save(embedded));
+        std::remove(png.c_str());
+        Scene copy, portable;
+        CHECK(copy.load(embedded) && copy.objs.size() == 1 && copy.objs[0].picture.image &&
+              copy.objs[0].picture.image->opacity(0.75f, 0) == 0);
+        CHECK(portable.load(packaged) && portable.objs.size() == 1 && portable.objs[0].picture.image && portable.missingAssets().empty());
+        if (portable.objs.size() == 1) std::remove(portable.objs[0].picture.path.c_str());
+        std::remove(packaged.c_str()); std::remove(embedded.c_str()); std::remove(tiff.c_str());
+        std::error_code ec;
+        std::filesystem::remove("build/t/brycescape-packaged_assets", ec);
+    }
+    printf("scene BVH, render region and resume\n");
+    {
+        Scene s;
+        for (int i = 0; i < 24; ++i) {
+            Object o = makeObject(ObjType::Sphere, i + 1);
+            o.pos = {(float)i * 4, 0, 0}; o.scl = V3(1);
+            s.objs.push_back(o);
+        }
+        s.cam.target = {};
+        s.cam.yaw = s.cam.pitch = 0;
+        s.cam.dist = 5;
+        s.render.region = true;
+        s.render.cropX = s.render.cropY = 0.25f;
+        s.updateAll();
+        Hit hit;
+        CHECK(!s.rayNodes.empty() && intersectScene(s, {{0, 0, 5}, {0, 0, -1}}, 20, hit) && hit.obj == 0);
+        Renderer render;
+        render.start(s, 64, 40, 0);
+        render.cancel();
+        if (render.resumable()) CHECK(render.resume());
+        render.wait();
+        std::vector<uint32_t> result, reference(64 * 40);
+        render.copyTo(result);
+        renderImage(s, 64, 40, reference.data(), 0);
+        CHECK(render.finished() && result == reference && result[0] == 0 && result[20 * 64 + 32] != 0);
+    }
     printf("metaball fields and Booleans\n");
     {
         Scene s;

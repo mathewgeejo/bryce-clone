@@ -6,9 +6,14 @@
 #include <climits>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <functional>
 #include <iterator>
 #include <map>
+#include <set>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -25,7 +30,7 @@ using R = Rect;
 const int TOP = 98, LEFT = 170, RIGHT = 236, STATUS = 24, TIMELINE = 34;
 const int NANO_W = 150, NANO_H = 112, ICW = 48, ICH = 32, STW = 64, STH = 40;
 const int VIEW_ID = 1000000;
-constexpr char APP_NAME[] = "Two Hoodoos and a Floppy";
+constexpr char APP_NAME[] = "Brycescape";
 const ObjType kCreate[] = {ObjType::Sphere, ObjType::Cube,    ObjType::Cylinder, ObjType::Cone,  ObjType::Pyramid, ObjType::Torus,
                            ObjType::Disc,   ObjType::Square,  ObjType::Stone,    ObjType::Terrain, ObjType::Lattice, ObjType::Ground,
                            ObjType::Water,  ObjType::Cloud,   ObjType::Light,    ObjType::Spotlight, ObjType::Parallel, ObjType::Metaball};
@@ -47,8 +52,13 @@ Scene gScene;
 std::vector<int> gSelSet;
 int gSel = -1, gTab = 0, gView = 0, gTool = 0;
 bool gShowRender = false;
-Renderer gMainR, gNanoR, gLabR;
-enum Lab { LabNone, LabMat, LabSky, LabTerrain, LabTree, LabRender, LabTools, LabExamples, LabObject, LabAttributes } gLab = LabNone;
+enum ViewMode { Wire, DepthWire, BoundsOnly, Solid, Textured } gViewMode = Wire;
+bool gDisplayPalette = false, gSafeFrame = false, gViewPreviewDirty = true;
+float gPreviewScale = 0.45f;
+std::string gHoverTip, gLastTip;
+uint64_t gTipSince = 0;
+Renderer gMainR, gNanoR, gLabR, gViewR;
+enum Lab { LabNone, LabMat, LabSky, LabTerrain, LabTree, LabRender, LabTools, LabExamples, LabObject, LabAttributes, LabDxf, LabMotion, LabAssets, LabCameras, LabCommands } gLab = LabNone;
 Scene gLabBackup;
 bool gLabChanged = false, gNanoDirty = true, gLabDirty = false, gMainWasBusy = false;
 uint64_t gLastChange = 0, gRenderStart = 0;
@@ -58,6 +68,9 @@ float gOrthoS[4] = {40, 40, 40, 40};
 int gCounter[(int)ObjType::COUNT] = {}, gTreeCounter = 0;
 R gVP{0, 0, 1, 1}, gListR{0, 0, 0, 0};
 int gListScroll = 0;
+std::string gFilter;
+int gListDrag = -1, gListDragY = 0, gLastRow = -1;
+uint64_t gLastRowTime = 0;
 uint32_t gSeed = 100;
 float gBrushSize = 0.06f, gBrushStr = 0.5f, gRough = 0.5f, gTerraces = 6;
 BrushMode gBrush = BrushMode::Raise;
@@ -68,7 +81,9 @@ uint64_t gSculptLast = 0;
 bool gRDrag = false, gMDrag = false;
 std::vector<uint32_t> gIcons[(int)ObjType::COUNT], gTreeIcon;
 std::vector<std::vector<uint32_t>> gSkyThumbs;
-std::vector<Scene> gUndo, gRedo;
+struct History { Scene scene; std::string action; };
+std::vector<History> gUndo, gRedo;
+std::string gPreStatus;
 Scene gPre;
 bool gHavePre = false, gChanged = false, gNoPush = false, gDirty = false;
 int gEditObj = -1;
@@ -77,12 +92,33 @@ int gQuickCat = 0, gSkyCat = 0, gMatCat = 0, gLabSkyCat = 0;
 bool gMatLayers = false;
 int gLayerIndex = 0;
 Library gLib;
+std::vector<Library> gLibraryUndo, gLibraryRedo;
 std::string gLibPath;
+uint64_t gAutosaveTime = 0;
+std::string gDxfPath;
+float gDxfScale = 1;
+bool gDxfZUp = true, gDxfLayers = true;
+bool gAppearanceTrack = false;
+int gMotionKey = 0;
+int gTerrainSeed = 77, gTerrainOctaves = 7;
+float gTerrainFrequency = 4, gErosionDensity = 1;
+bool gRegionTool = false, gRegionMask = false;
+V3 gRegionStart, gRegionEnd;
+TerrainPatch gTerrainClipboard;
+std::vector<Heightfield> gTerrainUndo, gTerrainRedo;
+BoolMode gNestedMode = BoolMode::Positive;
+struct AssetTile { std::string path, name; std::vector<uint32_t> thumbnail; };
+std::vector<AssetTile> gAssets;
+int gAssetPage = 0, gAssetSelection = -1;
 TreeParams gTreeP;
 bool gPlaying = false, gAutoKey = false, gAnimRender = false;
 int gAnimFrame = -1;
 uint64_t gPlayLast = 0;
-std::string gAnimBase;
+std::string gAnimBase, gAnimExtension;
+struct RenderJob { std::string scene, output; };
+std::vector<RenderJob> gQueue;
+int gQueueIndex = -1;
+bool gResumeAllowed = false;
 float gRepCount = 3, gRepScale = 1, gRandPos = 4, gRandRot = 45, gRandSize = 0.3f;
 V3 gRepOff{3, 0, 0}, gRepRot{0, 0, 0};
 
@@ -172,6 +208,23 @@ bool button(R r, const char* text, bool on = false, Font f = gFont) {
     int id = newId();
     press(r, id);
     bool h = hov(r), act = gActive == id && h;
+    if (h) {
+        static const std::map<std::string, const char*> tips = {
+            {"Group", "Ctrl+G groups the selection. Alt-click selects an individual group member."},
+            {"Ungroup", "Ctrl+U ungroups the selection."},
+            {"Wire", "Wireframe displays object edges. Try Depth Wire for distant objects."},
+            {"Move", "Drag to move in the view plane. Hold Ctrl to move vertically."},
+            {"Rotate", "Drag to rotate. Hold Shift to roll around the object's Z axis."},
+            {"Resize", "Drag to scale evenly. Hold Shift to change only the Y axis."},
+            {"Sculpt", "[ and ] resize the brush. Ctrl lowers height and Shift smooths."},
+            {"Key", "Ctrl+K records a transform key for the selection or camera."},
+            {"Frame Sel", "F frames the selection. With no selection, it frames the scene."},
+            {"Motion", "Open the motion editor for transform, appearance and camera keys."},
+            {"Commands", "F1 opens the command palette and shortcut list."},
+        };
+        auto tip = tips.find(text);
+        if (tip != tips.end()) gHoverTip = tip->second;
+    }
     if (on) vgrad(r, rgb(126, 142, 182), rgb(70, 82, 120));
     else if (act) vgrad(r, rgb(58, 58, 64), rgb(92, 92, 100));
     else if (h) vgrad(r, rgb(140, 140, 148), rgb(96, 96, 104));
@@ -260,6 +313,8 @@ bool dragI(R r, const char* text, int& v, float speed, int lo, int hi) {
 }
 
 void sceneChanged() {
+    gResumeAllowed = false;
+    gViewPreviewDirty = true;
     gScene.updateAll();
     gNanoDirty = true;
     gLastChange = nowMs();
@@ -331,8 +386,8 @@ void selectObj(int i, bool add, bool single = false) {
     gSel = i;
 }
 
-void pushUndo(Scene s) {
-    gUndo.push_back(std::move(s));
+void pushUndo(Scene s, std::string action = "Edit scene") {
+    gUndo.push_back({std::move(s), std::move(action)});
     gDirty = true;
     if (gUndo.size() > 40) gUndo.erase(gUndo.begin());
     gRedo.clear();
@@ -341,6 +396,7 @@ void pushUndo(Scene s) {
 void beginInteraction() {
     if (gHavePre || gLab != LabNone) return;
     gPre = gScene.snapshot();
+    gPreStatus = gStatus;
     gHavePre = true;
     gChanged = false;
 }
@@ -349,7 +405,10 @@ void autoKey();
 
 void endInteraction() {
     if (gHavePre && gChanged && !gNoPush) {
-        pushUndo(std::move(gPre));
+        std::string action = gStatus != gPreStatus ? gStatus : "Edit scene";
+        if (gDrag == DragSculpt && gActive == 0 && action == "Edit scene") action = "Terrain stroke";
+        else if (gDrag == DragObj && action == "Edit scene") action = gTool == 0 ? "Move objects" : (gTool == 1 ? "Rotate objects" : "Scale objects");
+        pushUndo(std::move(gPre), std::move(action));
         if (gAutoKey) autoKey();
     }
     gHavePre = gNoPush = false;
@@ -370,25 +429,32 @@ void undoRedo(bool redo) {
     auto& from = redo ? gRedo : gUndo;
     auto& to = redo ? gUndo : gRedo;
     if (from.empty()) { gStatus = redo ? "Nothing to redo." : "Nothing to undo."; return; }
-    to.push_back(gScene.snapshot());
-    gScene = std::move(from.back());
+    auto action = from.back().action;
+    to.push_back({gScene.snapshot(), action});
+    gScene = std::move(from.back().scene);
     from.pop_back();
     sceneReplaced();
     gNoPush = gDirty = true;
-    gStatus = redo ? "Redo." : "Undo.";
+    gStatus = (redo ? "Redo " : "Undo ") + action;
 }
 
 void commitRename() {
+    if (gEditObj == -2) { gFilter = gEditBuf; gListScroll = 0; }
+    if (gEditObj == -3 && gLab == LabCameras && gScene.activeCamera >= 0 && !gEditBuf.empty()) {
+        auto& name = gScene.cameras[gScene.activeCamera].name;
+        if (name != gEditBuf) { name = gEditBuf; sceneChanged(); }
+    }
     if (gEditObj >= 0 && gEditObj < (int)gScene.objs.size() && !gEditBuf.empty() && gScene.objs[gEditObj].name != gEditBuf) {
-        if (gLab == LabNone && !gHavePre) pushUndo(gScene.snapshot());
+        if (gLab == LabNone && !gHavePre) pushUndo(gScene.snapshot(), "Rename object");
         gScene.objs[gEditObj].name = gEditBuf;
+        gDirty = true;
     }
     gEditObj = -1;
 }
 
 // ---------------------------------------------------------------- views & scene actions
 
-ViewBasis curBasis() { return gView == 0 ? cameraBasis(gScene.cam) : orthoBasis(gView, gOrthoC[gView], gOrthoS[gView]); }
+ViewBasis curBasis() { return gView == 0 ? cameraBasis(gScene.viewCamera()) : orthoBasis(gView, gOrthoC[gView], gOrthoS[gView]); }
 
 void orbitCam(float dx, float dy) {
     gScene.cam.yaw -= dx * 0.4f;
@@ -399,14 +465,15 @@ void orbitCam(float dx, float dy) {
 void panView(float dx, float dy) {
     ViewBasis vb = curBasis();
     float hh = gVP.h * 0.5f;
-    if (gView == 0) gScene.cam.target += (vb.r * -dx + vb.u * dy) * (gScene.cam.dist * vb.k / hh);
+    if (gView == 0) gScene.cam.target += (vb.r * -dx + vb.u * dy) * ((vb.ortho ? 1.f : gScene.cam.dist) * vb.k / hh);
     else gOrthoC[gView] += (vb.r * -dx + vb.u * dy) * (vb.k / hh);
     sceneChanged();
 }
 
 void zoomView(float steps) {
     float f = std::pow(0.88f, steps);
-    if (gView == 0) gScene.cam.dist = clampf(gScene.cam.dist * f, 1.f, 5000.f);
+    if (gView == 0 && gScene.cam.orthographic) gScene.cam.orthoScale = clampf(gScene.cam.orthoScale * f, 0.1f, 5000.f);
+    else if (gView == 0) gScene.cam.dist = clampf(gScene.cam.dist * f, 1.f, 5000.f);
     else gOrthoS[gView] = clampf(gOrthoS[gView] * f, 1.f, 5000.f);
     sceneChanged();
 }
@@ -431,19 +498,22 @@ void frameView(bool selection) {
             gStatus = selection ? "Select a visible object to frame it." : "There are no finite objects to frame.";
             return;
         }
-        lo = hi = gScene.objs[gSel].pos;
+        lo = hi = gScene.objs[gSel].worldPos;
     }
     V3 center = (lo + hi) * 0.5f;
     float radius = std::max(0.75f, length(hi - center));
     float aspect = std::min(1.f, (float)gVP.w / gVP.h);
     if (gView == 0) {
         gScene.cam.target = center;
+        gScene.cam.lookAt = -1;
         float fov = std::atan(std::tan(rad(gScene.cam.fov * 0.5f)) * aspect);
         gScene.cam.dist = clampf(radius * 1.18f / std::sin(fov), 1.f, 5000.f);
+        if (gScene.cam.orthographic) gScene.cam.orthoScale = clampf(radius * 1.18f / aspect, 0.1f, 5000.f);
         sceneChanged();
     } else {
         gOrthoC[gView] = center;
         gOrthoS[gView] = clampf(radius * 1.18f / aspect, 1.f, 5000.f);
+        gViewPreviewDirty = true;
     }
     gShowRender = false;
 }
@@ -486,34 +556,35 @@ std::vector<int> sortedSel() {
 void actDelete() {
     auto s = sortedSel();
     if (s.empty()) return;
-    for (auto it = s.rbegin(); it != s.rend(); ++it) gScene.objs.erase(gScene.objs.begin() + *it);
+    std::vector<int> remaining;
+    for (int i = 0; i < (int)gScene.objs.size(); ++i)
+        if (!std::binary_search(s.begin(), s.end(), i)) remaining.push_back(i);
+    gScene = gScene.subset(remaining);
     clearSel();
     sceneChanged();
     gStatus = "Deleted " + std::to_string(s.size()) + " object(s).";
 }
 
-void replicate(int times, V3 off, V3 rot, float scl) {
+void replicate(int times, V3 off, V3 rot, float scl, bool linked = false) {
     auto s = sortedSel();
     if (s.empty()) return;
-    int ng = gScene.maxGroup();
     std::vector<int> made;
-    for (int k = 1; k <= times; k++) {
-        std::map<int, int> gmap;
-        for (int i : s) {
-            Object o = gScene.objs[i];
-            if (o.hf) o.hf = std::make_shared<Heightfield>(*o.hf);
+    for (int k = 1; k <= times; ++k) {
+        Scene copy = gScene.subset(s);
+        for (Object& o : copy.objs) {
+            if (o.hf && !linked) o.hf = std::make_shared<Heightfield>(*o.hf);
             o.name += " copy";
-            o.pos += off * (float)k;
-            o.rot += rot * (float)k;
-            o.scl = o.scl * std::pow(scl, (float)k);
-            o.keys.clear();
-            if (o.group > 0) {
-                if (!gmap.count(o.group)) gmap[o.group] = ++ng;
-                o.group = gmap[o.group];
+            if (o.parent < 0) {
+                o.moveWorld(off * (float)k);
+                o.rot += rot * (float)k;
+                o.scl *= std::pow(scl, (float)k);
             }
-            gScene.objs.push_back(o);
-            made.push_back((int)gScene.objs.size() - 1);
+            o.keys.clear();
+            o.appearances.clear();
         }
+        int begin = (int)gScene.objs.size(), end = begin + (int)copy.objs.size();
+        gScene.append(std::move(copy));
+        for (int i = begin; i < end; ++i) made.push_back(i);
     }
     gSelSet = made;
     gSel = made.back();
@@ -522,6 +593,43 @@ void replicate(int times, V3 off, V3 rot, float scl) {
 }
 
 void actDuplicate() { replicate(1, V3(2, 0, 2), V3(0.f), 1); }
+
+void actLinked() { replicate(1, V3(2, 0, 2), V3(0.f), 1, true); }
+
+void actSelectMatching(int field) {
+    if (!validSel()) return;
+    const auto& selected = gScene.objs[gSel];
+    gSelSet.clear();
+    for (int i = 0; i < (int)gScene.objs.size(); ++i) {
+        const auto& o = gScene.objs[i];
+        if ((field == 0 && o.type == selected.type) || (field == 1 && o.mat.name == selected.mat.name) ||
+            (field == 2 && selected.group > 0 && o.group == selected.group)) gSelSet.push_back(i);
+    }
+    if (gSelSet.empty()) gSelSet.push_back(gSel);
+    gStatus = "Selected " + std::to_string(gSelSet.size()) + " matching objects.";
+}
+
+void actIsolate(bool showAll) {
+    if (!showAll && !validSel()) return;
+    for (int i = 0; i < (int)gScene.objs.size(); ++i) gScene.objs[i].hidden = !showAll && !isSel(i);
+    sceneChanged();
+    gStatus = showAll ? "Show all objects" : "Isolate selection";
+}
+
+void reorderSceneObject(int from, int target) {
+    if (from < 0 || target < 0 || from == target) return;
+    int n = (int)gScene.objs.size();
+    std::vector<int> order;
+    for (int i = 0; i < n; ++i) if (i != from) order.push_back(i);
+    order.insert(order.begin() + target, from);
+    std::vector<int> remap(n);
+    for (int i = 0; i < n; ++i) remap[order[i]] = i;
+    gScene = gScene.subset(order);
+    for (int& i : gSelSet) i = remap[i];
+    if (gSel >= 0) gSel = remap[gSel];
+    sceneChanged();
+    gStatus = "Reorder scene object";
+}
 
 void actLand() {
     auto s = sortedSel();
@@ -546,7 +654,7 @@ void actLand() {
         Hit h;
         V3 c = (lo + hi) * 0.5f;
         float ground = intersectScene(tmp, {V3(c.x, hi.y, c.z), V3(0, -1, 0)}, 1e30f, h) ? h.p.y : 0.f;
-        for (int i : u.second) gScene.objs[i].pos.y += ground - lo.y;
+        for (int i : u.second) gScene.objs[i].moveWorld({0, ground - lo.y, 0});
     }
     sceneChanged();
     gStatus = "Landed the selection on the surface below.";
@@ -564,6 +672,62 @@ void actUngroup() {
     for (int i : gSelSet) gScene.objs[i].group = 0;
     sceneChanged();
     gStatus = "Ungrouped the selection.";
+}
+
+void actParent(bool detach) {
+    if (!validSel() || (!detach && gSelSet.size() < 2)) {
+        gStatus = "Select the children, then Shift-click the parent last.";
+        return;
+    }
+    int changed = 0;
+    for (int i : gSelSet) {
+        if ((!detach && i == gSel) || gScene.objs[i].locked) continue;
+        int parent = detach ? -1 : gSel;
+        if (gScene.objs[i].parent != parent && gScene.setParent(i, parent)) ++changed;
+    }
+    if (changed) sceneChanged();
+    gStatus = changed ? std::to_string(changed) + (detach ? " object(s) detached." : " object(s) parented.") :
+                         "No hierarchy links changed. Check locks or circular links.";
+}
+
+void actNestBoolean(bool detach) {
+    int active = validSel() ? gScene.objs[gSel].group : 0;
+    if (!active) { gStatus = "Choose a Boolean group as the active selection."; return; }
+    int count = 0;
+    if (detach) {
+        count = gScene.setBooleanParent(active, 0, gNestedMode);
+    } else {
+        std::vector<int> selected;
+        for (int i : gSelSet) {
+            int group = gScene.objs[i].group;
+            if (group > 0 && group != active && std::find(selected.begin(), selected.end(), group) == selected.end()) selected.push_back(group);
+        }
+        for (int group : selected) if (gScene.setBooleanParent(group, active, gNestedMode)) ++count;
+    }
+    if (count) sceneChanged();
+    gStatus = count ? (detach ? "Detached Boolean group." : "Nested Boolean groups under the active group.") :
+                      "Select another group and avoid circular links.";
+}
+
+void actBakeGeometry() {
+    auto parts = meshSelection(gScene, gSelSet, 48);
+    if (parts.empty()) { gStatus = "No surface to bake. A Boolean group needs a positive volume and overlapping intersection parts."; return; }
+    Scene baked;
+    for (auto& part : parts) {
+        part.mesh.build();
+        Object o = makeObject(ObjType::Mesh, ++gCounter[(int)ObjType::Mesh]);
+        o.name = part.name + " (baked)";
+        if (validSel()) o.mat = gScene.objs[gSel].mat;
+        o.mesh = std::make_shared<Mesh>(std::move(part.mesh));
+        baked.objs.push_back(std::move(o));
+    }
+    int first = (int)gScene.objs.size();
+    gScene.append(std::move(baked));
+    gSelSet.clear();
+    for (int i = first; i < (int)gScene.objs.size(); ++i) gSelSet.push_back(i);
+    gSel = first;
+    sceneChanged();
+    gStatus = "Created baked mesh copies.";
 }
 
 void setBoolMode(BoolMode b) {
@@ -588,15 +752,31 @@ bool fileDialog(bool save, const char* filter, const char* ext, std::string& out
 
 const char* SCENE_FILTER = "Landscape Scene (*.c3d)\0*.c3d\0All Files (*.*)\0*.*\0";
 const char* BMP_FILTER = "Bitmap Image (*.bmp)\0*.bmp\0";
+const char* IMAGE_FILTER = "Pictures (*.bmp;*.png;*.jpg;*.jpeg;*.tga;*.tif;*.tiff)\0*.bmp;*.png;*.jpg;*.jpeg;*.tga;*.tif;*.tiff\0All Files (*.*)\0*.*\0";
+const char* OUTPUT_FILTER = "PNG Image (*.png)\0*.png\0TIFF Image (*.tiff)\0*.tiff;*.tif\0Bitmap Image (*.bmp)\0*.bmp\0";
 
 std::string baseName(const std::string& p) {
     size_t s = p.find_last_of("\\/");
     return s == std::string::npos ? p : p.substr(s + 1);
 }
 
+std::string extension(const std::string& p) {
+    std::string name = baseName(p);
+    auto dot = name.find_last_of('.');
+    if (dot == std::string::npos) return {};
+    name.erase(0, dot + 1);
+    for (char& c : name) if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+    return name;
+}
+
 void actImport() {
     std::string p, err;
-    if (!fileDialog(false, "Wavefront OBJ (*.obj)\0*.obj\0All Files (*.*)\0*.*\0", "obj", p)) return;
+    if (!fileDialog(false, "Wavefront OBJ (*.obj)\0*.obj\0ASCII DXF (*.dxf)\0*.dxf\0All Files (*.*)\0*.*\0", "obj", p)) return;
+    if (extension(p) == "dxf") {
+        gDxfPath = std::move(p);
+        openLab(LabDxf);
+        return;
+    }
     auto m = std::make_shared<Mesh>();
     if (!loadOBJ(p, *m, err)) { gStatus = "Could not import " + p + ": " + err; return; }
     Object o = makeObject(ObjType::Mesh, ++gCounter[(int)ObjType::Mesh]);
@@ -609,9 +789,20 @@ void actImport() {
     addObject(o);
 }
 
+void actExportGeometry() {
+    if (gSelSet.empty()) { gStatus = "Select the objects to export."; return; }
+    std::string p;
+    if (!fileDialog(true, "Wavefront OBJ (*.obj)\0*.obj\0ASCII DXF (*.dxf)\0*.dxf\0", "obj", p)) return;
+    auto format = extension(p);
+    if (format != "obj" && format != "dxf") { gStatus = "Use an .obj or .dxf filename."; return; }
+    auto parts = meshSelection(gScene, gSelSet, 48);
+    if (parts.empty()) { gStatus = "The selection contains no exportable surfaces."; return; }
+    gStatus = saveGeometry(p, parts, format == "dxf") ? "Exported geometry to " + p : "Could not write " + p;
+}
+
 bool loadPicture(Picture& picture) {
     std::string path;
-    if (!fileDialog(false, BMP_FILTER, "bmp", path)) return false;
+    if (!fileDialog(false, IMAGE_FILTER, "png", path)) return false;
     auto image = loadImageCached(path, true);
     if (!image) { gStatus = "Could not read picture " + path + "."; return false; }
     picture.path = path;
@@ -641,11 +832,21 @@ bool confirmDiscard() {
     return discard;
 }
 
+std::string recoveryPath() {
+    return (std::filesystem::path(gLibPath).parent_path() / "recovery.c3d").string();
+}
+
+void clearRecovery() {
+    std::error_code error;
+    std::filesystem::remove(recoveryPath(), error);
+}
+
 void actNew() {
     if (!confirmDiscard()) return;
     gScene = makeEmptyScene();
     gPath.clear();
     sceneReplaced();
+    clearRecovery();
     gStatus = "New scene.";
 }
 
@@ -657,7 +858,10 @@ void actOpen() {
     gScene = std::move(s);
     gPath = p;
     sceneReplaced();
-    gStatus = "Opened " + p;
+    clearRecovery();
+    auto missing = gScene.missingAssets();
+    gStatus = missing.empty() ? "Opened " + p :
+        "Opened scene with " + std::to_string(missing.size()) + " missing assets. Use Commands to relink.";
 }
 
 void actMerge() {
@@ -675,10 +879,54 @@ void actMerge() {
 void actSave(bool as) {
     std::string p = gPath;
     if ((as || p.empty()) && !fileDialog(true, SCENE_FILTER, "c3d", p)) return;
-    if (!gScene.save(p)) { gStatus = "Could not write " + p; return; }
+    std::string oldTitle = gScene.title;
+    if (gScene.title.empty()) gScene.title = std::filesystem::path(p).stem().string();
+    if (!gScene.save(p)) { gScene.title = oldTitle; gStatus = "Could not write " + p; return; }
     gPath = p;
     gDirty = false;
+    clearRecovery();
+    std::vector<uint32_t> thumbnail(96 * 64);
+    Scene preview = gScene;
+    preview.render = {};
+    renderImage(preview, 96, 64, thumbnail.data(), 0);
+    saveRaster(p + ".thumb.png", 96, 64, thumbnail);
     gStatus = "Saved " + p;
+}
+
+void actPackage() {
+    std::string path, error;
+    if (!fileDialog(true, SCENE_FILTER, "c3d", path)) return;
+    gStatus = gScene.package(path, error) ? "Saved the scene and collected assets." : "Could not package the scene: " + error;
+}
+
+void actEmbed() {
+    std::string path, error;
+    if (!fileDialog(true, SCENE_FILTER, "c3d", path)) return;
+    Scene output = gScene;
+    if (!output.embedAssets(error)) { gStatus = "Could not embed images: " + error; return; }
+    gStatus = output.save(path) ? "Saved a scene with embedded images." : "Could not write the embedded scene.";
+}
+
+void actRelink() {
+    auto missing = gScene.missingAssets();
+    if (missing.empty()) { gStatus = "All scene assets are present."; return; }
+    gStatus = "Choose a replacement for " + baseName(missing.front()) + ".";
+    std::string replacement;
+    if (!fileDialog(false, IMAGE_FILTER, "png", replacement)) return;
+    if (!gScene.relinkAsset(missing.front(), replacement)) { gStatus = "Could not decode the replacement image."; return; }
+    sceneChanged();
+    gStatus = "Relinked " + baseName(replacement) + ".";
+}
+
+void actRecover() {
+    Scene saved;
+    if (!saved.load(recoveryPath())) { gStatus = "No usable autosave was found."; return; }
+    if (!confirmDiscard()) return;
+    gScene = std::move(saved);
+    gPath.clear();
+    sceneReplaced();
+    gDirty = true;
+    gStatus = "Recovered the autosave. Save As to keep it.";
 }
 
 void loadExample(int i) {
@@ -686,6 +934,7 @@ void loadExample(int i) {
     gScene = makeExample(i);
     gPath.clear();
     sceneReplaced();
+    clearRecovery();
     gStatus = "Loaded example scene \"" + exampleNames()[i] + "\". Press Render to see it.";
 }
 
@@ -709,13 +958,35 @@ bool saveBMP(const std::string& p, int w, int h, const std::vector<uint32_t>& px
     return fclose(f) == 0;
 }
 
+bool saveRenderOutput(const std::string& path, const Scene& rendered, int w, int h, std::vector<uint32_t> pixels) {
+    bool bmp = extension(path) == "bmp";
+    const auto& settings = rendered.render;
+    if (settings.alpha && !bmp) renderOutputPass(rendered, w, h, pixels, RenderPass::Alpha);
+    if (!(bmp ? saveBMP(path, w, h, pixels) : saveRaster(path, w, h, pixels, settings.alpha))) return false;
+    auto stem = std::filesystem::path(path);
+    stem.replace_extension();
+    if (settings.depthOutput) {
+        renderOutputPass(rendered, w, h, pixels, RenderPass::Depth);
+        if (!saveRaster(stem.string() + "_depth.png", w, h, pixels)) return false;
+    }
+    if (settings.idOutput) {
+        renderOutputPass(rendered, w, h, pixels, RenderPass::ObjectId);
+        if (!saveRaster(stem.string() + "_id.png", w, h, pixels)) return false;
+    }
+    return true;
+}
+
+bool saveRenderer(const std::string& path) {
+    std::vector<uint32_t> px;
+    gMainR.copyTo(px);
+    return saveRenderOutput(path, gMainR.scene(), gMainR.width(), gMainR.height(), std::move(px));
+}
+
 void actSaveImage() {
     if (!gMainR.hasImage()) { gStatus = "Render the scene first."; return; }
     std::string p;
-    if (!fileDialog(true, BMP_FILTER, "bmp", p)) return;
-    std::vector<uint32_t> px;
-    gMainR.copyTo(px);
-    gStatus = saveBMP(p, gMainR.width(), gMainR.height(), px) ? "Saved image " + p : "Could not write " + p;
+    if (!fileDialog(true, OUTPUT_FILTER, "png", p)) return;
+    gStatus = saveRenderer(p) ? "Saved image " + p : "Could not write image or passes for " + p;
 }
 
 void renderSize(int& w, int& h) {
@@ -727,7 +998,9 @@ void renderSize(int& w, int& h) {
 const char* qualityName(int q) { return q == 0 ? "Draft" : (q == 1 ? "Normal" : "Premium"); }
 
 void actRender() {
-    if (gMainR.busy() || gAnimRender) {
+    if (gMainR.busy() || gAnimRender || !gQueue.empty()) {
+        if (gAnimRender || !gQueue.empty()) gResumeAllowed = false;
+        gQueue.clear();
         gMainWasBusy = gAnimRender = false;
         gMainR.cancel();
         gStatus = "Render stopped.";
@@ -736,9 +1009,11 @@ void actRender() {
     gView = 0;
     gShowRender = true;
     gRenderStart = nowMs();
+    if (gResumeAllowed && gMainR.resume()) { gStatus = "Resumed render."; return; }
     int w, h;
     renderSize(w, h);
     gMainR.start(gScene, w, h);
+    gResumeAllowed = true;
     char b[96];
     snprintf(b, sizeof b, "Rendering %dx%d (%s)...", w, h, qualityName(gScene.render.quality));
     gStatus = b;
@@ -746,16 +1021,65 @@ void actRender() {
 
 void actRenderAnim() {
     std::string p;
-    if (!fileDialog(true, BMP_FILTER, "bmp", p)) return;
-    size_t dot = p.find_last_of('.');
-    gAnimBase = dot == std::string::npos ? p : p.substr(0, dot);
+    if (!fileDialog(true, OUTPUT_FILTER, "png", p)) return;
+    auto file = std::filesystem::path(p);
+    gAnimExtension = file.extension().string();
+    gAnimBase = file.replace_extension().string();
     gMainR.cancel();
+    gQueue.clear();
+    gResumeAllowed = false;
     gAnimRender = true;
     gAnimFrame = -1;
     gPlaying = false;
     gView = 0;
     gShowRender = true;
     gRenderStart = nowMs();
+}
+
+std::string animationName(int frame) {
+    char number[24];
+    snprintf(number, sizeof number, "%04d", frame);
+    std::string name = gAnimBase;
+    auto placeholder = name.find("{frame}");
+    if (placeholder == std::string::npos) name += std::string("_") + number;
+    else name.replace(placeholder, 7, number);
+    return name + gAnimExtension;
+}
+
+bool readQueue(const std::string& path, std::vector<RenderJob>& jobs) {
+    std::ifstream source(path);
+    if (!source) return false;
+    std::string line;
+    auto root = std::filesystem::path(path).parent_path();
+    std::set<std::string> outputs;
+    while (std::getline(source, line)) {
+        auto start = line.find_first_not_of(" \r\t");
+        if (start == std::string::npos || line[start] == '#') continue;
+        std::istringstream record(line);
+        RenderJob job;
+        if (!(record >> std::quoted(job.scene) >> std::quoted(job.output)) || job.scene.empty() || job.output.empty() || jobs.size() >= 10000)
+            return false;
+        record >> std::ws;
+        if (!record.eof()) return false;
+        job.scene = (root / job.scene).lexically_normal().string();
+        job.output = (root / job.output).lexically_normal().string();
+        auto ext = extension(job.output);
+        if ((ext != "bmp" && ext != "png" && ext != "tif" && ext != "tiff") || !outputs.insert(job.output).second) return false;
+        jobs.push_back(std::move(job));
+    }
+    return !source.bad() && !jobs.empty();
+}
+
+void actQueue() {
+    std::string path;
+    if (!fileDialog(false, "Render Queue (*.txt)\0*.txt\0", "txt", path)) return;
+    std::vector<RenderJob> jobs;
+    if (!readQueue(path, jobs)) { gStatus = "Invalid queue. Each line needs a scene path and a unique output path."; return; }
+    gMainR.cancel();
+    gAnimRender = gPlaying = gResumeAllowed = false;
+    gQueue = std::move(jobs);
+    gQueueIndex = -1;
+    gShowRender = true;
 }
 
 void setFrame(int f) {
@@ -808,6 +1132,81 @@ void saveLibrary() {
     if (!gLib.save(gLibPath)) gStatus = "Could not write library " + gLibPath;
 }
 
+void rememberLibrary() {
+    gLibraryUndo.push_back(gLib);
+    if (gLibraryUndo.size() > 24) gLibraryUndo.erase(gLibraryUndo.begin());
+    gLibraryRedo.clear();
+}
+
+void libraryHistory(bool redo) {
+    auto& from = redo ? gLibraryRedo : gLibraryUndo;
+    auto& to = redo ? gLibraryUndo : gLibraryRedo;
+    if (from.empty()) return;
+    if (!from.back().save(gLibPath)) { gStatus = "Could not save the library history change."; return; }
+    to.push_back(std::move(gLib));
+    gLib = std::move(from.back());
+    from.pop_back();
+    gStatus = redo ? "Redo library edit." : "Undo library edit.";
+}
+
+std::filesystem::path assetDirectory() {
+    return std::filesystem::path(gLibPath).parent_path() / "assets";
+}
+
+void refreshAssets() {
+    gAssets.clear();
+    gAssetSelection = -1;
+    gAssetPage = 0;
+    std::error_code error;
+    std::filesystem::directory_iterator it(assetDirectory(), error), end;
+    for (; !error && it != end; it.increment(error)) {
+        if (it->path().extension() != ".c3d") continue;
+        AssetTile tile{it->path().string(), it->path().stem().string(), {}};
+        auto bmp = it->path();
+        auto image = loadBMP(bmp.replace_extension(".bmp").string());
+        if (image && image->w == 96 && image->h == 64) {
+            for (V3 p : image->px) tile.thumbnail.push_back(rgb((unsigned)(p.x * 255), (unsigned)(p.y * 255), (unsigned)(p.z * 255)));
+        }
+        gAssets.push_back(std::move(tile));
+    }
+    std::sort(gAssets.begin(), gAssets.end(), [](const auto& a, const auto& b) { return a.name < b.name; });
+}
+
+void storeAsset(const Scene& asset, std::string name) {
+    if (asset.objs.empty()) { gStatus = "There are no objects to save."; return; }
+    for (char& c : name)
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-')) c = '_';
+    if (name.empty()) name = "Scene";
+    std::error_code error;
+    auto dir = assetDirectory();
+    std::filesystem::create_directories(dir, error);
+    if (error) { gStatus = "Could not open the asset library."; return; }
+    auto path = dir / (name + ".c3d");
+    for (int suffix = 2; std::filesystem::exists(path, error) && !error; ++suffix)
+        path = dir / (name + "_" + std::to_string(suffix) + ".c3d");
+    if (error || !asset.save(path.string())) { gStatus = "Could not write the asset."; return; }
+    Scene previewScene = asset;
+    V3 lo(1e30f), hi(-1e30f);
+    bool finite = false;
+    for (const Object& o : asset.objs) {
+        V3 a, b;
+        if (o.hidden || !worldBounds(o, a, b)) continue;
+        lo = {std::min(lo.x, a.x), std::min(lo.y, a.y), std::min(lo.z, a.z)};
+        hi = {std::max(hi.x, b.x), std::max(hi.y, b.y), std::max(hi.z, b.z)};
+        finite = true;
+    }
+    if (finite) {
+        previewScene.cam.target = (lo + hi) * 0.5f;
+        previewScene.cam.dist = std::max(2.f, length(hi - lo) * 1.4f);
+    }
+    previewScene.render.panorama = false;
+    std::vector<uint32_t> pixels(96 * 64);
+    renderImage(previewScene, 96, 64, pixels.data(), 0);
+    saveBMP(path.replace_extension(".bmp").string(), 96, 64, pixels);
+    refreshAssets();
+    gStatus = "Saved asset " + name + ".";
+}
+
 // ---------------------------------------------------------------- labs: open / close / preview
 
 std::vector<int> treeMembers() {
@@ -841,6 +1240,12 @@ void openLab(Lab l) {
     if (l == LabTools && gSelSet.empty()) { gStatus = "Select objects to use the Edit Tools."; return; }
     commitRename();
     if (l == LabMat) { gMatLayers = false; gLayerIndex = 0; }
+    if (l == LabAssets) refreshAssets();
+    if (l == LabTerrain) {
+        gRegionTool = gRegionMask = false;
+        gTerrainUndo.clear();
+        gTerrainRedo.clear();
+    }
     gLabBackup = gScene.snapshot();
     gLab = l;
     gLabChanged = false;
@@ -854,7 +1259,16 @@ void closeLab(bool cancel) {
         if (gLab == LabMat && validSel())
             for (int i : gSelSet)
                 if (!isLight(gScene.objs[i].type)) gScene.objs[i].mat = gScene.objs[gSel].mat;
-        if (gLabChanged) pushUndo(std::move(gLabBackup));
+        if (gLabChanged) {
+            const char* name = "Edit scene";
+            if (gLab == LabMat) name = "Edit materials";
+            else if (gLab == LabSky) name = "Edit sky";
+            else if (gLab == LabTerrain) name = "Edit terrain";
+            else if (gLab == LabMotion) name = "Edit motion";
+            else if (gLab == LabDxf) name = "Import DXF";
+            else if (gLab == LabAssets) name = "Insert library asset";
+            pushUndo(std::move(gLabBackup), name);
+        }
     }
     gLabR.cancel();
     gLab = LabNone;
@@ -883,6 +1297,7 @@ void startLabPreview() {
         for (int i : treeMembers()) {
             Object o = gScene.objs[i];
             o.pos = V3(0.f); o.rot = V3(0.f); o.scl = V3(4.f); o.group = 0;
+            o.parent = -1; o.bind = {}; o.bindOffset = {}; o.hasBind = false;
             s.objs.push_back(o);
         }
         s.cam.target = {0, 2.4f, 0};
@@ -918,6 +1333,7 @@ void drawTop() {
     textIn({310, 4, 260, 22}, APP_NAME, rgb(240, 240, 245), gTitle, TextLeft | TextMiddle);
     const char* fb[6] = {"New", "Open...", "Merge...", "Save", "Save As...", "Examples..."};
     int fx = gW - 6 * 76 - 6;
+    if (button({fx - 88, 4, 82, 22}, "Commands")) openLab(LabCommands);
     for (int i = 0; i < 6; i++)
         if (button({fx + i * 76, 4, 72, 22}, fb[i])) {
             if (i == 0) defer(actNew);
@@ -937,9 +1353,9 @@ void drawTop() {
         }
         if (iconButton({x, 30, width, 62}, gTreeIcon, ICW, ICH, "Tree")) createTree();
         x += step;
-        if (iconButton({x, 30, width, 62}, {}, ICW, ICH, "Picture", false, "BMP")) defer(actCreatePicture);
+        if (iconButton({x, 30, width, 62}, {}, ICW, ICH, "Picture", false, "IMG")) defer(actCreatePicture);
         x += step;
-        if (iconButton({x, 30, width, 62}, {}, ICW, ICH, "Import", false, "OBJ")) defer(actImport);
+        if (iconButton({x, 30, width, 62}, {}, ICW, ICH, "Import", false, "3D")) defer(actImport);
     } else if (gTab == 1) {
         const char* tools[4] = {"Move", "Rotate", "Resize", "Sculpt"};
         for (int i = 0; i < 4; i++)
@@ -954,6 +1370,7 @@ void drawTop() {
             {"Delete", 60, actDelete},                        {"Group", 56, actGroup},
             {"Ungroup", 66, actUngroup},                      {"Undo", 50, [] { undoRedo(false); }},
             {"Redo", 50, [] { undoRedo(true); }},
+            {"Export Mesh", 84, [] { defer(actExportGeometry); }},
         };
         int x = 270;
         for (auto& b : bs) {
@@ -976,7 +1393,8 @@ void drawTop() {
         if (button({112, 64, 22, 24}, "<")) gQuickCat--;
         textIn({136, 64, 92, 24}, cats[gQuickCat].c_str(), rgb(255, 255, 255), gBold);
         if (button({230, 64, 22, 24}, ">")) gQuickCat++;
-        int qx = 260;
+        if (button({260, 64, 58, 24}, "Assets")) openLab(LabAssets);
+        int qx = 324;
         for (auto& m : materialPresets()) {
             if (m.category != cats[gQuickCat]) continue;
             if (qx + 92 > gW - 10) break;
@@ -1063,7 +1481,7 @@ void drawLeft() {
     int rid = newId();
     R rb{x + 75 - 34, y, 68, 68};
     press(rb, rid);
-    bool busy = gMainR.busy() || gAnimRender;
+    bool busy = gMainR.busy() || gAnimRender || !gQueue.empty();
     shadedBall(rb.x + 34, rb.y + 34, 33, busy ? V3(0.8f, 0.25f, 0.2f) : V3(0.25f, 0.65f, 0.3f), hov(rb));
     textIn({x, y + 70, 150, 18}, busy ? "STOP" : "RENDER", rgb(255, 255, 255), gBold);
     if (clicked(rb, rid)) actRender();
@@ -1075,12 +1493,14 @@ void drawLeft() {
     y += 26;
     if (button({x, y, 148, 22}, "Render Options...")) openLab(LabRender);
     y += 26;
+    if (button({x, y, 148, 22}, "Cameras...")) openLab(LabCameras);
+    y += 26;
     if (button({x, y, 148, 22}, gShowRender ? "Show Wireframe" : "Show Render") && gMainR.hasImage()) gShowRender = !gShowRender;
     y += 26;
     if (button({x, y, 148, 22}, "Save Image...")) defer(actSaveImage);
 }
 
-void row3(int x, int& y, int w, const char* title, V3& v, float speed, float minV = -1e9f) {
+bool row3(int x, int& y, int w, const char* title, V3& v, float speed, float minV = -1e9f) {
     int cw = (w - 8) / 3;
     label(x, y, title);
     y += 18;
@@ -1089,6 +1509,7 @@ void row3(int x, int& y, int w, const char* title, V3& v, float speed, float min
     ch |= dragF({x + 2 * (cw + 4), y, cw, 20}, "Z", v.z, speed, minV);
     y += 26;
     if (ch) sceneChanged();
+    return ch;
 }
 
 void lightControls(Object& light, int x, int& y, int w) {
@@ -1107,26 +1528,84 @@ void drawRight() {
     int x0 = gW - RIGHT;
     vgrad({x0, TOP, RIGHT, gH - TOP - STATUS - TIMELINE}, rgb(90, 90, 96), rgb(56, 56, 62));
     int x = x0 + 10, w = RIGHT - 20, y = TOP + 8;
-    label(x, y, "Scene Objects");
+    label(x, y, "Scene Hierarchy");
     y += 18;
+    std::string filter = gEditObj == -2 ? gEditBuf : gFilter;
+    std::string filterLabel = gEditObj == -2 ? gEditBuf + "|" : (gFilter.empty() ? "Filter objects..." : gFilter);
+    if (button({x, y, w - 32, 21}, filterLabel.c_str(), gEditObj == -2, gSmall)) {
+        gEditObj = -2;
+        gEditBuf = gFilter;
+    }
+    if (button({x + w - 28, y, 28, 21}, "X", false, gSmall)) { gFilter.clear(); filter.clear(); gListScroll = 0; }
+    y += 25;
     const int rows = 8, n = (int)gScene.objs.size();
+    std::vector<std::vector<int>> children(n + 1);
+    for (int i = 0; i < n; ++i) children[gScene.objs[i].parent + 1].push_back(i);
+    std::vector<std::pair<int, int>> ordered, pending;
+    for (auto it = children[0].rbegin(); it != children[0].rend(); ++it) pending.emplace_back(*it, 0);
+    while (!pending.empty()) {
+        auto node = pending.back();
+        pending.pop_back();
+        ordered.push_back(node);
+        auto& list = children[node.first + 1];
+        for (auto it = list.rbegin(); it != list.rend(); ++it) pending.emplace_back(*it, node.second + 1);
+    }
+    auto lowercase = [](std::string s) {
+        for (char& c : s) if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+        return s;
+    };
+    if (!filter.empty()) {
+        filter = lowercase(std::move(filter));
+        ordered.erase(std::remove_if(ordered.begin(), ordered.end(), [&](const auto& row) {
+            const auto& o = gScene.objs[row.first];
+            return lowercase(o.name + " " + objTypeName(o.type) + " " + o.mat.name).find(filter) == std::string::npos;
+        }), ordered.end());
+    }
     gListR = {x, y, w, rows * 18 + 4};
     fill(gListR, rgb(38, 38, 44));
     bevel(gListR, true);
-    gListScroll = std::max(0, std::min(gListScroll, n - rows));
-    for (int k = 0; k < rows && gListScroll + k < n; k++) {
-        int idx = gListScroll + k;
+    int visible = (int)ordered.size(), drop = -1;
+    gListScroll = std::max(0, std::min(gListScroll, visible - rows));
+    for (int k = 0; k < rows && gListScroll + k < visible; k++) {
+        auto [idx, depth] = ordered[gListScroll + k];
         R row{x + 2, y + 2 + k * 18, w - 4, 18};
         const Object& o = gScene.objs[idx];
         if (isSel(idx)) fill(row, idx == gSel ? rgb(92, 108, 156) : rgb(72, 84, 120));
         else if (hov(row)) fill(row, rgb(60, 60, 70));
-        std::string nm = (o.group ? "[" + std::to_string(o.group) + "] " : "") + o.name;
-        textIn({row.x + 6, row.y, row.w - 74, row.h}, nm.c_str(), o.hidden ? TXT_DIM : TXT, gFont, TextLeft | TextMiddle);
-        std::string tn = std::string(o.hidden ? "hidden " : "") + (o.boolMode != BoolMode::Neutral ? boolName(o.boolMode) : objTypeName(o.type));
+        std::string nm = (o.group ? "[" + std::to_string(o.group) + "] " : "") +
+                         (gEditObj == idx ? gEditBuf + "|" : o.name);
+        int indent = std::min(depth, 6) * 10;
+        textIn({row.x + 6 + indent, row.y, row.w - 74 - indent, row.h}, nm.c_str(), o.hidden ? TXT_DIM : TXT, gFont, TextLeft | TextMiddle);
+        std::string tn = std::string(o.hidden ? "H " : "") + (o.locked ? "L " : "") +
+                         (o.boolMode != BoolMode::Neutral ? boolName(o.boolMode) : objTypeName(o.type));
         textIn({row.x, row.y, row.w - 6, row.h}, tn.c_str(), TXT_DIM, gSmall, TextRight | TextMiddle);
         int id = newId();
         press(row, id);
-        if (gActive == id && gIn.pressed) selectObj(idx, gIn.shift, gIn.alt || gIn.ctrl);
+        if (gActive == id && gIn.pressed) {
+            if (gLastRow == idx && nowMs() - gLastRowTime < 380 && !gIn.shift && !gIn.ctrl) {
+                gEditObj = idx; gEditBuf = o.name;
+                gListDrag = -1;
+                gLastRow = -1;
+            } else {
+                selectObj(idx, gIn.shift, gIn.alt || gIn.ctrl);
+                gLastRow = idx; gLastRowTime = nowMs();
+                gListDrag = idx; gListDragY = gIn.my;
+            }
+        }
+        if (hov(row)) drop = idx;
+    }
+    if (gIn.released && gListDrag >= 0) {
+        if (drop >= 0 && std::abs(gIn.my - gListDragY) > 5) {
+            int from = gListDrag;
+            bool parent = gIn.alt;
+            defer([from, drop, parent] {
+                if (parent) {
+                    if (gScene.setParent(from, drop)) { sceneChanged(); gStatus = "Reparent scene object"; }
+                    else gStatus = "That hierarchy link would create a cycle.";
+                } else reorderSceneObject(from, drop);
+            });
+        }
+        gListDrag = -1;
     }
     y += gListR.h + 8;
     if (validSel()) {
@@ -1212,7 +1691,7 @@ int pick(int mx, int my) {
     for (int i = 0; i < (int)gScene.objs.size(); i++) {
         const Object& o = gScene.objs[i];
         if (o.hidden || (!isLight(o.type) && !(gIn.alt && o.type == ObjType::Metaball))) continue;
-        V3 c = vb.toCam(o.pos);
+        V3 c = vb.toCam(o.worldPos);
         if (!vb.ortho && c.z < 0.1f) continue;
         float d = vb.ortho ? 1.f : c.z;
         float sx = cx + c.x / (d * vb.k) * hh, sy = cy - c.y / (d * vb.k) * hh;
@@ -1256,16 +1735,20 @@ void dragObject() {
     ViewBasis vb = curBasis();
     float hh = gVP.h * 0.5f, dx = (float)gIn.dx, dy = (float)gIn.dy;
     std::vector<int> s;
-    for (int i : gSelSet)
-        if (!gScene.objs[i].locked) s.push_back(i);
+    for (int i : gSelSet) {
+        if (gScene.objs[i].locked) continue;
+        int parent = gScene.objs[i].parent;
+        while (parent >= 0 && (!isSel(parent) || gScene.objs[parent].locked)) parent = gScene.objs[parent].parent;
+        if (parent < 0) s.push_back(i);
+    }
     if (s.empty()) { gStatus = "The selection is locked."; return; }
     V3 c(0.f);
-    for (int i : s) c += gScene.objs[i].pos;
+    for (int i : s) c += gScene.objs[i].worldPos;
     c = c / (float)s.size();
     if (gTool == 0) {
-        float wpp = (vb.ortho ? 1.f : std::max(0.5f, vb.toCam(gScene.objs[gSel].pos).z)) * vb.k / hh;
+        float wpp = (vb.ortho ? 1.f : std::max(0.5f, vb.toCam(gScene.objs[gSel].worldPos).z)) * vb.k / hh;
         V3 d = gIn.ctrl ? V3(0, -dy * wpp, 0) : (vb.r * dx - vb.u * dy) * wpp;
-        for (int i : s) gScene.objs[i].pos += d;
+        for (int i : s) gScene.objs[i].moveWorld(d);
     } else if (gTool == 1) {
         float yaw = gIn.shift ? 0 : dx * 0.5f;
         M3 ry = rotY(rad(yaw));
@@ -1273,7 +1756,7 @@ void dragObject() {
             Object& o = gScene.objs[i];
             if (gIn.shift || (o.type == ObjType::Picture && o.picture.billboard)) o.rot.z += dx * 0.5f;
             else { o.rot.y += yaw; o.rot.x += dy * 0.5f; }
-            if (s.size() > 1) o.pos = c + ry * (o.pos - c);
+            if (s.size() > 1) o.moveWorld(c + ry * (o.worldPos - c) - o.worldPos);
         }
     } else {
         float f = std::exp(-dy * 0.01f + dx * 0.005f);
@@ -1282,20 +1765,20 @@ void dragObject() {
             if (isLight(o.type)) continue;
             if (gIn.shift) o.scl.y = std::max(0.01f, o.scl.y * f);
             else o.scl = V3(std::max(0.01f, o.scl.x * f), std::max(0.01f, o.scl.y * f), std::max(0.01f, o.scl.z * f));
-            if (s.size() > 1) o.pos = c + (o.pos - c) * f;
+            if (s.size() > 1) o.moveWorld(c + (o.worldPos - c) * f - o.worldPos);
         }
     }
     sceneChanged();
 }
 
-V3 lightAimTip(const Object& o) { return o.pos + o.lightAxis() * (o.type == ObjType::Spotlight ? 4.f : 5.f); }
+V3 lightAimTip(const Object& o) { return o.worldPos + o.lightAxis() * (o.type == ObjType::Spotlight ? 4.f : 5.f); }
 
 void dragLightAim() {
     Object& o = gScene.objs[gSel];
     ViewBasis vb = curBasis();
     V3 tip = lightAimTip(o);
     float wpp = (vb.ortho ? 1.f : std::max(0.1f, vb.toCam(tip).z)) * vb.k / (gVP.h * 0.5f);
-    V3 aim = normalize(tip - o.pos + (vb.r * (float)gIn.dx - vb.u * (float)gIn.dy) * wpp);
+    V3 aim = normalize(o.parentInv * (tip - o.worldPos + (vb.r * (float)gIn.dx - vb.u * (float)gIn.dy) * wpp));
     if (length(aim) < 0.5f) return;
     o.rot.x = std::acos(clampf(-aim.y, -1, 1)) * 180 / PI;
     if (std::fabs(aim.x) + std::fabs(aim.z) > 1e-5f) o.rot.y = std::atan2(-aim.x, -aim.z) * 180 / PI;
@@ -1309,7 +1792,9 @@ void drawViewport() {
         fill(vp, rgb(16, 16, 18));
         blitFit(gMainR, vp);
     } else {
-        vgrad(vp, rgb(84, 86, 92), rgb(132, 134, 140));
+        bool previewMode = gViewMode == Solid || gViewMode == Textured;
+        vgrad(vp, rgb(53, 66, 75), rgb(127, 146, 150));
+        if (previewMode) blitFit(gViewR, vp);
         ViewBasis vb = curBasis();
         float hh = vp.h * 0.5f, cx = vp.x + vp.w * 0.5f, cy = vp.y + hh;
         setClip(vp);
@@ -1330,9 +1815,11 @@ void drawViewport() {
             int x0, y0, x1, y1;
             P(ca, x0, y0);
             P(cb, x1, y1);
-            line(x0, y0, x1, y1, pen);
+            float fade = gViewMode == DepthWire ? lerpf(1, 0.28f, clampf((ca.z + cb.z) / (vb.ortho ? 4400.f : 320.f), 0, 1)) : 1.f;
+            line(x0, y0, x1, y1, rgb((unsigned)(red(pen) * fade), (unsigned)(green(pen) * fade), (unsigned)(blue(pen) * fade)));
         };
-        for (int k = -10; k <= 10; k++) { seg(V3(k * 5.f, 0, -50), V3(k * 5.f, 0, 50)); seg(V3(-50, 0, k * 5.f), V3(50, 0, k * 5.f)); }
+        if (!previewMode)
+            for (int k = -10; k <= 10; k++) { seg(V3(k * 5.f, 0, -50), V3(k * 5.f, 0, 50)); seg(V3(-50, 0, k * 5.f), V3(50, 0, k * 5.f)); }
         std::vector<V3> s;
         auto drawObj = [&](int i) {
             const Object& o = gScene.objs[i];
@@ -1342,16 +1829,31 @@ void drawViewport() {
             else if (sel) c = i == gSel ? rgb(225, 28, 28) : rgb(235, 90, 70);
             else if (o.boolMode == BoolMode::Negative || (o.type == ObjType::Metaball && o.metaNegative)) c = rgb(20, 110, 40);
             else if (o.boolMode == BoolMode::Intersect) c = rgb(120, 40, 140);
+            else if (o.boolMode == BoolMode::Positive) c = rgb(50, 202, 194);
             else if (o.locked) c = rgb(70, 70, 76);
             pen = c;
+            if (gViewMode == BoundsOnly) {
+                V3 lo, hi;
+                if (!worldBounds(o, lo, hi)) return;
+                auto corner = [&](int i) { return V3((i & 1) ? hi.x : lo.x, (i & 2) ? hi.y : lo.y, (i & 4) ? hi.z : lo.z); };
+                for (int k = 0; k < 8; ++k) for (int bit : {1, 2, 4})
+                    if (!(k & bit)) seg(corner(k), corner(k | bit));
+                return;
+            }
             s.clear();
             wireframe(o, s);
             for (size_t j = 0; j + 1 < s.size(); j += 2) seg(s[j], s[j + 1]);
         };
         for (int i = 0; i < (int)gScene.objs.size(); i++)
-            if (!isSel(i) && !gScene.objs[i].hidden) drawObj(i);
+            if (!previewMode && !isSel(i) && !gScene.objs[i].hidden) drawObj(i);
         for (int i : gSelSet)
             if (i < (int)gScene.objs.size()) drawObj(i);
+        if (validSel()) {
+            const Object& o = gScene.objs[gSel];
+            pen = rgb(240, 180, 70);
+            auto at = [&](const Key& k) { return o.worldPos + o.parentSpace * (k.pos - o.pos); };
+            for (size_t i = 1; i < o.keys.size(); ++i) seg(at(o.keys[i - 1]), at(o.keys[i]));
+        }
         if (validSel() && gTool != TOOL_SCULPT) {
             const Object& selected = gScene.objs[gSel];
             R aim{};
@@ -1362,7 +1864,7 @@ void drawViewport() {
                     int x = (int)clampf(cx + c.x / (d * vb.k) * hh, -30000, 30000);
                     int y = (int)clampf(cy - c.y / (d * vb.k) * hh, -30000, 30000);
                     pen = rgb(255, 218, 120);
-                    seg(selected.pos, tip);
+                    seg(selected.worldPos, tip);
                     if (vp.in(x, y) && vp.w >= 38 && vp.h >= 20) {
                         aim = {std::clamp(x - 19, vp.x, vp.x + vp.w - 38), std::clamp(y - 10, vp.y, vp.y + vp.h - 20), 38, 20};
                         bool hover = hov(aim);
@@ -1375,7 +1877,7 @@ void drawViewport() {
             }
             V3 lo, hi;
             bool bounded = sceneBounds(true, lo, hi);
-            V3 center = bounded ? (lo + hi) * 0.5f : gScene.objs[gSel].pos;
+            V3 center = bounded ? (lo + hi) * 0.5f : gScene.objs[gSel].worldPos;
             V3 c = vb.toCam(center);
             float depth = vb.ortho ? 1.f : c.z;
             if (depth > 0.1f) {
@@ -1446,12 +1948,12 @@ void drawViewport() {
                     V3 prev;
                     for (int k = 0; k <= 40; k++) {
                         float a = 2 * PI * k / 40, x = cxl + std::cos(a) * R2, z = czl + std::sin(a) * R2;
-                        V3 p = o.pos + o.fwd * V3(x, H(x, z) + 0.004f, z);
+                        V3 p = o.worldPos + o.fwd * V3(x, H(x, z) + 0.004f, z);
                         if (k) seg(prev, p);
                         prev = p;
                     }
                 }
-                V3 c0 = o.pos + o.fwd * V3(cxl, H(cxl, czl), czl), up = normalize(o.fwd * V3(0, 1, 0));
+                V3 c0 = o.worldPos + o.fwd * V3(cxl, H(cxl, czl), czl), up = normalize(o.fwd * V3(0, 1, 0));
                 seg(c0, c0 + up * (o.scl.y * 0.25f + 0.5f));
             }
         }
@@ -1462,9 +1964,39 @@ void drawViewport() {
         snprintf(buf, sizeof buf, "%s   |   Tool: %s   |   Frame %d", vn[gView], tn[gTool], gScene.frame);
         textIn({vp.x + 10, vp.y + 6, vp.w - 20, 18}, buf, rgb(240, 240, 245), gBold, TextLeft | TextMiddle);
     }
+    if (gSafeFrame) {
+        float ratio = gScene.render.width > 0 && gScene.render.height > 0 ? gScene.render.width / (float)gScene.render.height : 16.f / 9;
+        int w = std::min(vp.w - 20, (int)((vp.h - 20) * ratio)), h = (int)(w / ratio);
+        int x = vp.x + (vp.w - w) / 2, y = vp.y + (vp.h - h) / 2;
+        Color c = rgb(240, 190, 106);
+        line(x, y, x + w, y, c); line(x + w, y, x + w, y + h, c);
+        line(x + w, y + h, x, y + h, c); line(x, y + h, x, y, c);
+    }
+    if (button({vp.x + vp.w - 100, vp.y + 5, 94, 22}, "Display", gDisplayPalette, gSmall)) gDisplayPalette = !gDisplayPalette;
+    R palette{vp.x + vp.w - 198, vp.y + 34, 190, 142};
+    if (gDisplayPalette) {
+        int x = palette.x, y = palette.y;
+        vgrad(palette, rgb(55, 75, 82), rgb(36, 51, 59));
+        bevel(palette, false);
+        const char* modes[] = {"Wire", "Depth Wire", "Bounds", "Solid", "Texture", "Render"};
+        for (int i = 0; i < 6; ++i) {
+            if (!button({x + 5 + (i % 2) * 92, y + 6 + (i / 2) * 26, 88, 22}, modes[i],
+                        i == 5 ? gShowRender : (!gShowRender && gViewMode == i), gSmall)) continue;
+            if (i == 5) {
+                if (gMainR.hasImage()) gShowRender = true;
+                else actRender();
+            } else {
+                gViewMode = (ViewMode)i;
+                gShowRender = false;
+                gViewPreviewDirty = true;
+            }
+        }
+        toggle({x + 5, y + 84, 180, 22}, "Safe Frame", gSafeFrame);
+        if (slider({x + 5, y + 112, 180, 22}, "Preview Scale", gPreviewScale, 0.2f, 0.8f)) gViewPreviewDirty = true;
+    }
     line(vp.x, vp.y, vp.x + vp.w, vp.y, rgb(28, 28, 32));
 
-    if (hov(vp) && gIn.pressed && gActive == 0) {
+    if (hov(vp) && !(gDisplayPalette && hov(palette)) && gIn.pressed && gActive == 0) {
         gActive = VIEW_ID;
         SculptHit sh = gTool == TOOL_SCULPT && !gShowRender ? sculptPick(gIn.mx, gIn.my) : SculptHit();
         if (gShowRender) { gShowRender = false; gDrag = DragNone; }
@@ -1510,8 +2042,9 @@ void drawTimeline() {
     if (button({x + 60, y, 50, 24}, gPlaying ? "Stop" : "Play", gPlaying)) { gPlaying = !gPlaying; gPlayLast = nowMs(); }
     if (button({x + 112, y, 28, 24}, ">")) jumpKey(1);
     if (button({x + 142, y, 28, 24}, ">|")) setFrame(last);
+    if (button({x + 176, y, 62, 24}, "Motion")) openLab(LabMotion);
     int rx = gW - 600;
-    R tr{x + 180, y, rx - x - 190, 24};
+    R tr{x + 244, y, rx - x - 250, 24};
     int id = newId();
     press(tr, id);
     fill(tr, rgb(36, 36, 42));
@@ -1542,14 +2075,22 @@ void drawStatus() {
     R sb{0, gH - STATUS, gW, STATUS};
     vgrad(sb, rgb(70, 70, 76), rgb(44, 44, 48));
     line(0, sb.y, gW, sb.y, rgb(28, 28, 32));
-    textIn({10, sb.y, gW - 360, sb.h}, gStatus.c_str(), TXT, gFont, TextLeft | TextMiddle);
-    if (gMainR.busy() || gAnimRender) {
+    if (gHoverTip != gLastTip) { gLastTip = gHoverTip; gTipSince = nowMs(); }
+    bool tip = !gHoverTip.empty() && !gIn.down && nowMs() - gTipSince > 450;
+    textIn({10, sb.y, gW - 360, sb.h}, tip ? gHoverTip.c_str() : gStatus.c_str(), TXT, gFont, TextLeft | TextMiddle);
+    if (gMainR.busy() || gAnimRender || !gQueue.empty()) {
         R pb{gW - 330, sb.y + 5, 320, 14};
         fill(pb, rgb(30, 30, 34));
         vgrad({pb.x, pb.y, (int)(pb.w * gMainR.progress()), pb.h}, rgb(120, 200, 120), rgb(60, 130, 60));
         char buf[96];
         if (gAnimRender) snprintf(buf, sizeof buf, "Frame %d/%d  %d%%", std::max(gAnimFrame, 0), gScene.frames - 1, (int)(gMainR.progress() * 100));
-        else snprintf(buf, sizeof buf, "Rendering %d%%", (int)(gMainR.progress() * 100));
+        else {
+            float progress = gMainR.progress();
+            if (progress > 0.02f && progress < 1)
+                snprintf(buf, sizeof buf, "Rendering %d%%   ~%.0f s left", (int)(progress * 100),
+                         (nowMs() - gRenderStart) / 1000.f * (1 - progress) / progress);
+            else snprintf(buf, sizeof buf, "Rendering %d%%", (int)(progress * 100));
+        }
         textIn(pb, buf, rgb(255, 255, 255), gSmall);
     } else
         textIn({gW - 600, sb.y, 590, sb.h}, "Shift+click multi-select   RMB orbit   MMB pan   Wheel zoom   Ctrl+Z undo   Ctrl+R render", TXT_DIM, gSmall, TextRight | TextMiddle);
@@ -1572,6 +2113,210 @@ void labFooter(R P, bool cancelOnly = false) {
     if (button({P.x + P.w - 100, P.y + P.h - 40, 88, 28}, cancelOnly ? "Close" : "Cancel", false, gBold)) closeLab(true);
 }
 
+void drawDxfLab() {
+    R p = panel(420, 246, "Import DXF");
+    int x = p.x + 20, y = p.y + 46, w = p.w - 40;
+    label(x, y, baseName(gDxfPath).c_str(), w);
+    slider({x, y + 24, w, 24}, "World Units per DXF Unit", gDxfScale, 0.001f, 1000, "%.3f", true);
+    toggle({x, y + 56, w, 24}, "Convert Z-Up to Y-Up", gDxfZUp);
+    toggle({x, y + 88, w, 24}, "One Object per Layer", gDxfLayers);
+    if (button({x + w - 198, p.y + p.h - 40, 88, 28}, "Import")) {
+        std::vector<MeshLayer> layers;
+        std::string error;
+        if (!loadDXF(gDxfPath, layers, gDxfScale, gDxfZUp, gDxfLayers, error)) {
+            gStatus = "Could not import DXF: " + error;
+            return;
+        }
+        int first = (int)gScene.objs.size(), group = layers.size() > 1 ? gScene.maxGroup() + 1 : 0;
+        for (auto& part : layers) {
+            Object o = makeObject(ObjType::Mesh, ++gCounter[(int)ObjType::Mesh]);
+            o.name = gDxfLayers ? part.name : baseName(gDxfPath);
+            o.group = group;
+            o.mesh = std::make_shared<Mesh>(std::move(part.mesh));
+            gScene.objs.push_back(std::move(o));
+        }
+        selectObj(first, false);
+        gShowRender = false;
+        sceneChanged();
+        closeLab(false);
+        gStatus = "Imported " + std::to_string(layers.size()) + " DXF object(s).";
+        return;
+    }
+    if (button({x + w - 88, p.y + p.h - 40, 88, 28}, "Cancel")) closeLab(true);
+}
+
+void drawMotionLab() {
+    Object* object = validSel() ? &gScene.objs[gSel] : nullptr;
+    R p = panel(548, 384, std::string("Motion Editor  -  ") + (object ? object->name : "Camera"));
+    int x = p.x + 16, y = p.y + 48, w = p.w - 32;
+    int frame = gScene.frame;
+    if (sliderI({x, y, w, 24}, "Frame", frame, 0, gScene.frames - 1)) setFrame(frame);
+    y += 32;
+    if (object && toggle({x, y, 174, 24}, "Appearance Track", gAppearanceTrack)) gMotionKey = 0;
+    bool appearance = object && gAppearanceTrack;
+    if (button({x + 184, y, 132, 24}, "Set Key Here")) {
+        if (appearance) putKey(object->appearances, object->appearance(frame));
+        else if (object) putKey(object->keys, Key{frame, object->pos, object->rot, object->scl});
+        else putKey(gScene.camKeys, CamKey{frame, gScene.cam});
+        sceneChanged();
+    }
+    y += 34;
+    auto track = [&](auto& keys, const auto& edit) {
+        if (keys.empty()) return;
+        gMotionKey = std::clamp(gMotionKey, 0, (int)keys.size() - 1);
+        if (button({x, y, 30, 24}, "<") && gMotionKey > 0) --gMotionKey;
+        if (button({x + 34, y, 30, 24}, ">") && gMotionKey + 1 < (int)keys.size()) ++gMotionKey;
+        auto& k = keys[gMotionKey];
+        std::string at = "Go to Key " + std::to_string(k.frame);
+        if (button({x + 68, y, 130, 24}, at.c_str())) setFrame(k.frame);
+        std::string mode = std::string("Ease ") + easeName(k.ease);
+        if (button({x + 202, y, 142, 24}, mode.c_str())) {
+            k.ease = (Ease)(((int)k.ease + 1) % (int)Ease::COUNT);
+            gScene.applyFrame(gScene.frame);
+            sceneChanged();
+        }
+        if (button({x + 348, y, 126, 24}, "Remove Key")) {
+            keys.erase(keys.begin() + gMotionKey);
+            gScene.applyFrame(gScene.frame);
+            sceneChanged();
+            return;
+        }
+        y += 36;
+        if (edit(k)) { gScene.applyFrame(gScene.frame); sceneChanged(); }
+    };
+    if (appearance) {
+        track(object->appearances, [&](AppearanceKey& k) {
+            bool changed = toggle({x, y, 128, 24}, "Hidden", k.hidden);
+            if (isLight(object->type)) changed |= slider({x + 134, y, 240, 24}, "Light Power", k.light[0], 0, 5);
+            else if (isHeightfield(object->type)) changed |= slider({x + 134, y, 240, 24}, "Terrain Height", k.terrain.height, 0.05f, 5);
+            else changed |= slider({x + 134, y, 240, 24}, "Transparency", k.material.transparency, 0, 1);
+            note({x, y + 34, w, 58}, "Edit materials, pictures, terrain or lights at the target frame, then set an appearance key here.");
+            return changed;
+        });
+    } else if (object) {
+        track(object->keys, [&](Key& k) {
+            bool ch = row3(x, y, w, "Path Point", k.pos, 0.05f);
+            ch |= row3(x, y, w, "Rotation", k.rot, 0.5f);
+            ch |= row3(x, y, w, "Scale", k.scl, 0.03f, 0.01f);
+            return ch;
+        });
+    } else {
+        track(gScene.camKeys, [&](CamKey& k) {
+            bool ch = row3(x, y, w, "Camera Target", k.cam.target, 0.05f);
+            ch |= slider({x, y, w, 24}, "Orbit Distance", k.cam.dist, 1, 500, "%.1f", true);
+            return ch;
+        });
+    }
+    labFooter(p);
+}
+
+void drawCamerasLab() {
+    R p = panel(700, 448, "Cameras");
+    int x = p.x + 20, y = p.y + 46;
+    if (button({x, y, 206, 24}, "Add Camera") && gScene.cameras.size() < 128) {
+        std::string name = "Camera " + std::to_string(gScene.cameras.size() + 1);
+        gScene.cameras.push_back({name, gScene.cam, gScene.camKeys});
+        gScene.selectCamera((int)gScene.cameras.size() - 1);
+        sceneChanged();
+    }
+    y += 29;
+    int active = gScene.activeCamera, n = (int)gScene.cameras.size();
+    if (n > 0) {
+        if (button({x, y, 98, 22}, "Previous")) { gScene.selectCamera((active + n - 1) % n); sceneChanged(); }
+        if (button({x + 106, y, 100, 22}, "Next")) { gScene.selectCamera((active + 1) % n); sceneChanged(); }
+    }
+    y += 30;
+    int first = std::max(0, active - 6);
+    for (int i = first; i < std::min(n, first + 7); ++i)
+        if (button({x, y + (i - first) * 26, 206, 22}, gScene.cameras[i].name.c_str(), active == i)) {
+            gScene.selectCamera(i);
+            gView = 0;
+            gShowRender = false;
+            sceneChanged();
+        }
+    if (active >= 0 && button({x, p.y + 340, 206, 24}, "Remove Active Camera")) {
+        gScene.cameras.erase(gScene.cameras.begin() + active);
+        gScene.activeCamera = -1;
+        if (!gScene.cameras.empty()) gScene.selectCamera(std::min(active, (int)gScene.cameras.size() - 1));
+        sceneChanged();
+    }
+    if (gScene.activeCamera >= 0) {
+        const auto& name = gScene.cameras[gScene.activeCamera].name;
+        auto caption = gEditObj == -3 ? gEditBuf + "|" : "Rename Camera";
+        if (button({x, p.y + 368, 206, 24}, caption.c_str(), gEditObj == -3)) { gEditObj = -3; gEditBuf = name; }
+    }
+    Camera& c = gScene.cam;
+    int cx = p.x + 248, w = 430;
+    y = p.y + 46;
+    bool ch = toggle({cx, y, 212, 24}, "Orthographic Camera", c.orthographic);
+    toggle({cx + 216, y, 212, 24}, "Show Safe Frame", gSafeFrame);
+    y += 30;
+    if (c.orthographic) ch |= slider({cx, y, w, 24}, "Ortho Scale", c.orthoScale, 0.1f, 500, "%.2f", true);
+    else ch |= slider({cx, y, w, 24}, "Field of View", c.fov, 15, 120, "%.0f");
+    y += 28;
+    const int fovs[] = {24, 35, 50, 75};
+    for (int i = 0; i < 4; ++i) {
+        auto text = std::to_string(fovs[i]) + " deg";
+        if (button({cx + i * 107, y, 104, 22}, text.c_str(), c.fov == fovs[i])) { c.fov = (float)fovs[i]; c.orthographic = false; ch = true; }
+    }
+    y += 30;
+    row3(cx, y, w, "Camera Target", c.target, 0.08f);
+    ch |= slider({cx, y, 212, 24}, "Yaw", c.yaw, -180, 180, "%.0f");
+    ch |= slider({cx + 216, y, 212, 24}, "Pitch", c.pitch, -89, 89, "%.0f");
+    y += 28;
+    ch |= slider({cx, y, w, 24}, "Distance", c.dist, 1, 5000, "%.1f", true); y += 28;
+    if (button({cx, y, 212, 24}, "Look at Selected Object") && validSel()) { c.lookAt = gSel; ch = true; }
+    if (button({cx + 216, y, 212, 24}, "Clear Look-at")) { c.lookAt = -1; ch = true; }
+    y += 28;
+    if (gView != 0 && button({cx, y, w, 24}, "Match Editor View")) {
+        c.target = gOrthoC[gView];
+        c.dist = 2000;
+        c.yaw = gView == 3 ? 90.f : 0.f;
+        c.pitch = gView == 1 ? 90.f : 0.f;
+        c.orthographic = true;
+        c.orthoScale = gOrthoS[gView];
+        c.lookAt = -1;
+        ch = true;
+    }
+    y += 28;
+    if (c.lookAt >= 0 && c.lookAt < (int)gScene.objs.size())
+        label(cx, y, ("Looking at " + gScene.objs[c.lookAt].name).c_str(), w);
+    if (ch) { gView = 0; gShowRender = false; sceneChanged(); }
+    labFooter(p);
+}
+
+void drawCommandsLab() {
+    R p = panel(770, 480, "Commands");
+    struct Command { const char* label; const char* key; std::function<void()> run; };
+    const Command commands[] = {
+        {"Render / Resume", "Ctrl+R", actRender}, {"Frame Selection", "F", [] { frameView(validSel()); }},
+        {"Group Selection", "Ctrl+G", actGroup}, {"Ungroup Selection", "Ctrl+U", actUngroup},
+        {"Duplicate", "Ctrl+D", actDuplicate}, {"Land Selection", "Ctrl+L", actLand},
+        {"Attributes", "A", [] { openLab(LabAttributes); }}, {"Materials", "M", [] { openLab(LabMat); }},
+        {"Object Editor", "E", [] { if (validSel()) openLab(objectEditor(gScene.objs[gSel])); }},
+        {"Motion Editor", "Ctrl+K sets a key", [] { openLab(LabMotion); }},
+        {"Cameras", "1-4 switch views", [] { openLab(LabCameras); }},
+        {"Object Library", "Browse saved assets", [] { openLab(LabAssets); }},
+        {"Export Mesh", "OBJ or DXF", actExportGeometry}, {"Render Options", "Output, crop and samples", [] { openLab(LabRender); }},
+        {"Collect Scene Assets", "Save a portable scene folder", actPackage}, {"Relink Missing Asset", "Replace an unavailable image", actRelink},
+        {"Recover Autosave", "Restore a recovery scene", actRecover},
+        {"Reload Scene Images", "Refresh files from disk", [] { gScene.reloadAssets(); sceneChanged(); }},
+        {"Save with Embedded Images", "Keep images inside the scene file", actEmbed},
+    };
+    for (int i = 0; i < (int)std::size(commands); ++i) {
+        int x = p.x + 18 + (i % 2) * 369, y = p.y + 50 + (i / 2) * 36;
+        if (button({x, y, 182, 27}, commands[i].label)) {
+            auto run = commands[i].run;
+            closeLab(true);
+            defer([run] { gNoPush = false; beginInteraction(); run(); endInteraction(); });
+            return;
+        }
+        textIn({x + 192, y, 164, 27}, commands[i].key, TXT_DIM, gSmall, TextLeft | TextMiddle);
+    }
+    note({p.x + 20, p.y + 411, p.w - 48, 22}, "Shift-click adds to selection. Alt-click picks a group member. Ctrl lowers terrain and Shift smooths.");
+    labFooter(p, true);
+}
+
 void preview(R pv, const char* caption) {
     fill(pv, rgb(16, 16, 18));
     blitFit(gLabR, pv);
@@ -1582,13 +2327,13 @@ void preview(R pv, const char* caption) {
 void drawObjectLab() {
     if (!validSel()) { closeLab(true); return; }
     Object& o = gScene.objs[gSel];
-    R p = panel(660, 350, std::string(objTypeName(o.type)) + " Editor  -  " + o.name);
+    R p = panel(660, isLight(o.type) ? 540 : 350, std::string(objTypeName(o.type)) + " Editor  -  " + o.name);
     int x = p.x + 16, y = p.y + 46;
     bool ch = false;
     if (o.type == ObjType::Picture) {
         Picture& picture = o.picture;
         int sel = gSel;
-        if (button({x, y, 288, 24}, "Replace BMP..."))
+        if (button({x, y, 288, 24}, "Replace Picture..."))
             defer([sel] { if (loadPicture(gScene.objs[sel].picture)) sceneChanged(); });
         std::string filename = picture.image ? baseName(picture.path) : "Missing image: " + baseName(picture.path);
         textIn({x, y + 28, 288, 18}, filename.c_str(), TXT_DIM, gSmall, TextLeft | TextMiddle);
@@ -1633,6 +2378,33 @@ void drawObjectLab() {
         int ly = y;
         lightControls(o, x, ly, 288);
         if (o.type != ObjType::Light) row3(x, ly, 288, "Aim Rotation", o.rot, 0.5f);
+        auto& l = o.lighting;
+        const char* falloff[] = {"Soft", "Constant", "Linear", "Inverse Square"};
+        if (button({x, ly, 288, 24}, (std::string("Falloff ") + falloff[(int)l.falloff]).c_str())) {
+            l.falloff = (Falloff)(((int)l.falloff + 1) % (int)Falloff::COUNT);
+            ch = true;
+        }
+        ly += 28;
+        ch |= slider({x, ly, 288, 24}, "Falloff Range", l.range, 0.1f, 250, "%.1f", true); ly += 28;
+        ch |= sliderI({x, ly, 288, 24}, "Area Shadow Samples", l.samples, 1, 16); ly += 28;
+        ch |= toggle({x, ly, 142, 24}, "Enabled", l.enabled);
+        ch |= toggle({x + 146, ly, 142, 24}, "Cast Shadows", l.casts); ly += 28;
+        ch |= toggle({x, ly, 142, 24}, "Disk Area", l.disk);
+        ch |= toggle({x + 146, ly, 142, 24}, "Visible Emitter", l.visible); ly += 28;
+        if (o.type == ObjType::Spotlight) {
+            int sel = gSel;
+            if (button({x, ly, 188, 24}, l.gel.empty() ? "Load Projected Gel..." : baseName(l.gel).c_str())) defer([sel] {
+                std::string path;
+                if (!fileDialog(false, IMAGE_FILTER, "png", path)) return;
+                auto img = loadImageCached(path, true);
+                if (!img) { gStatus = "Could not load the projector gel."; return; }
+                auto& effect = gScene.objs[sel].lighting;
+                effect.gel = path;
+                effect.gelImage = std::move(img);
+                sceneChanged();
+            });
+            if (button({x + 192, ly, 96, 24}, "Clear Gel")) { l.gel.clear(); l.gelImage.reset(); ch = true; }
+        }
     }
     if (ch) sceneChanged();
     preview({p.x + 324, y, 320, 240}, "Scene preview");
@@ -1740,7 +2512,7 @@ void drawTextureLayers(Material& m) {
             int i = gLayerIndex;
             defer([sel, i] {
                 std::string path;
-                if (!fileDialog(false, BMP_FILTER, "bmp", path)) return;
+                if (!fileDialog(false, IMAGE_FILTER, "png", path)) return;
                 auto image = loadImageCached(path, true);
                 if (!image) { gStatus = "Could not read picture " + path + "."; return; }
                 auto& item = gScene.objs[sel].mat.layers[i];
@@ -1820,6 +2592,7 @@ void drawMatLab() {
                                [&](const Material* const& p) { m = *p; ch = true; }) + 8;
     if (lib && list.empty()) { note({x, y, 228, 40}, "Empty. Use Add to Library to keep your own materials."); y += 40; }
     if (button({x, y, 110, 24}, "Add to Library")) {
+        rememberLibrary();
         Material c = m;
         c.category = "Library";
         c.img.reset();
@@ -1829,6 +2602,7 @@ void drawMatLab() {
         gStatus = "Added \"" + c.name + "\" to the library.";
     }
     if (lib && button({x + 114, y, 110, 24}, "Remove")) {
+        rememberLibrary();
         gLib.mats.erase(std::remove_if(gLib.mats.begin(), gLib.mats.end(), [&](const Material& e) { return e.name == m.name; }), gLib.mats.end());
         saveLibrary();
     }
@@ -1848,12 +2622,12 @@ void drawMatLab() {
     y += 28;
     swatch({x2, y, 224, 24}, "Color B", m.color2);
     y += 34;
-    if (button({x2, y, 224, 24}, "Load Picture (BMP)...")) {
+    if (button({x2, y, 224, 24}, "Load Picture...")) {
         defer([sel] {
             std::string p;
-            if (!fileDialog(false, "Bitmap Image (*.bmp)\0*.bmp\0", "bmp", p) || sel >= (int)gScene.objs.size()) return;
+            if (!fileDialog(false, IMAGE_FILTER, "png", p) || sel >= (int)gScene.objs.size()) return;
             auto img = loadImageCached(p);
-            if (!img) { gStatus = "Could not read picture " + p + " (8, 24 or 32-bit uncompressed BMP required)."; return; }
+            if (!img) { gStatus = "Could not read picture " + p + "."; return; }
             Material& mm = gScene.objs[sel].mat;
             mm.image = p;
             mm.img = img;
@@ -1880,6 +2654,11 @@ void drawMatLab() {
     preview({P.x + P.w - 336, P.y + 46, 320, 320}, m.name.c_str());
     std::string layers = "Texture Layers (" + std::to_string(m.layers.size()) + ")...";
     if (button({P.x + P.w - 336, P.y + 396, 320, 26}, layers.c_str())) gMatLayers = true;
+    int fx = P.x + P.w - 336, fy = P.y + 434;
+    ch |= slider({fx, fy, 320, 24}, "Absorption", m.absorption, 0, 10); fy += 30;
+    ch |= slider({fx, fy, 320, 24}, "Volume Density", m.volumeDensity, 0, 8); fy += 30;
+    ch |= slider({fx, fy, 320, 24}, "Volume Scattering", m.volumeScatter, 0, 1); fy += 30;
+    ch |= slider({fx, fy, 320, 24}, "Volume Noise", m.volumeNoise, 0, 1);
     if (ch) sceneChanged();
     labFooter(P);
 }
@@ -1903,6 +2682,7 @@ void drawSkyLab() {
     y = grid2<const Sky*>(x, y + 20, list, [](const Sky* const& s) { return s->name.c_str(); }, [&](const Sky* const& s) { return s->name == k.name; },
                           [&](const Sky* const& s) { k = *s; ch = true; }) + 8;
     if (button({x, y, 110, 24}, "Add to Library")) {
+        rememberLibrary();
         Sky c = k;
         c.category = "Library";
         gLib.skies.erase(std::remove_if(gLib.skies.begin(), gLib.skies.end(), [&](const Sky& e) { return e.name == c.name; }), gLib.skies.end());
@@ -1911,6 +2691,7 @@ void drawSkyLab() {
         gStatus = "Added \"" + c.name + "\" to the library.";
     }
     if (lib && button({x + 114, y, 110, 24}, "Remove")) {
+        rememberLibrary();
         gLib.skies.erase(std::remove_if(gLib.skies.begin(), gLib.skies.end(), [&](const Sky& e) { return e.name == k.name; }), gLib.skies.end());
         saveLibrary();
     }
@@ -1957,10 +2738,34 @@ void drawSkyLab() {
     swatch({x3, y, w2, 24}, "Cloud Color", k.cloudColor); y += 28;
     swatch({x3, y, w2, 24}, "Ambient Color", k.ambientColor);
     preview({P.x + P.w - 356, P.y + 46, 340, 255}, "Camera view preview");
-    note({P.x + P.w - 356, P.y + 330, 340, 120},
-         "Rainbows appear opposite a low sun. Use Key Sky on the timeline to animate between skies.");
+    int sx = P.x + P.w - 356, sy = P.y + 330;
+    ch |= slider({sx, sy, 340, 24}, "Cloud Altitude", k.cloudAltitude, 1, 200); sy += 28;
+    ch |= slider({sx, sy, 340, 24}, "Cloud Thickness", k.cloudThickness, 0.1f, 30); sy += 28;
+    ch |= slider({sx, sy, 340, 24}, "Cloud Shadows", k.cloudShadow, 0, 1); sy += 28;
+    ch |= slider({sx, sy, 340, 24}, "Sky Lighting", k.skylight, 0, 2); sy += 28;
+    swatch({sx, sy, 340, 24}, "Stratus Tint", k.stratusColor); sy += 28;
+    swatch({sx, sy, 340, 24}, "Moon Tint", k.moonColor);
     if (ch) sceneChanged();
     labFooter(P);
+}
+
+void rememberTerrain(const Heightfield& f) {
+    if (gTerrainUndo.size() >= 8) gTerrainUndo.erase(gTerrainUndo.begin());
+    gTerrainUndo.push_back({f.res, f.h, {}});
+    gTerrainRedo.clear();
+}
+
+void terrainHistory(bool redo) {
+    if (!validSel() || !gScene.objs[gSel].hf) return;
+    auto& f = *gScene.objs[gSel].hf;
+    auto& from = redo ? gTerrainRedo : gTerrainUndo;
+    auto& to = redo ? gTerrainUndo : gTerrainRedo;
+    if (from.empty()) return;
+    to.push_back({f.res, std::move(f.h), {}});
+    f = std::move(from.back());
+    from.pop_back();
+    f.computeNormals();
+    sceneChanged();
 }
 
 void drawTerrainLab() {
@@ -1968,7 +2773,7 @@ void drawTerrainLab() {
     Object& o = gScene.objs[gSel];
     Heightfield& f = *o.hf;
     bool ch = false;
-    R P = panel(1100, 640, "Terrain Editor  -  " + o.name);
+    R P = panel(1100, 640, std::string(o.type == ObjType::Lattice ? "Symmetric Lattice  -  " : "Terrain Editor  -  ") + o.name);
     R hm{P.x + 16, P.y + 46, 400, 400};
     static std::vector<uint32_t> img;
     img.resize((size_t)hm.w * hm.h);
@@ -1981,23 +2786,51 @@ void drawTerrainLab() {
     bevel(hm, true);
     int id = newId();
     press(hm, id);
-    if (hov(hm)) {
+    if (hov(hm) && !gRegionTool) {
         int rp = (int)(gBrushSize * hm.w);
         circle(gIn.mx, gIn.my, rp, rgb(255, 80, 60));
     }
-    if (gActive == id && gIn.down) {
+    if (gActive == id && gIn.down && gRegionTool) {
+        gRegionEnd = {clampf((gIn.mx - hm.x) / (float)hm.w, 0, 1), 0, clampf((gIn.my - hm.y) / (float)hm.h, 0, 1)};
+        if (gIn.pressed) gRegionStart = gRegionEnd;
+        gRegionMask = true;
+    }
+    V3 low = gRegionMask ? V3(std::min(gRegionStart.x, gRegionEnd.x), 0, std::min(gRegionStart.z, gRegionEnd.z)) : V3();
+    V3 high = gRegionMask ? V3(std::max(gRegionStart.x, gRegionEnd.x), 0, std::max(gRegionStart.z, gRegionEnd.z)) : V3(1);
+    HeightRegion region{(int)(low.x * (f.res - 1)), (int)(low.z * (f.res - 1)),
+                        (int)(high.x * (f.res - 1)), (int)(high.z * (f.res - 1))};
+    if (gRegionMask) {
+        int x0 = hm.x + (int)(low.x * (hm.w - 1)), x1 = hm.x + (int)(high.x * (hm.w - 1));
+        int y0 = hm.y + (int)(low.z * (hm.h - 1)), y1 = hm.y + (int)(high.z * (hm.h - 1));
+        Color c = rgb(255, 210, 55);
+        line(x0, y0, x1, y0, c); line(x1, y0, x1, y1, c);
+        line(x1, y1, x0, y1, c); line(x0, y1, x0, y0, c);
+    }
+    if (gActive == id && gIn.down && !gRegionTool) {
+        if (gIn.pressed) rememberTerrain(f);
         BrushMode bm = gBrush;
         if (gIn.shift && (bm == BrushMode::Raise || bm == BrushMode::Lower)) bm = bm == BrushMode::Raise ? BrushMode::Lower : BrushMode::Raise;
-        hfBrush(f, (gIn.mx - hm.x) / (float)hm.w, (gIn.my - hm.y) / (float)hm.h, gBrushSize, gBrushStr * 0.03f, bm);
+        hfBrush(f, (gIn.mx - hm.x) / (float)hm.w, (gIn.my - hm.y) / (float)hm.h, gBrushSize, gBrushStr * 0.03f, bm, &region);
         ch = true;
     }
-    note({hm.x, hm.y + hm.h + 6, hm.w, 36}, "Paint on the height map to sculpt (Shift swaps raise/lower). Bright = high, dark = low.");
+    int ry = hm.y + hm.h + 8;
+    toggle({hm.x, ry, 128, 24}, "Select Region", gRegionTool);
+    if (button({hm.x + 132, ry, 92, 24}, "Clear Mask")) gRegionMask = false;
+    if (button({hm.x + 228, ry, 82, 24}, "Copy")) gTerrainClipboard = hfCopyRegion(f, region);
+    if (button({hm.x + 314, ry, 86, 24}, "Paste") && !gTerrainClipboard.values.empty()) {
+        rememberTerrain(f);
+        hfPasteRegion(f, region, gTerrainClipboard);
+        ch = true;
+    }
+    if (button({hm.x, ry + 28, 128, 24}, "Undo Terrain Edit")) terrainHistory(false);
+    if (button({hm.x + 132, ry + 28, 132, 24}, "Redo Terrain Edit")) terrainHistory(true);
 
     int x = P.x + 432, y = P.y + 46;
     label(x, y, "Generate");
     y += 20;
     for (int i = 0; i < (int)TerrainKind::COUNT; i++)
         if (button({x + (i % 3) * 76, y + (i / 3) * 26, 72, 22}, terrainKindName((TerrainKind)i), false, gSmall)) {
+            rememberTerrain(f);
             hfGenerate(f, (TerrainKind)i, ++gSeed, gRough);
             ch = true;
         }
@@ -2005,7 +2838,8 @@ void drawTerrainLab() {
     label(x, y, "Filter");
     y += 20;
     struct Op { const char* n; std::function<void()> fn; } ops[] = {
-        {"Erode", [&] { hfErode(f, f.res * f.res, ++gSeed); }},       {"Smooth", [&] { hfSmooth(f); }},
+        {"Erode", [&] { hfErode(f, (int)std::min(4000000.f, f.res * f.res * gErosionDensity), (uint32_t)gTerrainSeed); }},
+        {"Smooth", [&] { hfSmooth(f); }},
         {"Sharpen", [&] { hfSharpen(f); }},                           {"Add Noise", [&] { hfNoise(f, ++gSeed, 0.06f); }},
         {"Terrace", [&] { hfTerrace(f, (int)gTerraces); }},           {"Plateau", [&] { hfPlateau(f, 0.6f); }},
         {"Spikes", [&] { hfSpikes(f, ++gSeed, 12); }},                {"Crater", [&] { hfCrater(f, 0.5f, 0.5f, 0.28f, 0.3f); }},
@@ -2016,15 +2850,19 @@ void drawTerrainLab() {
     };
     int nops = (int)(sizeof ops / sizeof ops[0]);
     for (int i = 0; i < nops; i++)
-        if (button({x + (i % 3) * 76, y + (i / 3) * 26, 72, 22}, ops[i].n, false, gSmall)) { ops[i].fn(); ch = true; }
+        if (button({x + (i % 3) * 76, y + (i / 3) * 26, 72, 22}, ops[i].n, false, gSmall)) {
+            rememberTerrain(f); ops[i].fn(); ch = true;
+        }
     y += ((nops + 2) / 3) * 26 + 6;
     label(x, y, "Resolution");
     y += 20;
-    const int resv[3] = {129, 257, 513};
-    for (int i = 0; i < 3; i++) {
+    const int resv[] = {129, 257, 513, 1025, 2049};
+    for (int i = 0; i < (int)std::size(resv); i++) {
         char b[16];
         snprintf(b, sizeof b, "%d", resv[i] - 1);
-        if (button({x + i * 76, y, 72, 22}, b, f.res == resv[i]) && f.res != resv[i]) { hfResample(f, resv[i]); ch = true; }
+        if (button({x + i * 45, y, 43, 22}, b, f.res == resv[i], gSmall) && f.res != resv[i]) {
+            rememberTerrain(f); hfResample(f, resv[i]); ch = true;
+        }
     }
     y += 30;
     label(x, y, "Settings");
@@ -2044,9 +2882,10 @@ void drawTerrainLab() {
     if (button({x4, y, 158, 24}, "Import Picture...")) {
         defer([sel] {
             std::string p;
-            if (!fileDialog(false, "Bitmap Image (*.bmp)\0*.bmp\0", "bmp", p) || sel >= (int)gScene.objs.size() || !gScene.objs[sel].hf) return;
-            auto im = loadBMP(p);
+            if (!fileDialog(false, IMAGE_FILTER, "png", p) || sel >= (int)gScene.objs.size() || !gScene.objs[sel].hf) return;
+            auto im = loadImage(p);
             if (!im) { gStatus = "Could not read " + p; return; }
+            rememberTerrain(*gScene.objs[sel].hf);
             hfFromImage(*gScene.objs[sel].hf, *im);
             sceneChanged();
         });
@@ -2061,6 +2900,20 @@ void drawTerrainLab() {
             gStatus = saveBMP(p, hf.res, hf.res, px) ? "Exported height map " + p : "Could not write " + p;
         });
     }
+    y += 32;
+    sliderI({x4, y, 155, 22}, "Seed", gTerrainSeed, 0, 99999);
+    sliderI({x4 + 162, y, 158, 22}, "Octaves", gTerrainOctaves, 1, 10); y += 26;
+    slider({x4, y, 155, 22}, "Frequency", gTerrainFrequency, 0.5f, 16);
+    slider({x4 + 162, y, 158, 22}, "Erosion Density", gErosionDensity, 0.05f, 2); y += 26;
+    if (button({x4, y, 320, 24}, o.type == ObjType::Lattice ? "Generate Symmetric Ridges" : "Generate Custom Fractal")) {
+        rememberTerrain(f);
+        hfCustomFractal(f, (uint32_t)gTerrainSeed, gRough, o.type == ObjType::Lattice, gTerrainFrequency, gTerrainOctaves);
+        ch = true;
+    }
+    y += 28;
+    ch |= slider({x4, y, 320, 24}, "Height Gain", o.terrain.height, 0.05f, 5); y += 28;
+    ch |= slider({x4, y, 320, 24}, "Clip Low Points", o.terrain.clip, 0, 1); y += 28;
+    if (o.type == ObjType::Terrain) ch |= slider({x4, y, 320, 24}, "Base Thickness", o.terrain.thickness, 0, 2);
     note({x4, y + 32, 320, 60}, "Imported pictures use brightness as height. Export saves the height map as a grayscale bitmap.");
     if (ch) sceneChanged();
     labFooter(P);
@@ -2115,7 +2968,7 @@ void drawTreeLab() {
 void drawRenderLab() {
     RenderSettings& r = gScene.render;
     bool ch = false;
-    R P = panel(820, 560, "Render Options");
+    R P = panel(820, 640, "Render Options");
     int x = P.x + 16, y = P.y + 46, w = 360;
     label(x, y, "Image Size");
     y += 20;
@@ -2139,8 +2992,23 @@ void drawRenderLab() {
     ch |= toggle({x, y, 176, 24}, "Soft Shadows", r.softShadows);
     ch |= toggle({x + 180, y, 176, 24}, "Blurry Reflections", r.blurReflections);
     y += 32;
-    note({x, y, w, 90}, "Draft is fastest. Normal anti-aliases edges. Premium accumulates many rays per pixel for soft shadows "
-                        "(set Soft Shadow Size on lights), depth of field and blurry reflections (set Blur in the Materials Lab).");
+    ch |= sliderI({x, y, w, 24}, "Ray Depth (0 = Auto)", r.bounces, 0, 16); y += 30;
+    ch |= toggle({x, y, w, 24}, "Colored Transparent Shadows", r.transparentShadows); y += 30;
+    ch |= toggle({x, y, 176, 24}, "Adaptive Sampling", r.adaptive);
+    ch |= toggle({x + 180, y, 176, 24}, "Edge-aware Denoise", r.denoise); y += 28;
+    ch |= sliderI({x, y, w, 24}, "Sampling Seed", r.seed, 1, 65535); y += 28;
+    ch |= toggle({x, y, w, 24}, "Render Region", r.region); y += 28;
+    if (r.region) {
+        ch |= slider({x, y, 176, 24}, "Region Left", r.cropX, 0, 0.99f);
+        ch |= slider({x + 180, y, 176, 24}, "Region Top", r.cropY, 0, 0.99f); y += 28;
+        ch |= slider({x, y, 176, 24}, "Region Width", r.cropW, 0.01f, 1);
+        ch |= slider({x + 180, y, 176, 24}, "Region Height", r.cropH, 0.01f, 1); y += 28;
+    }
+    if (button({x, y, w, 24}, "Start Render Queue...")) {
+        closeLab(false);
+        defer(actQueue);
+        return;
+    }
     int x2 = P.x + 420;
     y = P.y + 46;
     label(x2, y, "Camera");
@@ -2152,7 +3020,7 @@ void drawRenderLab() {
     ch |= slider({x2, y, 372, 24}, "Aperture", r.aperture, 0, 4); y += 30;
     if (button({x2, y, 372, 24}, "Focus on Selection") && validSel()) {
         ViewBasis vb = cameraBasis(gScene.cam);
-        r.focusDist = std::max(1.f, dot(gScene.objs[gSel].pos - vb.o, vb.f));
+        r.focusDist = std::max(1.f, dot(gScene.objs[gSel].worldPos - vb.o, vb.f));
         ch = true;
     }
     y += 40;
@@ -2163,6 +3031,10 @@ void drawRenderLab() {
     ch |= slider({x2, y, 372, 24}, "Contrast", r.contrast, 0.3f, 2.f); y += 30;
     ch |= slider({x2, y, 372, 24}, "Saturation", r.saturation, 0, 2); y += 30;
     if (button({x2, y, 372, 24}, "Reset Post Processing")) { r.gamma = 1; r.brightness = 0; r.contrast = 1; r.saturation = 1; ch = true; }
+    y += 38;
+    ch |= toggle({x2, y, 372, 24}, "Export Alpha with PNG or TIFF", r.alpha); y += 28;
+    ch |= toggle({x2, y, 184, 24}, "Write Depth PNG", r.depthOutput);
+    ch |= toggle({x2 + 188, y, 184, 24}, "Write Object ID PNG", r.idOutput);
     if (ch) sceneChanged();
     labFooter(P);
 }
@@ -2178,7 +3050,7 @@ void alignSel(int axis, int mode) {
         V3 lo, hi;
         worldBounds(o, lo, hi);
         float cur = mode == 0 ? lo[axis] : (mode == 1 ? (lo[axis] + hi[axis]) * 0.5f : hi[axis]), d = ref - cur;
-        (axis == 0 ? o.pos.x : axis == 1 ? o.pos.y : o.pos.z) += d;
+        o.moveWorld({axis == 0 ? d : 0, axis == 1 ? d : 0, axis == 2 ? d : 0});
     }
     sceneChanged();
 }
@@ -2186,19 +3058,20 @@ void alignSel(int axis, int mode) {
 void distributeSel(int axis) {
     auto s = sortedSel();
     if (s.size() < 3) { gStatus = "Select at least three objects to distribute."; return; }
-    auto key = [&](int i) { return gScene.objs[i].pos[axis]; };
+    auto key = [&](int i) { return gScene.objs[i].worldPos[axis]; };
     std::sort(s.begin(), s.end(), [&](int a, int b) { return key(a) < key(b); });
     float a = key(s.front()), b = key(s.back());
     for (size_t k = 0; k < s.size(); k++) {
         float v = a + (b - a) * k / (float)(s.size() - 1);
         Object& o = gScene.objs[s[k]];
-        (axis == 0 ? o.pos.x : axis == 1 ? o.pos.y : o.pos.z) = v;
+        float d = v - o.worldPos[axis];
+        o.moveWorld({axis == 0 ? d : 0, axis == 1 ? d : 0, axis == 2 ? d : 0});
     }
     sceneChanged();
 }
 
 void drawToolsLab() {
-    R P = panel(780, 520, "Edit Tools  -  " + std::to_string(gSelSet.size()) + " object(s)");
+    R P = panel(780, 556, "Edit Tools  -  " + std::to_string(gSelSet.size()) + " object(s)");
     int x = P.x + 16, y = P.y + 46, w = 350;
     label(x, y, "Replicate");
     y += 20;
@@ -2248,7 +3121,97 @@ void drawToolsLab() {
     y += 28;
     if (button({x2, y, 176, 24}, "Group")) actGroup();
     if (button({x2 + 180, y, 176, 24}, "Ungroup")) actUngroup();
+    y += 28;
+    if (button({x2, y, 176, 24}, "Parent to Active")) actParent(false);
+    if (button({x2 + 180, y, 176, 24}, "Detach Parent")) actParent(true);
+    y += 30;
+    if (button({x2, y, 176, 24}, "Nest Boolean")) actNestBoolean(false);
+    if (button({x2 + 180, y, 176, 24}, "Detach Boolean")) actNestBoolean(true);
+    y += 28;
+    if (button({x2, y, 176, 24}, (std::string("Nested Role ") + boolName(gNestedMode)).c_str()))
+        gNestedMode = (BoolMode)(1 + (int)gNestedMode % 3);
+    if (button({x2 + 180, y, 176, 24}, "Bake Mesh Copy")) actBakeGeometry();
+    y += 28;
+    if (toggle({x2, y, 356, 24}, "Use Cutter Materials on Cut Faces", gScene.cutterMaterial)) sceneChanged();
+    y += 29;
+    if (button({x2, y, 112, 24}, "Select Type")) actSelectMatching(0);
+    if (button({x2 + 118, y, 116, 24}, "Select Material")) actSelectMatching(1);
+    if (button({x2 + 240, y, 116, 24}, "Select Group")) actSelectMatching(2);
+    y += 28;
+    if (button({x2, y, 112, 24}, "Isolate")) actIsolate(false);
+    if (button({x2 + 118, y, 116, 24}, "Show All")) actIsolate(true);
+    if (button({x2 + 240, y, 116, 24}, "Linked Copy")) actLinked();
+    y += 29;
+    size_t tris = 0, bytes = 0;
+    std::set<const void*> seen;
+    for (const auto& o : gScene.objs) {
+        if (o.mesh) {
+            tris += o.mesh->triCount();
+            if (seen.insert(o.mesh.get()).second) bytes += (o.mesh->v.size() + o.mesh->n.size()) * sizeof(V3) + o.mesh->tri.size() * sizeof(uint32_t);
+        }
+        if (o.hf) {
+            size_t cells = (size_t)std::max(0, o.hf->res - 1);
+            tris += cells * cells * (o.type == ObjType::Lattice ? 4 : 2);
+            if (seen.insert(o.hf.get()).second) bytes += o.hf->h.size() * sizeof(float) + o.hf->n.size() * sizeof(V3);
+        }
+    }
+    auto stats = std::to_string(tris) + " triangles  /  " + std::to_string(bytes / 1024) + " KiB of geometry data";
+    label(x2, y, stats.c_str(), 356);
     labFooter(P);
+}
+
+void drawAssetsLab() {
+    R p = panel(700, 390, "Scene and Object Library");
+    int x = p.x + 16, y = p.y + 46;
+    bool selection = validSel();
+    if (button({x, y, 152, 24}, selection ? "Save Selected Objects" : "Save Current Scene")) {
+        Scene asset = selection ? gScene.subset(gSelSet) : gScene.snapshot();
+        storeAsset(asset, selection ? gScene.objs[gSel].name : (gPath.empty() ? "Scene" : baseName(gPath)));
+    }
+    if (button({x + 158, y, 130, 24}, "Import Asset...")) defer([] {
+        std::string path;
+        Scene asset;
+        if (!fileDialog(false, SCENE_FILTER, "c3d", path)) return;
+        if (asset.load(path)) storeAsset(asset, baseName(path));
+        else gStatus = "Could not read the asset.";
+    });
+    if (gAssetSelection >= 0 && gAssetSelection < (int)gAssets.size()) {
+        if (button({x + 296, y, 116, 24}, "Insert Asset")) {
+            std::string path = gAssets[gAssetSelection].path;
+            int first = (int)gScene.objs.size();
+            if (gScene.merge(path) && (int)gScene.objs.size() > first) {
+                gSelSet.clear();
+                for (int i = first; i < (int)gScene.objs.size(); ++i) gSelSet.push_back(i);
+                gSel = first;
+                sceneChanged();
+                closeLab(false);
+                return;
+            }
+            gStatus = "Could not insert the asset.";
+        }
+        if (button({x + 418, y, 142, 24}, "Export Asset...")) {
+            std::string asset = gAssets[gAssetSelection].path;
+            defer([asset] {
+                std::string path;
+                Scene contents;
+                if (fileDialog(true, SCENE_FILTER, "c3d", path))
+                    gStatus = contents.load(asset) && contents.save(path) ? "Exported the asset." : "Could not export the asset.";
+            });
+        }
+    }
+    y += 38;
+    const int pageSize = 10;
+    for (int i = 0; i < pageSize && i + gAssetPage * pageSize < (int)gAssets.size(); ++i) {
+        int n = gAssetPage * pageSize + i;
+        const auto& item = gAssets[n];
+        if (iconButton({x + (i % 5) * 132, y + (i / 5) * 94, 126, 88}, item.thumbnail, 96, 64, item.name.c_str(),
+                       n == gAssetSelection, "3D")) gAssetSelection = n;
+    }
+    if (gAssets.empty()) note({x, y, 600, 38}, "Save a selection, a scene, or import a scene file to fill the library.");
+    y += 194;
+    if (button({x, y, 86, 22}, "Previous") && gAssetPage > 0) --gAssetPage;
+    if (button({x + 92, y, 86, 22}, "Next") && (gAssetPage + 1) * pageSize < (int)gAssets.size()) ++gAssetPage;
+    labFooter(p, true);
 }
 
 void drawExamplesLab() {
@@ -2295,6 +3258,11 @@ void drawUI() {
         case LabExamples: drawExamplesLab(); break;
         case LabObject: drawObjectLab(); break;
         case LabAttributes: drawAttributesLab(); break;
+        case LabDxf: drawDxfLab(); break;
+        case LabMotion: drawMotionLab(); break;
+        case LabAssets: drawAssetsLab(); break;
+        case LabCameras: drawCamerasLab(); break;
+        case LabCommands: drawCommandsLab(); break;
         default: break;
         }
     }
@@ -2304,6 +3272,7 @@ void doFrame() {
     if (!gBits) return;
     for (int guard = 0; guard < 3; guard++) {
         gIdc = 0;
+        gHoverTip.clear();
         gResizeHovered = false;
         drawUI();
         if (gIn.released) gActive = 0;
@@ -2320,6 +3289,11 @@ void doFrame() {
 
 void tick() {
     uint64_t now = nowMs();
+    if (gDirty && !gModal && !gAnimRender && gQueue.empty() && gLab == LabNone && !gIn.down &&
+        now - gAutosaveTime >= 60000 && now - gLastChange >= 1500) {
+        gAutosaveTime = now;
+        gScene.save(recoveryPath());
+    }
     if (gDrag == DragSculpt && gIn.down && gActive == VIEW_ID && !gModal && now - gSculptLast >= 33) {
         gSculptLast = now;
         sculptStep();
@@ -2333,17 +3307,58 @@ void tick() {
         gLastChange = now - 1000;
         doFrame();
     }
-    if (gNanoDirty && now - gLastChange > 120) { gNanoDirty = false; gNanoR.start(gScene, NANO_W, NANO_H, 0); }
+    if (gNanoDirty && now - gLastChange > 120) {
+        gNanoDirty = false;
+        Scene preview = gScene;
+        preview.render = {};
+        gNanoR.start(preview, NANO_W, NANO_H, 0);
+    }
+    static int previewView = -1, previewWidth = 0, previewHeight = 0;
+    if (!gShowRender && (gViewMode == Solid || gViewMode == Textured) && now - gLastChange > 100 &&
+        (gViewPreviewDirty || previewView != gView || previewWidth != gVP.w || previewHeight != gVP.h)) {
+        gViewPreviewDirty = false;
+        previewView = gView;
+        previewWidth = gVP.w; previewHeight = gVP.h;
+        Scene preview = gScene;
+        preview.sky.shadows = false;
+        preview.render = {};
+        for (auto& o : preview.objs) {
+            if (gViewMode == Solid) o.mat = Material{};
+            o.mat.reflect = o.mat.transparency = o.mat.volumeDensity = 0;
+            for (auto& layer : o.mat.layers) layer.influence[TexReflection] = layer.influence[TexTransparency] = 0;
+            o.lighting.visible = false;
+        }
+        ViewBasis basis = curBasis();
+        gViewR.start(preview, std::max(1, (int)(gVP.w * gPreviewScale)), std::max(1, (int)(gVP.h * gPreviewScale)), 0, &basis);
+    }
     if (gLab != LabNone && gLabDirty && now - gLastChange > 120) { gLabDirty = false; startLabPreview(); }
+    if (!gQueue.empty() && !gMainR.busy()) {
+        if (gQueueIndex >= 0 && (!gMainR.finished() || !saveRenderer(gQueue[gQueueIndex].output))) {
+            gStatus = "Queue could not write " + gQueue[gQueueIndex].output;
+            gQueue.clear();
+        } else if (++gQueueIndex >= (int)gQueue.size()) {
+            gStatus = "Render queue complete.";
+            gQueue.clear();
+        } else {
+            Scene scene;
+            if (!scene.load(gQueue[gQueueIndex].scene)) {
+                gStatus = "Queue could not read " + gQueue[gQueueIndex].scene;
+                gQueue.clear();
+            } else {
+                gRenderStart = nowMs();
+                gMainR.start(scene, scene.render.width > 0 ? scene.render.width : gVP.w,
+                             scene.render.height > 0 ? scene.render.height : gVP.h);
+                gStatus = "Queue item " + std::to_string(gQueueIndex + 1) + " of " + std::to_string(gQueue.size()) + ".";
+            }
+        }
+        doFrame();
+    }
     if (gAnimRender && !gMainR.busy()) {
         if (gAnimFrame >= 0) {
             if (!gMainR.finished()) gAnimRender = false;
             else {
-                char fn[32];
-                snprintf(fn, sizeof fn, "_%04d.bmp", gAnimFrame);
-                std::vector<uint32_t> px;
-                gMainR.copyTo(px);
-                if (!saveBMP(gAnimBase + fn, gMainR.width(), gMainR.height(), px)) { gAnimRender = false; gStatus = "Could not write " + gAnimBase + fn; }
+                auto path = animationName(gAnimFrame);
+                if (!saveRenderer(path)) { gAnimRender = false; gStatus = "Could not write " + path; }
             }
         }
         if (gAnimRender && ++gAnimFrame < gScene.frames) {
@@ -2354,7 +3369,7 @@ void tick() {
             gMainR.start(gScene, w, h);
         } else {
             char b[200];
-            if (gAnimRender) snprintf(b, sizeof b, "Animation rendered: %d frames as %s_0000.bmp ... in %.1f s.", gScene.frames, gAnimBase.c_str(), (now - gRenderStart) / 1000.f);
+            if (gAnimRender) snprintf(b, sizeof b, "Rendered %d animation frames in %.1f s.", gScene.frames, (now - gRenderStart) / 1000.f);
             else snprintf(b, sizeof b, "Animation render stopped at frame %d.", std::max(gAnimFrame, 0));
             if (gStatus.rfind("Could not", 0) != 0) gStatus = b;
             gAnimRender = false;
@@ -2362,12 +3377,19 @@ void tick() {
         doFrame();
     }
     bool mb = gMainR.busy();
-    if (gMainWasBusy && !mb && !gAnimRender && gMainR.finished()) {
+    if (gMainWasBusy && !mb && !gAnimRender && gQueue.empty() && gMainR.finished() && gStatus.rfind("Queue", 0) != 0 && gStatus != "Render queue complete.") {
         char b[96];
         snprintf(b, sizeof b, "Render complete in %.1f s. Click the image to return to the wireframe.", (now - gRenderStart) / 1000.f);
         gStatus = b;
     }
     gMainWasBusy = mb;
+    static bool previewWasBusy = false;
+    bool previewActive = gViewR.busy() || previewWasBusy;
+    previewWasBusy = gViewR.busy();
+    static uint64_t tipPainted = 0;
+    bool tipReady = !gLastTip.empty() && now - gTipSince > 450 && tipPainted != gTipSince;
+    if (tipReady) tipPainted = gTipSince;
+    if (previewActive || tipReady) doFrame();
     static bool wasBusy = false;
     bool busy = mb || gNanoR.busy() || gLabR.busy();
     if ((busy || wasBusy) && !gModal) doFrame();
@@ -2455,11 +3477,14 @@ void handleKey(int wp) {
     bool ctrl = input.ctrl, shift = input.shift;
     if (wp == KeyCode::Escape) {
         if (gLab != LabNone) { closeLab(true); endInteraction(); }
-        else if (gMainR.busy() || gAnimRender) actRender();
+        else if (gMainR.busy() || gAnimRender || !gQueue.empty()) actRender();
         else gShowRender = false;
         return;
     }
+    if (gLab == LabTerrain && ctrl && (wp == 'Z' || wp == 'Y')) { terrainHistory(shift || wp == 'Y'); return; }
+    if ((gLab == LabMat || gLab == LabSky) && ctrl && (wp == 'Z' || wp == 'Y')) { libraryHistory(shift || wp == 'Y'); return; }
     if (gLab != LabNone) return;
+    if (wp == KeyCode::Help) { openLab(LabCommands); return; }
     beginInteraction();
     if (wp == KeyCode::Delete) actDelete();
     else if (ctrl && wp == 'Z') undoRedo(shift);
@@ -2492,14 +3517,29 @@ bool parseInt(const char* arg, int& value) {
 
 void usage(FILE* out) {
     std::fputs("Usage:\n"
-               "  Canyon3D --render OUTPUT.bmp [WIDTH HEIGHT [SCENE.c3d]]\n"
-               "  Canyon3D --example INDEX OUTPUT.bmp [WIDTH HEIGHT [QUALITY]]\n"
-               "  Canyon3D --export-example INDEX OUTPUT.c3d\n", out);
+               "  Brycescape --render OUTPUT [WIDTH HEIGHT [SCENE.c3d]]\n"
+               "  Brycescape --example INDEX OUTPUT [WIDTH HEIGHT [QUALITY]]\n"
+               "  Brycescape --export-example INDEX OUTPUT.c3d\n"
+               "  Brycescape --batch QUEUE.txt\n", out);
 }
 
 int headless(int argc, char** argv) {
     std::string_view command = argv[1];
     if (command == "--help") { usage(stdout); return 0; }
+    if (command == "--batch") {
+        std::vector<RenderJob> jobs;
+        if (argc != 3 || !readQueue(argv[2], jobs)) { usage(stderr); return 2; }
+        for (const auto& job : jobs) {
+            Scene scene;
+            if (!scene.load(job.scene)) { std::fprintf(stderr, "Could not read scene: %s\n", job.scene.c_str()); return 3; }
+            int w = scene.render.width > 0 ? scene.render.width : 800, h = scene.render.height > 0 ? scene.render.height : 500;
+            if ((size_t)w * h > 64000000) return 2;
+            std::vector<uint32_t> pixels((size_t)w * h);
+            renderImage(scene, w, h, pixels.data());
+            if (!saveRenderOutput(job.output, scene, w, h, std::move(pixels))) return 4;
+        }
+        return 0;
+    }
     Scene scene;
     int w = 800, h = 500, quality = -1, example = 0;
     const char* output;
@@ -2525,10 +3565,10 @@ int headless(int argc, char** argv) {
         usage(stderr);
         return 2;
     }
-    if (w < 1 || h < 1 || w > 16384 || h > 16384) { usage(stderr); return 2; }
+    if (w < 1 || h < 1 || w > 16384 || h > 16384 || (size_t)w * h > 64000000) { usage(stderr); return 2; }
     std::vector<uint32_t> px((size_t)w * h);
     renderImage(scene, w, h, px.data(), quality);
-    if (saveBMP(output, w, h, px)) return 0;
+    if (saveRenderOutput(output, scene, w, h, std::move(px))) return 0;
     std::fprintf(stderr, "Could not write image: %s\n", output);
     return 4;
 }
@@ -2543,6 +3583,7 @@ int entry(int argc, char** argv) {
     gMainR.cancel();
     gNanoR.cancel();
     gLabR.cancel();
+    gViewR.cancel();
     return status;
 }
 
@@ -2551,6 +3592,9 @@ void initialize() {
     gLib.load(gLibPath);
     gScene = makeDefaultScene();
     sceneReplaced();
+    gAutosaveTime = nowMs();
+    std::error_code recoveryError;
+    if (std::filesystem::is_regular_file(recoveryPath(), recoveryError)) gStatus = "Autosave found. Open Commands to recover it.";
     buildIcons();
 }
 
@@ -2617,7 +3661,7 @@ void pointerWheel(float steps, int x, int y) {
 
 void keyDown(int key) {
     if (gModal) return;
-    if (gEditObj >= 0) {
+    if (gEditObj != -1) {
         if (key == KeyCode::Backspace && !gEditBuf.empty()) {
             size_t end = gEditBuf.size() - 1;
 #ifndef _WIN32
@@ -2638,11 +3682,15 @@ void keyDown(int key) {
 }
 
 void textInput(std::string_view text) {
-    if (gModal || gEditObj < 0 || gEditBuf.size() + text.size() > 60) return;
+    if (gModal || gEditObj == -1 || gEditBuf.size() + text.size() > 60) return;
     gEditBuf += text;
     doFrame();
 }
 
-bool shouldClose() { return !gModal && confirmDiscard(); }
+bool shouldClose() {
+    if (gModal || !confirmDiscard()) return false;
+    if (gDirty) clearRecovery();
+    return true;
+}
 
 }  // namespace studio

@@ -43,6 +43,7 @@ int keyCode(WPARAM key) {
     case VK_DELETE: return desktop::KeyCode::Delete;
     case VK_OEM_4: return desktop::KeyCode::LeftBracket;
     case VK_OEM_6: return desktop::KeyCode::RightBracket;
+    case VK_F1: return desktop::KeyCode::Help;
     default: return key == VK_SPACE || (key >= '0' && key <= '9') || (key >= 'A' && key <= 'Z') ? (int)key : 0;
     }
 }
@@ -125,7 +126,7 @@ int run(const char* title) {
     wc.hInstance = instance;
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
-    wc.lpszClassName = "Canyon3DWnd";
+    wc.lpszClassName = "BrycescapeWnd";
     if (!RegisterClassA(&wc)) return 1;
     RECT wa{};
     SystemParametersInfoA(SPI_GETWORKAREA, 0, &wa, 0);

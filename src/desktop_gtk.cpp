@@ -103,6 +103,7 @@ int keyCode(guint key) {
     case GDK_KEY_Delete: case GDK_KEY_KP_Delete: return KeyCode::Delete;
     case GDK_KEY_bracketleft: case GDK_KEY_braceleft: return KeyCode::LeftBracket;
     case GDK_KEY_bracketright: case GDK_KEY_braceright: return KeyCode::RightBracket;
+    case GDK_KEY_F1: return KeyCode::Help;
     default:
         gunichar c = gdk_keyval_to_unicode(gdk_keyval_to_upper(key));
         return c == ' ' || (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ? (int)c : 0;
@@ -184,9 +185,14 @@ int run(const char* title) {
 }
 
 std::string libraryPath() {
-    std::filesystem::path config = std::filesystem::path(g_get_user_config_dir()) / "two-hoodoos-and-a-floppy";
+    std::filesystem::path root(g_get_user_config_dir());
+    std::filesystem::path config = root / "brycescape";
     g_mkdir_with_parents(config.c_str(), 0700);
-    return (config / "canyon3d_library.txt").string();
+    auto path = config / "canyon3d_library.txt";
+    std::error_code error;
+    std::filesystem::copy_file(root / "two-hoodoos-and-a-floppy" / path.filename(), path,
+                               std::filesystem::copy_options::skip_existing, error);
+    return path.string();
 }
 
 uint32_t* resizeCanvas(int w, int h) {
@@ -320,7 +326,17 @@ bool chooseFile(bool save, const char* filters, const char* extension, std::stri
         const char* pattern = name + std::strlen(name) + 1;
         GtkFileFilter* filter = gtk_file_filter_new();
         gtk_file_filter_set_name(filter, name);
-        gtk_file_filter_add_pattern(filter, !std::strcmp(pattern, "*.*") ? "*" : pattern);
+        std::string patterns = !std::strcmp(pattern, "*.*") ? "*" : pattern;
+        size_t start = 0, stop;
+        do {
+            stop = patterns.find(';', start);
+            std::string part = patterns.substr(start, stop - start);
+            gtk_file_filter_add_pattern(filter, part.c_str());
+            gchar* upper = g_ascii_strup(part.c_str(), -1);
+            if (upper != part) gtk_file_filter_add_pattern(filter, upper);
+            g_free(upper);
+            start = stop + 1;
+        } while (stop != std::string::npos);
         gtk_file_chooser_add_filter(chooser, filter);
         name = pattern + std::strlen(pattern) + 1;
     }

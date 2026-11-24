@@ -1,11 +1,15 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "mesh.h"
 
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <fstream>
+#include <locale>
 #include <map>
+#include <sstream>
 
 static void growBox(V3& lo, V3& hi, V3 p) {
     lo = V3(std::min(lo.x, p.x), std::min(lo.y, p.y), std::min(lo.z, p.z));
@@ -103,8 +107,11 @@ bool Mesh::intersect(V3 o, V3 d, float tmin, float tmax, float& tOut, V3& nOut, 
                 hit = true;
             }
         } else if (sp + 2 <= 96) {
-            stack[sp++] = nd.left;
-            stack[sp++] = nd.right;
+            const auto& a = nodes[nd.left];
+            const auto& b = nodes[nd.right];
+            bool leftFirst = dot(a.bmin + a.bmax - b.bmin - b.bmax, d) < 0;
+            stack[sp++] = leftFirst ? nd.right : nd.left;
+            stack[sp++] = leftFirst ? nd.left : nd.right;
         }
     }
     return hit;
@@ -166,6 +173,184 @@ bool loadOBJ(const std::string& path, Mesh& m, std::string& err) {
     out.build();
     m = std::move(out);
     return true;
+}
+
+namespace {
+
+struct DxfValue { int code; std::string value; };
+
+std::string trimDxf(std::string value) {
+    size_t a = value.find_first_not_of(" \r\t"), b = value.find_last_not_of(" \r\t");
+    return a == std::string::npos ? std::string() : value.substr(a, b - a + 1);
+}
+
+template <class T> bool dxfNumber(const std::string& value, T& result) {
+    std::istringstream in(value);
+    in.imbue(std::locale::classic());
+    return (in >> result) && in.peek() == EOF;
+}
+
+void dxfFace(Mesh& mesh, const std::vector<V3>& vertices) {
+    if (vertices.size() < 3) return;
+    uint32_t start = (uint32_t)mesh.v.size();
+    mesh.v.insert(mesh.v.end(), vertices.begin(), vertices.end());
+    for (uint32_t i = 2; i < vertices.size(); ++i)
+        if (length(cross(vertices[i - 1] - vertices[0], vertices[i] - vertices[0])) > 0)
+            mesh.tri.insert(mesh.tri.end(), {start, start + i - 1, start + i});
+}
+
+}  // namespace
+
+bool loadDXF(const std::string& path, std::vector<MeshLayer>& layers, float scale, bool zUp, bool split, std::string& err) {
+    std::ifstream in(path);
+    if (!in) { err = "cannot open DXF"; return false; }
+    if (!(scale > 0 && scale <= 1e6f)) { err = "invalid import scale"; return false; }
+    std::map<std::string, Mesh> meshes;
+    std::vector<DxfValue> record;
+    std::string entity, parentLayer;
+    bool active = true, polyface = false, eof = false;
+    std::vector<V3> polyVertices;
+    std::vector<std::array<int, 4>> polyFaces;
+    int line = 0;
+    auto at = [&](int code) {
+        for (const auto& value : record) if (value.code == code) return value.value;
+        return std::string();
+    };
+    auto layer = [&](const std::string& name) -> Mesh& {
+        return meshes[split ? (name.empty() ? "0" : name) : "DXF"];
+    };
+    auto vertex = [&](int offset, V3& p) {
+        if (!dxfNumber(at(10 + offset), p.x) || !dxfNumber(at(20 + offset), p.y)) return false;
+        std::string z = at(30 + offset);
+        if (!z.empty() && !dxfNumber(z, p.z)) return false;
+        if (!(maxc({std::fabs(p.x), std::fabs(p.y), std::fabs(p.z)}) <= 1e12f)) return false;
+        p = (zUp ? V3(p.x, p.z, -p.y) : p) * scale;
+        return true;
+    };
+    auto finishPolyline = [&] {
+        if (!polyface) return true;
+        auto& mesh = layer(parentLayer);
+        for (const auto& indices : polyFaces) {
+            std::vector<V3> face;
+            for (int index : indices) {
+                if (!index) break;
+                if (index < 0 || (size_t)index > polyVertices.size()) return false;
+                face.push_back(polyVertices[index - 1]);
+            }
+            if (face.size() < 3) return false;
+            dxfFace(mesh, face);
+        }
+        polyface = false;
+        polyVertices.clear();
+        polyFaces.clear();
+        return true;
+    };
+    auto consume = [&] {
+        if (entity == "SECTION") { active = at(2) == "ENTITIES"; return true; }
+        if (!active) return true;
+        if (entity == "3DFACE") {
+            std::vector<V3> vertices(3);
+            for (int i = 0; i < 3; ++i) if (!vertex(i, vertices[i])) return false;
+            if (!at(13).empty()) {
+                V3 last;
+                if (!vertex(3, last)) return false;
+                if (length(last - vertices.back()) > 0) vertices.push_back(last);
+            }
+            dxfFace(layer(at(8)), vertices);
+        } else if (entity == "POLYLINE") {
+            if (!finishPolyline()) return false;
+            int flags = 0;
+            dxfNumber(at(70), flags);
+            polyface = (flags & 64) != 0;
+            parentLayer = at(8);
+        } else if (entity == "VERTEX" && polyface) {
+            int flags = 0;
+            dxfNumber(at(70), flags);
+            if ((flags & 128) && !(flags & 64)) {
+                std::array<int, 4> face{};
+                for (int i = 0; i < 4; ++i) {
+                    auto value = at(71 + i);
+                    int index = 0;
+                    if (!value.empty() && (!dxfNumber(value, index) || index < -2000000 || index > 2000000)) return false;
+                    face[i] = std::abs(index);
+                }
+                polyFaces.push_back(face);
+            } else {
+                V3 p;
+                if (!vertex(0, p)) return false;
+                polyVertices.push_back(p);
+            }
+        } else if (entity == "SEQEND" || entity == "ENDSEC") {
+            if (!finishPolyline()) return false;
+            if (entity == "ENDSEC") active = false;
+        }
+        return true;
+    };
+    std::string code, value;
+    while (std::getline(in, code)) {
+        ++line;
+        int group = 0;
+        if (line > 16000000 || !dxfNumber(trimDxf(code), group) || !std::getline(in, value)) {
+            err = "invalid or truncated ASCII DXF at line " + std::to_string(line);
+            return false;
+        }
+        ++line;
+        value = trimDxf(std::move(value));
+        if (group == 0) {
+            if (!consume()) { err = "malformed " + entity + " before line " + std::to_string(line - 1); return false; }
+            if (value == "EOF") { eof = true; break; }
+            entity = value;
+            record.clear();
+        } else {
+            record.push_back({group, std::move(value)});
+        }
+    }
+    if (!eof || !finishPolyline()) { err = "incomplete DXF or missing EOF"; return false; }
+    std::vector<MeshLayer> result;
+    for (auto& [name, mesh] : meshes) {
+        if (mesh.tri.empty()) continue;
+        if (mesh.v.size() > 2000000 || mesh.triCount() > 2000000) { err = "DXF layer is too large"; return false; }
+        mesh.build();
+        result.push_back({name, std::move(mesh)});
+    }
+    if (result.empty()) { err = "no 3DFACE or polyface geometry in the ENTITIES section"; return false; }
+    layers = std::move(result);
+    return true;
+}
+
+bool saveGeometry(const std::string& path, const std::vector<MeshLayer>& layers, bool dxf) {
+    std::ofstream out(path);
+    if (!out) return false;
+    out.imbue(std::locale::classic());
+    out.precision(9);
+    if (dxf) out << "0\nSECTION\n2\nENTITIES\n";
+    else out << "# Brycescape geometry\n";
+    size_t base = 1;
+    for (const auto& [name, mesh] : layers) {
+        std::string label = name;
+        for (char& c : label) if (!(c >= 'A' && c <= 'Z') && !(c >= 'a' && c <= 'z') &&
+                                  !(c >= '0' && c <= '9') && c != '-') c = '_';
+        if (label.empty()) label = "Object";
+        if (!dxf) {
+            out << "o " << label << '\n';
+            for (V3 p : mesh.v) out << "v " << p.x << ' ' << p.y << ' ' << p.z << '\n';
+        }
+        for (size_t i = 0; i < mesh.tri.size(); i += 3) {
+            if (!dxf) {
+                out << "f " << base + mesh.tri[i] << ' ' << base + mesh.tri[i + 1] << ' ' << base + mesh.tri[i + 2] << '\n';
+                continue;
+            }
+            out << "0\n3DFACE\n8\n" << label << '\n';
+            for (int k = 0; k < 4; ++k) {
+                V3 p = mesh.v[mesh.tri[i + std::min(k, 2)]];
+                out << 10 + k << '\n' << p.x << '\n' << 20 + k << '\n' << -p.z << '\n' << 30 + k << '\n' << p.y << '\n';
+            }
+        }
+        base += mesh.v.size();
+    }
+    if (dxf) out << "0\nENDSEC\n0\nEOF\n";
+    out.close();
+    return (bool)out;
 }
 
 static void tube(Mesh& m, V3 a, V3 b, float ra, float rb) {

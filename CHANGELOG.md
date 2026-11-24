@@ -1,5 +1,99 @@
 # Implementation log
 
+## Brycescape
+
+- Renamed the studio, build targets, launcher and project documentation to **Brycescape**. Linux migrates the existing material and sky library on first startup.
+- Replaced the original backlog with a scored Bryce 7.1 feature-gap inventory, retaining partial and unverified work and linking completed changes to this log.
+
+## P1 · 6. DXF import
+
+- Added ASCII DXF imports for 3DFACE and polyface geometry with layered objects, unit scaling, up-axis conversion and file diagnostics.
+
+## P1 · 7. Geometry export
+
+- Added **Edit → Export Mesh** for OBJ and ASCII DXF. It exports world-space selected geometry, samples implicit and Boolean surfaces, and triangulates terrain and lattices.
+
+## P1 · 8. Hierarchies
+
+- Added parent links and an indented scene hierarchy. Parenting preserves the current pose and propagates parent transforms through nested objects and animation.
+- Scene loading checks for invalid or cyclic links. Merge, duplicate and delete remap hierarchy links and preserve detached objects' world poses.
+
+## P1 · 9. Motion editing
+
+- Added a Motion Editor for object and camera keys, editable path points, and per-key spline, linear, smooth and hold interpolation.
+- Added appearance keys for layered materials, lights, terrain shape, visibility and picture content. The viewport displays object motion paths.
+
+## P1 · 10. Terrain editing
+
+- Added 1025 and 2049 point grids, a rectangular brush mask, terrain region copy/paste, and local undo/redo for strokes and terrain edits.
+- Added seeded fractal frequency, octave and erosion density controls, plus height gain, low-height clipping and a solid terrain base.
+- Symmetric lattices have their own editor title and fractal workflow. Brush updates recompute normals near the changed region.
+
+## P1 · 11. Boolean workflow
+
+- Added nested Boolean groups with positive, negative or intersection roles, lattice operands, and a cutter-material option.
+- Added **Bake Mesh Copy** for selected geometry and Boolean assemblies. Empty results report a diagnostic.
+
+## P1 · 12. Scene and object library
+
+- Added a thumbnail library for object selections and scene fragments, including terrain, trees, imported meshes and Boolean assemblies.
+- Assets can be imported, inserted into the scene, or exported as standalone scene files.
+
+## P2 · 13–16. Lighting, volumes and atmosphere
+
+- Added volume density, noise, absorption and single scattering for closed primitives, with volumetric attenuation on shadow rays.
+- Added per-light falloff, range, shadow settings, disk sampling, emitter visibility and spotlight gels.
+- Added nested dielectric handling, total internal reflection, absorption and configurable ray depth and transparent shadows.
+- Added cloud altitude, thickness and shadow controls, moon and stratus tint, and independent sky lighting.
+
+## P2 · 17. Production rendering
+
+- Added variance-based premium sampling, an optional edge-aware cleanup pass, adjustable seeds and render regions.
+- Added resumable interactive still renders, progress estimates, and manifest queues in the desktop and headless renderer.
+
+## P2 · 18. Render output
+
+- Added PNG and TIFF exports with optional alpha, depth and object ID output. Animation filenames accept a `{frame}` placeholder.
+
+## P2 · 19–21. Viewport and cameras
+
+- Added a floating display palette, contextual controls, and a framed viewport style.
+- Added depth-cued wireframe, bounding boxes, solid and texture previews, render display, and an independent preview-resolution control.
+- Added named cameras, active-camera selection, orthographic projection, field-of-view presets, editor view matching, look-at constraints and a safe-frame overlay.
+
+## P2 · 22–23. Scene management and history
+
+- Added object filtering, inline hierarchy renaming, drag reorder and Alt-drop parenting, matching selections, isolation, geometry statistics and persistent linked geometry copies.
+- Added named scene undo/redo entries and persistent undo/redo for changes to the materials and skies library.
+
+## P2 · 24. Command discovery
+
+- Added an **F1** command palette and modifier hints for common tools.
+
+## P3 · 25. Image compatibility
+
+- Added PNG, JPEG, TGA and TIFF loading for picture cards, materials, height maps and light gels. Picture cards use imported alpha as well as chroma keys.
+
+## P3 · 26. Scene persistence
+
+- Added v4 scene records with legacy loading, atomic saves, relative image references, missing-asset relinking, and image reload.
+- Added autosave recovery, scene titles and descriptions, and thumbnail sidecars. Scenes can collect images in a portable folder or embed them in the scene file.
+
+## P3 · 27. Presets and example scenes
+
+- Added badlands, salt flats, and glacial bowl terrain families, a cloud shelf sky, and three original example scenes with a cutout marker, nested Booleans, and mist.
+- Added Salt Crust under Terrains and Basin Mist and Volcanic Smoke under Atmosphere.
+
+## P3 · 28. Performance
+
+- Added a scene BVH, nearer-first mesh traversal, heightfield range rejection, and local brush-normal updates.
+- Added resumable row tracking, adaptive sampling, and lower-cost viewport previews. Scene image caches can be refreshed from Commands.
+
+## Verification
+
+- The Windows core suite passed with zero failures. The renamed launcher rendered the new examples to PNG and exported a queued render to TIFF.
+- All Linux source files passed x86-64 C++17 syntax checks against GTK 3 and LibTIFF headers. A live Linux launch remains unverified.
+
 ## Native Linux desktop
 
 - Added a GTK 3 desktop backend for the shared editor on Linux. It handles the canvas, keyboard and mouse input, and native file and color dialogs.

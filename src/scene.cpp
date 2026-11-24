@@ -1,8 +1,11 @@
 #include "scene.h"
 
 #include <fstream>
+#include <chrono>
+#include <filesystem>
 #include <iomanip>
 #include <map>
+#include <set>
 
 #include "terrain.h"
 
@@ -43,15 +46,19 @@ Sky lerpSky(const Sky& a, const Sky& b, float t) {
     s.cloudColor = C(a.cloudColor, b.cloudColor); s.ambient = L(a.ambient, b.ambient); s.ambientColor = C(a.ambientColor, b.ambientColor);
     s.stars = L(a.stars, b.stars); s.moonAlt = L(a.moonAlt, b.moonAlt); s.moonAz = L(a.moonAz, b.moonAz);
     s.moonPhase = L(a.moonPhase, b.moonPhase); s.moonSize = L(a.moonSize, b.moonSize); s.rainbow = L(a.rainbow, b.rainbow);
+    s.cloudAltitude = L(a.cloudAltitude, b.cloudAltitude); s.cloudThickness = L(a.cloudThickness, b.cloudThickness);
+    s.cloudShadow = L(a.cloudShadow, b.cloudShadow); s.skylight = L(a.skylight, b.skylight);
+    s.stratusColor = C(a.stratusColor, b.stratusColor); s.moonColor = C(a.moonColor, b.moonColor);
     return s;
 }
 
-void Heightfield::computeNormals() {
+void Heightfield::computeNormals(int x0, int z0, int x1, int z1) {
+    if (n.size() != h.size()) { x0 = z0 = 0; x1 = z1 = -1; }
     n.resize(h.size());
     if (res < 2) return;
     float cs = 2.f / (res - 1);
-    for (int z = 0; z < res; z++)
-        for (int x = 0; x < res; x++) {
+    for (int z = std::max(0, z0); z <= (z1 < 0 ? res - 1 : std::min(res - 1, z1)); z++)
+        for (int x = std::max(0, x0); x <= (x1 < 0 ? res - 1 : std::min(res - 1, x1)); x++) {
             int xl = std::max(x - 1, 0), xr = std::min(x + 1, res - 1), zu = std::max(z - 1, 0), zd = std::min(z + 1, res - 1);
             float dx = (at(xr, z) - at(xl, z)) / ((xr - xl) * cs), dz = (at(x, zd) - at(x, zu)) / ((zd - zu) * cs);
             n[z * res + x] = normalize(V3(-dx, 1, -dz));
@@ -63,7 +70,8 @@ bool localBounds(const Object& o, V3& lo, V3& hi) {
     switch (o.type) {
     case ObjType::Metaball: lo = V3(-o.metaRadius); hi = V3(o.metaRadius); break;
     case ObjType::Picture: hi = o.picture.halfExtent(); lo = -hi; break;
-    case ObjType::Terrain: lo.y = 0; break;
+    case ObjType::Terrain: lo.y = -o.terrain.thickness; hi.y = o.terrain.height; break;
+    case ObjType::Lattice: lo.y = -o.terrain.height; hi.y = o.terrain.height; break;
     case ObjType::Torus: {
         float radius = o.torus.major + o.torus.minor;
         hi = {radius, o.torus.minor * o.torus.section, radius};
@@ -86,20 +94,24 @@ bool localBounds(const Object& o, V3& lo, V3& hi) {
 
 bool worldBounds(const Object& o, V3& lo, V3& hi) {
     V3 a, b;
-    if (!localBounds(o, a, b)) { lo = hi = o.pos; return isLight(o.type); }
+    if (!localBounds(o, a, b)) { lo = hi = o.worldPos; return isLight(o.type); }
     lo = V3(1e30f); hi = V3(-1e30f);
     for (int i = 0; i < 8; i++) {
-        V3 p = o.pos + o.fwd * V3((i & 1) ? b.x : a.x, (i & 2) ? b.y : a.y, (i & 4) ? b.z : a.z);
+        V3 p = o.worldPos + o.fwd * V3((i & 1) ? b.x : a.x, (i & 2) ? b.y : a.y, (i & 4) ? b.z : a.z);
         lo = V3(std::min(lo.x, p.x), std::min(lo.y, p.y), std::min(lo.z, p.z));
         hi = V3(std::max(hi.x, p.x), std::max(hi.y, p.y), std::max(hi.z, p.z));
     }
     return true;
 }
 
-void Object::update(const Camera* camera) {
+void Object::update(const Camera* camera, const Object* ancestor) {
+    parentSpace = ancestor ? ancestor->fwd * bind : bind;
+    parentInv = parentSpace.inverse();
+    worldPos = parentSpace * pos + (ancestor ? ancestor->worldPos + ancestor->fwd * bindOffset : bindOffset);
     M3 orientation = rotY(rad(rot.y)) * rotX(rad(rot.x));
-    if (type == ObjType::Picture && picture.billboard && camera) {
-        V3 n = normalize(camera->eye() - pos);
+    bool facing = type == ObjType::Picture && picture.billboard && camera;
+    if (facing) {
+        V3 n = normalize(camera->eye() - worldPos);
         if (length(n) < 0.5f) n = normalize(camera->eye() - camera->target);
         if (length(n) < 0.5f) n = {0, 0, 1};
         V3 r = normalize(cross(std::fabs(n.y) > 0.99f ? V3(0, 0, 1) : V3(0, 1, 0), n));
@@ -110,29 +122,71 @@ void Object::update(const Camera* camera) {
             orientation.m[i][2] = n[i];
         }
     }
-    fwd = orientation * rotZ(rad(rot.z)) * scaleM(scl);
+    fwd = (facing ? orientation : parentSpace * orientation) * rotZ(rad(rot.z)) * scaleM(scl);
     inv = fwd.inverse();
     nrm = inv.transpose();
     V3 lo, hi;
     if (!localBounds(*this, lo, hi)) { bradius = -1; return; }
     V3 c = (lo + hi) * 0.5f;
     float ms = std::max(length(fwd.col(0)), std::max(length(fwd.col(1)), length(fwd.col(2))));
-    bcenter = pos + fwd * c;
+    bcenter = worldPos + fwd * c;
     bradius = length(hi - c) * ms * 1.001f + 1e-4f;
+    if (ancestor || hasBind) {
+        bradius = 0;
+        for (int i = 0; i < 8; ++i)
+            bradius = std::max(bradius, length(fwd * (V3((i & 1) ? hi.x : lo.x, (i & 2) ? hi.y : lo.y, (i & 4) ? hi.z : lo.z) - c)));
+        bradius += 1e-4f;
+    }
+}
+
+static bool hierarchyOrder(const std::vector<Object>& objects, std::vector<int>& order) {
+    int count = (int)objects.size();
+    std::vector<uint8_t> state(count);
+    std::vector<int> chain;
+    for (int start = 0; start < count; ++start) {
+        int i = start;
+        chain.clear();
+        while (i >= 0 && i < count && state[i] == 0) {
+            state[i] = 1;
+            chain.push_back(i);
+            i = objects[i].parent;
+        }
+        if (i >= count || i < -1 || (i >= 0 && state[i] == 1)) return false;
+        for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+            state[*it] = 2;
+            order.push_back(*it);
+        }
+    }
+    return true;
 }
 
 void Scene::updateAll() {
+    std::vector<int> order;
+    if (hierarchyOrder(objs, order)) {
+        for (int i : order) {
+            Object& o = objs[i];
+            o.update(&cam, o.parent < 0 ? nullptr : &objs[o.parent]);
+        }
+    } else {
+        for (Object& o : objs) o.update(&cam);
+    }
     std::map<int, std::vector<int>> groups;
     std::map<int, size_t> fieldGroups;
     metaballs.clear();
+    lights.clear();
+    volumes.clear();
+    auto image = [&](const std::string& key) {
+        auto found = embeddedImages.find(key);
+        return found == embeddedImages.end() ? loadImageCached(key) : found->second;
+    };
     for (size_t i = 0; i < objs.size(); i++) {
         Object& o = objs[i];
-        o.update(&cam);
         o.csg = false;
-        if (o.mat.tex == TexType::Image && !o.mat.image.empty() && !o.mat.img) o.mat.img = loadImageCached(o.mat.image);
+        if (o.mat.tex == TexType::Image && !o.mat.image.empty() && !o.mat.img) o.mat.img = image(o.mat.image);
         for (auto& layer : o.mat.layers)
-            if (layer.tex == TexType::Image && !layer.image.empty() && !layer.img) layer.img = loadImageCached(layer.image);
-        if (o.type == ObjType::Picture && !o.picture.path.empty() && !o.picture.image) o.picture.image = loadImageCached(o.picture.path);
+            if (layer.tex == TexType::Image && !layer.image.empty() && !layer.img) layer.img = image(layer.image);
+        if (o.type == ObjType::Picture && !o.picture.path.empty() && !o.picture.image) o.picture.image = image(o.picture.path);
+        if (isLight(o.type) && !o.lighting.gel.empty() && !o.lighting.gelImage) o.lighting.gelImage = image(o.lighting.gel);
         if (o.hidden) continue;
         if (o.type == ObjType::Metaball) {
             size_t field = metaballs.size();
@@ -145,23 +199,183 @@ void Scene::updateAll() {
         }
     }
     csg.clear();
+    booleanNodes.clear();
+    std::map<int, int> nested;
+    auto node = [&](int id) {
+        auto [it, inserted] = nested.emplace(id, (int)booleanNodes.size());
+        if (inserted) booleanNodes.emplace_back();
+        return it->second;
+    };
+    for (const auto& link : booleanLinks) { node(link.child); node(link.parent); }
+    for (const auto& [id, members] : groups)
+        for (int i : members) if (objs[i].type == ObjType::Lattice) { node(id); break; }
     for (auto& g : groups) {
         for (int i : g.second) objs[i].csg = true;
+        auto parent = nested.find(g.first);
+        if (parent != nested.end()) {
+            booleanNodes[parent->second].parts = std::move(g.second);
+            continue;
+        }
         auto field = fieldGroups.find(g.first);
         if (field == fieldGroups.end()) csg.push_back(std::move(g.second));
         else metaballs[field->second].operands = std::move(g.second);
     }
+    for (const auto& [id, index] : nested) {
+        auto field = fieldGroups.find(id);
+        if (field == fieldGroups.end()) continue;
+        booleanNodes[index].field = (int)field->second;
+        metaballs[field->second].nested = true;
+    }
+    for (const auto& link : booleanLinks) {
+        int child = nested[link.child];
+        booleanNodes[nested[link.parent]].children.emplace_back(child, link.mode);
+        booleanNodes[child].nested = true;
+    }
+    for (int i = 0; i < (int)objs.size(); ++i) {
+        const auto& o = objs[i];
+        if (o.hidden) continue;
+        if (isLight(o.type) && o.lighting.enabled) lights.push_back(i);
+        if (!o.csg && canVolume(o.type) && o.mat.volumeDensity > 0) volumes.push_back(i);
+    }
+    rayNodes.clear(); rayOrder.clear(); unbounded.clear();
+    if (objs.size() < 16) return;
+    std::vector<std::pair<V3, V3>> boxes(objs.size());
+    for (int i = 0; i < (int)objs.size(); ++i) {
+        const auto& o = objs[i];
+        if (o.hidden || o.csg || isLight(o.type)) continue;
+        auto& [lo, hi] = boxes[i];
+        if (worldBounds(o, lo, hi)) rayOrder.push_back(i);
+        else unbounded.push_back(i);
+    }
+    if (rayOrder.empty()) return;
+    auto build = [&](const auto& self, int first, int last) -> int {
+        V3 lo(1e30f), hi(-1e30f);
+        for (int i = first; i < last; ++i) {
+            auto& [a, b] = boxes[rayOrder[i]];
+            lo = {std::min(lo.x, a.x), std::min(lo.y, a.y), std::min(lo.z, a.z)};
+            hi = {std::max(hi.x, b.x), std::max(hi.y, b.y), std::max(hi.z, b.z)};
+        }
+        int id = (int)rayNodes.size();
+        rayNodes.push_back({lo - V3(1e-4f), hi + V3(1e-4f)});
+        if (last - first <= 4) {
+            rayNodes[id].first = first;
+            rayNodes[id].count = last - first;
+            return id;
+        }
+        V3 size = hi - lo;
+        int axis = size.x > size.y && size.x > size.z ? 0 : (size.y > size.z ? 1 : 2);
+        int mid = first + (last - first) / 2;
+        std::nth_element(rayOrder.begin() + first, rayOrder.begin() + mid, rayOrder.begin() + last, [&](int a, int b) {
+            return boxes[a].first[axis] + boxes[a].second[axis] < boxes[b].first[axis] + boxes[b].second[axis];
+        });
+        int left = self(self, first, mid), right = self(self, mid, last);
+        rayNodes[id].left = left; rayNodes[id].right = right;
+        return id;
+    };
+    build(build, 0, (int)rayOrder.size());
+}
+
+bool Scene::setBooleanParent(int child, int parent, BoolMode mode) {
+    if (child <= 0 || parent < 0 || (parent && mode == BoolMode::Neutral)) return false;
+    int depth = 0;
+    for (int i = parent; i > 0;) {
+        if (i == child || ++depth > 32) return false;
+        auto it = std::find_if(booleanLinks.begin(), booleanLinks.end(), [=](const BooleanLink& l) { return l.child == i; });
+        i = it != booleanLinks.end() ? it->parent : 0;
+    }
+    booleanLinks.erase(std::remove_if(booleanLinks.begin(), booleanLinks.end(), [=](const BooleanLink& l) { return l.child == child; }), booleanLinks.end());
+    if (parent) booleanLinks.push_back({child, parent, mode});
+    return true;
+}
+
+static void bindParent(Object& object, int index, const Object* parent) {
+    V3 origin = object.worldPos - object.parentSpace * object.pos;
+    object.bind = parent ? parent->inv * object.parentSpace : object.parentSpace;
+    object.bindOffset = parent ? parent->inv * (origin - parent->worldPos) : origin;
+    object.parent = index;
+    object.hasBind = true;
+}
+
+bool Scene::setParent(int child, int newParent) {
+    if (child < 0 || child >= (int)objs.size() || newParent < -1 || newParent >= (int)objs.size()) return false;
+    for (int i = newParent; i >= 0; i = objs[i].parent) if (i == child) return false;
+    if (newParent >= 0 && length(objs[newParent].inv * V3(1, 0, 0)) == 0) return false;
+    if (objs[child].parent != newParent) {
+        bindParent(objs[child], newParent, newParent < 0 ? nullptr : &objs[newParent]);
+        updateAll();
+    }
+    return true;
+}
+
+Scene Scene::subset(const std::vector<int>& indices) const {
+    Scene result = *this;
+    result.objs.clear();
+    std::vector<int> remap(objs.size(), -1);
+    for (int i : indices) {
+        if (i < 0 || i >= (int)objs.size() || remap[i] >= 0) continue;
+        remap[i] = (int)result.objs.size();
+        result.objs.push_back(objs[i]);
+    }
+    for (Object& o : result.objs) {
+        if (o.parent < 0) continue;
+        int newParent = remap[o.parent];
+        if (newParent < 0) bindParent(o, -1, nullptr);
+        else o.parent = newParent;
+    }
+    auto fixCamera = [&](Camera& c) {
+        if (c.lookAt >= 0) c.lookAt = c.lookAt < (int)remap.size() ? remap[c.lookAt] : -1;
+    };
+    fixCamera(result.cam);
+    for (auto& key : result.camKeys) fixCamera(key.cam);
+    for (auto& camera : result.cameras) {
+        fixCamera(camera.view);
+        for (auto& key : camera.keys) fixCamera(key.cam);
+    }
+    for (auto& camera : result.memory) fixCamera(camera);
+    std::set<int> used;
+    for (const Object& o : result.objs) if (o.group) used.insert(o.group);
+    result.booleanLinks.erase(std::remove_if(result.booleanLinks.begin(), result.booleanLinks.end(), [&](const BooleanLink& l) {
+        return !used.count(l.child) || !used.count(l.parent);
+    }), result.booleanLinks.end());
+    result.updateAll();
+    return result;
 }
 
 int Scene::maxGroup() const {
     int m = 0;
     for (auto& o : objs) m = std::max(m, o.group);
+    for (auto& link : booleanLinks) m = std::max({m, link.parent, link.child});
     return m;
 }
 
 V3 Camera::eye() const {
     float p = rad(pitch), y = rad(yaw);
     return target + V3(std::cos(p) * std::sin(y), std::sin(p), std::cos(p) * std::cos(y)) * dist;
+}
+
+Camera Scene::viewCamera() const {
+    Camera result = cam;
+    if (cam.lookAt < 0 || cam.lookAt >= (int)objs.size()) return result;
+    V3 target = objs[cam.lookAt].worldPos, delta = cam.eye() - target;
+    float distance = length(delta);
+    if (distance < 0.001f) return result;
+    result.target = target;
+    result.dist = distance;
+    result.yaw = std::atan2(delta.x, delta.z) * 180 / PI;
+    result.pitch = std::asin(clampf(delta.y / distance, -0.99999f, 0.99999f)) * 180 / PI;
+    return result;
+}
+
+void Scene::selectCamera(int index) {
+    if (index < 0 || index >= (int)cameras.size() || index == activeCamera) return;
+    if (activeCamera >= 0 && activeCamera < (int)cameras.size()) {
+        cameras[activeCamera].view = cam;
+        cameras[activeCamera].keys = camKeys;
+    }
+    cam = cameras[index].view;
+    camKeys = cameras[index].keys;
+    activeCamera = index;
+    updateAll();
 }
 
 Ray ViewBasis::ray(float nx, float ny) const {
@@ -172,10 +386,12 @@ Ray ViewBasis::ray(float nx, float ny) const {
 ViewBasis cameraBasis(const Camera& c) {
     ViewBasis b;
     b.o = c.eye();
-    b.f = normalize(c.target - b.o);
-    b.r = normalize(cross(b.f, V3(0, 1, 0)));
+    float yaw = rad(c.yaw), pitch = rad(c.pitch);
+    b.f = {-std::cos(pitch) * std::sin(yaw), -std::sin(pitch), -std::cos(pitch) * std::cos(yaw)};
+    b.r = {std::cos(yaw), 0, -std::sin(yaw)};
     b.u = cross(b.r, b.f);
-    b.k = std::tan(rad(c.fov) * 0.5f);
+    b.ortho = c.orthographic;
+    b.k = c.orthographic ? c.orthoScale : std::tan(rad(c.fov) * 0.5f);
     return b;
 }
 
@@ -192,8 +408,12 @@ ViewBasis orthoBasis(int mode, V3 center, float halfH) {
 
 Scene Scene::snapshot() const {
     Scene s = *this;
-    for (auto& o : s.objs)
-        if (o.hf) o.hf = std::make_shared<Heightfield>(*o.hf);
+    std::map<const Heightfield*, std::shared_ptr<Heightfield>> copies;
+    for (auto& o : s.objs) if (o.hf) {
+        auto [at, added] = copies.emplace(o.hf.get(), nullptr);
+        if (added) at->second = std::make_shared<Heightfield>(*o.hf);
+        o.hf = at->second;
+    }
     return s;
 }
 
@@ -222,22 +442,76 @@ template <class K, class G> static auto spline(const std::vector<K>& v, int i0, 
     return cr(at(i0 - 1), at(i0), at(i1), at(i1 + 1), t);
 }
 
+const char* easeName(Ease ease) {
+    const char* names[] = {"Spline", "Linear", "Smooth", "Hold"};
+    return names[(int)ease];
+}
+
+static float easeTime(Ease ease, float t) {
+    if (ease == Ease::Hold) return 0;
+    if (ease == Ease::Smooth) return t * t * (3 - 2 * t);
+    return t;
+}
+
+template <class K, class G> static V3 motion(const std::vector<K>& v, int a, int b, float t, G get) {
+    return v[a].ease == Ease::Spline ? spline(v, a, b, t, get) : lerp(get(v[a]), get(v[b]), easeTime(v[a].ease, t));
+}
+
+AppearanceKey Object::appearance(int f) const {
+    return {f, mat, picture, terrain, lightColor, {lightPower, spotAngle, spotSoft, lightSize}, hidden};
+}
+
+static void blendAppearance(Object& o, const AppearanceKey& a, const AppearanceKey& b, float t) {
+    t = easeTime(a.ease, t);
+    o.mat = a.material;
+    o.mat.color1 = lerp(a.material.color1, b.material.color1, t);
+    o.mat.color2 = lerp(a.material.color2, b.material.color2, t);
+    for (auto property : {&Material::diffuse, &Material::ambient, &Material::specular, &Material::shininess,
+                          &Material::reflect, &Material::transparency, &Material::ior, &Material::bump,
+                          &Material::metal, &Material::emission, &Material::blur})
+        o.mat.*property = lerpf(a.material.*property, b.material.*property, t);
+    o.mat.texScale = lerpf(a.material.texScale, b.material.texScale, t);
+    for (size_t i = 0; i < o.mat.layers.size() && i < b.material.layers.size(); ++i) {
+        auto& layer = o.mat.layers[i];
+        const auto& other = b.material.layers[i];
+        layer.color1 = lerp(layer.color1, other.color1, t); layer.color2 = lerp(layer.color2, other.color2, t);
+        layer.offset = lerp(layer.offset, other.offset, t); layer.rotation = lerp(layer.rotation, other.rotation, t);
+        layer.texScale = lerpf(layer.texScale, other.texScale, t); layer.opacity = lerpf(layer.opacity, other.opacity, t);
+        for (int j = 0; j < TexChannelCount; ++j) layer.influence[j] = lerpf(layer.influence[j], other.influence[j], t);
+    }
+    o.lightColor = lerp(a.lightColor, b.lightColor, t);
+    o.lightPower = lerpf(a.light[0], b.light[0], t);
+    o.spotAngle = lerpf(a.light[1], b.light[1], t);
+    o.spotSoft = lerpf(a.light[2], b.light[2], t);
+    o.lightSize = lerpf(a.light[3], b.light[3], t);
+    o.terrain = {lerpf(a.terrain.height, b.terrain.height, t), lerpf(a.terrain.clip, b.terrain.clip, t),
+                 lerpf(a.terrain.thickness, b.terrain.thickness, t)};
+    o.picture = a.picture;
+    o.picture.keyTolerance = lerpf(a.picture.keyTolerance, b.picture.keyTolerance, t);
+    o.hidden = a.hidden;
+}
+
 void Scene::applyFrame(int f) {
     frame = f;
     int i0, i1;
     float t;
-    for (Object& o : objs)
+    for (Object& o : objs) {
         if (keySpan(o.keys, (float)f, i0, i1, t)) {
-            o.pos = spline(o.keys, i0, i1, t, [](const Key& k) { return k.pos; });
-            o.rot = spline(o.keys, i0, i1, t, [](const Key& k) { return k.rot; });
-            o.scl = spline(o.keys, i0, i1, t, [](const Key& k) { return k.scl; });
+            o.pos = motion(o.keys, i0, i1, t, [](const Key& k) { return k.pos; });
+            o.rot = motion(o.keys, i0, i1, t, [](const Key& k) { return k.rot; });
+            o.scl = motion(o.keys, i0, i1, t, [](const Key& k) { return k.scl; });
             o.scl = V3(std::max(o.scl.x, 0.01f), std::max(o.scl.y, 0.01f), std::max(o.scl.z, 0.01f));
         }
+        if (keySpan(o.appearances, (float)f, i0, i1, t)) blendAppearance(o, o.appearances[i0], o.appearances[i1], t);
+    }
     if (keySpan(camKeys, (float)f, i0, i1, t)) {
-        cam.target = spline(camKeys, i0, i1, t, [](const CamKey& k) { return k.cam.target; });
-        V3 a = spline(camKeys, i0, i1, t, [](const CamKey& k) { return V3(k.cam.yaw, k.cam.pitch, k.cam.dist); });
+        cam.target = motion(camKeys, i0, i1, t, [](const CamKey& k) { return k.cam.target; });
+        V3 a = motion(camKeys, i0, i1, t, [](const CamKey& k) { return V3(k.cam.yaw, k.cam.pitch, k.cam.dist); });
         cam.yaw = a.x; cam.pitch = clampf(a.y, -89, 89); cam.dist = std::max(a.z, 1.f);
-        cam.fov = lerpf(camKeys[i0].cam.fov, camKeys[i1].cam.fov, t);
+        cam.fov = lerpf(camKeys[i0].cam.fov, camKeys[i1].cam.fov, easeTime(camKeys[i0].ease, t));
+        cam.orthographic = camKeys[i0].cam.orthographic;
+        cam.lookAt = camKeys[i0].cam.lookAt;
+        cam.orthoScale = lerpf(camKeys[i0].cam.orthoScale, camKeys[i1].cam.orthoScale, easeTime(camKeys[i0].ease, t));
     }
     if (keySpan(skyKeys, (float)f, i0, i1, t)) sky = lerpSky(skyKeys[i0].sky, skyKeys[i1].sky, t);
     updateAll();
@@ -352,9 +626,10 @@ static bool triHit(V3 o, V3 d, V3 a, V3 b, V3 c, float& t, float& u, float& v) {
     return true;
 }
 
-static bool hitTerrain(const Heightfield& f, V3 o, V3 d, LHit& h) {
+static bool hitTerrain(const Object& terrain, V3 o, V3 d, LHit& h) {
+    const Heightfield& f = *terrain.hf;
     float t0 = EPS, t1 = h.t;
-    if (!boxSpan(V3(-1, 0, -1), V3(1, 1, 1), o, d, t0, t1)) return false;
+    if (!boxSpan(V3(-1, 0, -1), V3(1, terrain.terrain.height, 1), o, d, t0, t1)) return false;
     const int N = f.res - 1;
     const float cs = 2.f / N, INF = 1e30f;
     V3 p = o + d * t0;
@@ -367,9 +642,12 @@ static bool hitTerrain(const Heightfield& f, V3 o, V3 d, LHit& h) {
     while (i >= 0 && j >= 0 && i < N && j < N && tEnter <= t1) {
         float tExit = std::min(std::min(tmx, tmz), t1);
         float y0 = o.y + d.y * tEnter, y1 = o.y + d.y * tExit;
-        float h00 = f.at(i, j), h10 = f.at(i + 1, j), h01 = f.at(i, j + 1), h11 = f.at(i + 1, j + 1);
+        float h00 = terrain.terrainAt(i, j), h10 = terrain.terrainAt(i + 1, j);
+        float h01 = terrain.terrainAt(i, j + 1), h11 = terrain.terrainAt(i + 1, j + 1);
         float hmax = std::max(std::max(h00, h10), std::max(h01, h11));
-        if (hmax > 1e-4f && std::min(y0, y1) <= hmax + 1e-4f) {
+        float hmin = std::min(std::min(h00, h10), std::min(h01, h11));
+        if ((hmax > 1e-4f || terrain.terrain.thickness > 0) &&
+            std::min(y0, y1) <= hmax + 1e-4f && std::max(y0, y1) >= hmin - 1e-4f) {
             float x0 = -1 + i * cs, z0 = -1 + j * cs;
             V3 a(x0, h00, z0), b(x0 + cs, h10, z0), c(x0, h01, z0 + cs), e(x0 + cs, h11, z0 + cs);
             float bt = INF, bu = 0, bv = 0, t, u, v;
@@ -381,7 +659,9 @@ static bool hitTerrain(const Heightfield& f, V3 o, V3 d, LHit& h) {
                 V3 na = f.n[j * r + i], ne = f.n[(j + 1) * r + i + 1];
                 V3 nb = tri == 0 ? f.n[j * r + i + 1] : ne, nc = tri == 0 ? ne : f.n[(j + 1) * r + i];
                 h.t = bt;
-                h.n = na * (1 - bu - bv) + nb * bu + nc * bv;
+                V3 n = na * (1 - bu - bv) + nb * bu + nc * bv;
+                h.n = terrain.terrain.clip > 0 ? normalize(tri == 0 ? cross(e - a, b - a) : cross(c - a, e - a)) :
+                    normalize({n.x * terrain.terrain.height, n.y, n.z * terrain.terrain.height});
                 return true;
             }
         }
@@ -389,6 +669,37 @@ static bool hitTerrain(const Heightfield& f, V3 o, V3 d, LHit& h) {
         else { j += sj; tEnter = tmz; tmz += tdz; }
     }
     return false;
+}
+
+static bool hitTerrainBase(const Object& ob, V3 o, V3 d, LHit& h) {
+    bool lattice = ob.type == ObjType::Lattice;
+    if (!lattice && ob.terrain.thickness <= 0) return false;
+    float floor = -ob.terrain.thickness;
+    bool found = false;
+    auto face = [&](int axis, float plane, V3 normal) {
+        if (std::fabs(d[axis]) < 1e-12f) return;
+        float t = (plane - o[axis]) / d[axis];
+        if (t <= EPS || t >= h.t) return;
+        V3 p = o + d * t;
+        if (axis == 1) {
+            if (std::fabs(p.x) > 1 || std::fabs(p.z) > 1) return;
+        } else {
+            float u = axis == 0 ? p.z : p.x;
+            if (std::fabs(u) > 1 || (!lattice && p.y < floor)) return;
+            int n = ob.hf->res - 1, k = plane < 0 ? 0 : n;
+            float s = (u + 1) * 0.5f * n;
+            int i = std::min((int)s, n - 1);
+            float a = axis == 0 ? ob.terrainAt(k, i) : ob.terrainAt(i, k);
+            float b = axis == 0 ? ob.terrainAt(k, i + 1) : ob.terrainAt(i + 1, k);
+            float top = lerpf(a, b, s - i);
+            if (p.y > top || (lattice && p.y < -top)) return;
+        }
+        h = {t, normal};
+        found = true;
+    };
+    if (!lattice) face(1, floor, {0, -1, 0});
+    for (float sign : {-1.f, 1.f}) { face(0, sign, {sign, 0, 0}); face(2, sign, {0, 0, sign}); }
+    return found;
 }
 
 static float sdTorus(const TorusShape& shape, V3 p, V3 start, V3 end) {
@@ -463,14 +774,14 @@ static void fillHit(const Object& ob, const Ray& r, float t, V3 ln, Hit& h) {
     h.t = t;
     h.p = r.o + r.d * t;
     h.n = normalize(ob.nrm * ln);
-    h.lr = ob.inv * (h.p - ob.pos);
+    h.lr = ob.inv * (h.p - ob.worldPos);
     h.lp = h.lr * ob.scl;
     h.ly = h.lr.y;
 }
 
 static bool intersectObj(const Object& ob, const Ray& r, float tmax, Hit& h) {
     if (isLight(ob.type) || sphereReject(ob, r, tmax)) return false;
-    V3 lo = ob.inv * (r.o - ob.pos), ld = ob.inv * r.d;
+    V3 lo = ob.inv * (r.o - ob.worldPos), ld = ob.inv * r.d;
     LHit lh{tmax, {}};
     bool ok = false;
     switch (ob.type) {
@@ -501,19 +812,28 @@ static bool intersectObj(const Object& ob, const Ray& r, float tmax, Hit& h) {
         if (t <= EPS || t >= tmax) break;
         V3 p = lo + ld * t, ext = picture.halfExtent();
         if (std::fabs(p.x) > ext.x || std::fabs(p.y) > ext.y) break;
-        V3 color = picture.image->sampleClamped(0.5f + 0.5f * p.x / ext.x, 0.5f - 0.5f * p.y / ext.y, picture.chroma);
-        if (picture.chroma && length(color - picture.keyColor) <= picture.keyTolerance) break;
+        float u = 0.5f + 0.5f * p.x / ext.x, v = 0.5f - 0.5f * p.y / ext.y;
+        float alpha = picture.image->opacity(u, v);
+        V3 color = picture.image->sampleClamped(u, v, picture.chroma || !picture.image->alpha.empty());
+        if (alpha < 0.004f || (picture.chroma && length(color - picture.keyColor) <= picture.keyTolerance)) break;
         h.pictureColor = color;
+        h.pictureOpacity = alpha;
         lh = {t, {0, 0, 1}};
         ok = true;
         break;
     }
-    case ObjType::Terrain: ok = ob.hf && ob.hf->res > 1 && hitTerrain(*ob.hf, lo, ld, lh); break;
+    case ObjType::Terrain:
+        if (ob.hf && ob.hf->res > 1) {
+            ok = hitTerrain(ob, lo, ld, lh);
+            if (hitTerrainBase(ob, lo, ld, lh)) ok = true;
+        }
+        break;
     case ObjType::Lattice:
         if (ob.hf && ob.hf->res > 1) {
-            if (hitTerrain(*ob.hf, lo, ld, lh)) ok = true;
+            if (hitTerrain(ob, lo, ld, lh)) ok = true;
             LHit m = lh;
-            if (hitTerrain(*ob.hf, V3(lo.x, -lo.y, lo.z), V3(ld.x, -ld.y, ld.z), m)) { lh = {m.t, V3(m.n.x, -m.n.y, m.n.z)}; ok = true; }
+            if (hitTerrain(ob, V3(lo.x, -lo.y, lo.z), V3(ld.x, -ld.y, ld.z), m)) { lh = {m.t, V3(m.n.x, -m.n.y, m.n.z)}; ok = true; }
+            if (ob.csg && hitTerrainBase(ob, lo, ld, lh)) ok = true;
         }
         break;
     case ObjType::Torus: {
@@ -560,7 +880,7 @@ static bool intersectCsg(const Scene& s, const std::vector<int>& g, const Ray& r
         const Object& ob = s.objs[g[k]];
         if (ob.boolMode == BoolMode::Intersect) nInter++;
         if (ob.boolMode == BoolMode::Positive && firstPos < 0) firstPos = k;
-        V3 lo = ob.inv * (r.o - ob.pos), ld = ob.inv * r.d;
+        V3 lo = ob.inv * (r.o - ob.worldPos), ld = ob.inv * r.d;
         float tn, tf;
         V3 nn, nf;
         if (!convexSpan(ob.type, lo, ld, tn, tf, nn, nf)) continue;
@@ -588,7 +908,7 @@ static bool intersectCsg(const Scene& s, const std::vector<int>& g, const Ray& r
         if (now != state && ev[e].t > EPS) {
             if (ev[e].t >= tmax) return false;
             const Object& surf = s.objs[g[ev[e].m]];
-            int mi = surf.boolMode == BoolMode::Negative ? firstPos : ev[e].m;
+            int mi = surf.boolMode == BoolMode::Negative && !s.cutterMaterial ? firstPos : ev[e].m;
             fillHit(s.objs[g[mi]], r, ev[e].t, V3(0, 1, 0), h);
             V3 n = normalize(surf.nrm * ev[e].n);
             if ((dot(n, r.d) < 0) != now) n = -n;
@@ -654,7 +974,7 @@ static bool intersectMetaballs(const Scene& s, const MetaballGroup& g, const Ray
         const Object& o = s.objs[i];
         if (!o.metaNegative && material < 0) material = i;
         if (sphereReject(o, r, tmax)) continue;
-        V3 a = o.inv * (r.o - o.pos) / o.metaRadius, d = o.inv * r.d / o.metaRadius;
+        V3 a = o.inv * (r.o - o.worldPos) / o.metaRadius, d = o.inv * r.d / o.metaRadius;
         double curvature = dot(d, d);
         if (curvature <= 0) continue;
         double center = -dot(a, d) / curvature;
@@ -684,7 +1004,7 @@ static bool intersectMetaballs(const Scene& s, const MetaballGroup& g, const Ray
         if (o.boolMode == BoolMode::Intersect) masks++;
         float tn, tf;
         V3 nn, nf;
-        if (sphereReject(o, r, tmax) || !convexSpan(o.type, o.inv * (r.o - o.pos), o.inv * r.d, tn, tf, nn, nf)) continue;
+        if (sphereReject(o, r, tmax) || !convexSpan(o.type, o.inv * (r.o - o.worldPos), o.inv * r.d, tn, tf, nn, nf)) continue;
         if (tf <= EPS || tn >= tmax || tn >= tf) continue;
         if (tn <= EPS) count(o.boolMode)++;
         else events.push_back({tn, i, 1, nn});
@@ -703,7 +1023,7 @@ static bool intersectMetaballs(const Scene& s, const MetaballGroup& g, const Ray
         int contributor = material;
         for (const auto& p : parts) {
             const Object& o = s.objs[p.obj];
-            V3 local = o.inv * (point - o.pos) / o.metaRadius;
+            V3 local = o.inv * (point - o.worldPos) / o.metaRadius;
             float q = std::max(0.f, 1 - dot(local, local));
             n += o.nrm * local * (q * (float)p.strength / o.metaRadius);
             double weight = q * q * p.strength;
@@ -730,7 +1050,7 @@ static bool intersectMetaballs(const Scene& s, const MetaballGroup& g, const Ray
         } while (i < events.size() && events[i].t == t);
         if (inside() != before) {
             const Object& o = s.objs[surface->obj];
-            h.obj = o.boolMode == BoolMode::Negative ? material : surface->obj;
+            h.obj = o.boolMode == BoolMode::Negative && !s.cutterMaterial ? material : surface->obj;
             fillHit(s.objs[h.obj], r, t, {}, h);
             h.n = normalize(o.nrm * surface->normal);
             if ((dot(h.n, r.d) < 0) != inside()) h.n = -h.n;
@@ -741,20 +1061,110 @@ static bool intersectMetaballs(const Scene& s, const MetaballGroup& g, const Ray
     return ballSurface(from, tmax);
 }
 
+static bool intersectNested(const Scene& s, int root, const Ray& ray, float limit, Hit& h, int skip, int depth = 0) {
+    if (depth >= 32) return false;
+    const auto& node = s.booleanNodes[root];
+    struct Operand { int index, kind; BoolMode role; Hit hit; bool available = false, inside = false; };
+    std::vector<Operand> items;
+    for (int i : node.parts) { if (i == skip) return false; items.push_back({i, 0, s.objs[i].boolMode, {}}); }
+    for (auto [i, mode] : node.children) items.push_back({i, 1, mode, {}});
+    if (node.field >= 0) items.push_back({node.field, 2, BoolMode::Positive, {}});
+    auto advance = [&](Operand& in, float start) {
+        Ray r{ray.o + ray.d * start, ray.d};
+        if (in.kind == 0) {
+            in.available = intersectObj(s.objs[in.index], r, 1e30f, in.hit);
+            in.hit.obj = in.index;
+        } else if (in.kind == 1) {
+            in.available = intersectNested(s, in.index, r, 1e30f, in.hit, skip, depth + 1);
+        } else {
+            in.available = intersectMetaballs(s, s.metaballs[in.index], r, 1e30f, in.hit, skip);
+        }
+        if (in.available) in.hit.t += start;
+    };
+    for (auto& in : items) {
+        advance(in, 0);
+        in.inside = in.available && dot(in.hit.n, ray.d) > 0;
+    }
+    auto inside = [&] {
+        bool any = false;
+        for (const auto& in : items) {
+            if ((in.role == BoolMode::Negative && in.inside) || (in.role == BoolMode::Intersect && !in.inside)) return false;
+            if (in.role == BoolMode::Positive && in.inside) any = true;
+        }
+        return any;
+    };
+    for (int iteration = 0; iteration < 512; ++iteration) {
+        float best = limit;
+        for (const auto& in : items) if (in.available) best = std::min(best, in.hit.t);
+        if (best >= limit) return false;
+        bool before = inside();
+        Hit face;
+        BoolMode role = BoolMode::Neutral;
+        for (auto& in : items) {
+            if (!in.available || in.hit.t > best + 1e-5f) continue;
+            bool old = inside();
+            in.inside = dot(in.hit.n, ray.d) < 0;
+            if (old != inside()) { face = in.hit; role = in.role; }
+            advance(in, in.hit.t);
+        }
+        if (before == inside()) continue;
+        h = face;
+        if ((dot(h.n, ray.d) < 0) != inside()) h.n = -h.n;
+        if (role == BoolMode::Negative && !s.cutterMaterial) {
+            for (const auto& in : items) if (in.role == BoolMode::Positive && in.inside && in.hit.obj >= 0) {
+                h.obj = in.hit.obj;
+                const Object& m = s.objs[h.obj];
+                h.lr = m.inv * (h.p - m.worldPos);
+                h.lp = h.lr * m.scl;
+                h.ly = h.lr.y;
+                break;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
 bool intersectObject(const Object& o, const Ray& r, float tmax, Hit& h) { return intersectObj(o, r, tmax, h); }
 
 bool intersectScene(const Scene& s, const Ray& r, float tmax, Hit& h, int skip, RayPurpose purpose) {
     bool any = false;
-    for (size_t i = 0; i < s.objs.size(); ++i) {
+    auto test = [&](int i) {
         const Object& o = s.objs[i];
+        if (purpose != RayPurpose::View && canVolume(o.type) && o.mat.volumeDensity > 0 && !o.csg) return;
         if (o.type == ObjType::Picture && ((purpose == RayPurpose::Shadow && !o.picture.shadows) ||
-                                           (purpose == RayPurpose::Reflection && !o.picture.reflections))) continue;
+                                           (purpose == RayPurpose::Reflection && !o.picture.reflections))) return;
         Hit t;
-        if ((int)i != skip && !o.hidden && !o.csg && intersectObj(o, r, tmax, t)) {
+        if (i != skip && !o.hidden && !o.csg && intersectObj(o, r, any ? tmax + 1e-6f : tmax, t) &&
+            (t.t < tmax || (any && t.t == tmax && i < h.obj))) {
             tmax = t.t;
             h = t;
-            h.obj = (int)i;
+            h.obj = i;
             any = true;
+        }
+    };
+    if (s.rayNodes.empty()) {
+        for (int i = 0; i < (int)s.objs.size(); ++i) test(i);
+    } else {
+        for (int i : s.unbounded) test(i);
+        int stack[64], next = 0;
+        stack[next++] = 0;
+        while (next) {
+            const auto& node = s.rayNodes[stack[--next]];
+            float near = EPS, far = tmax;
+            if (!boxSpan(node.lower, node.upper, r.o, r.d, near, far)) continue;
+            if (node.left < 0) {
+                for (int i = 0; i < node.count; ++i) test(s.rayOrder[node.first + i]);
+            } else {
+                float a = EPS, az = tmax, b = EPS, bz = tmax;
+                const auto& l = s.rayNodes[node.left]; const auto& rt = s.rayNodes[node.right];
+                bool left = boxSpan(l.lower, l.upper, r.o, r.d, a, az);
+                bool right = boxSpan(rt.lower, rt.upper, r.o, r.d, b, bz);
+                if (left && right) {
+                    stack[next++] = a < b ? node.right : node.left;
+                    stack[next++] = a < b ? node.left : node.right;
+                } else if (left || right) stack[next++] = left ? node.left : node.right;
+            }
         }
     }
     for (const auto& g : s.csg) {
@@ -773,12 +1183,18 @@ bool intersectScene(const Scene& s, const Ray& r, float tmax, Hit& h, int skip, 
         }
     }
     for (const auto& g : s.metaballs) {
+        if (g.nested) continue;
         Hit t;
         if (intersectMetaballs(s, g, r, tmax, t, skip)) {
             tmax = t.t;
             h = t;
             any = true;
         }
+    }
+    for (int i = 0; i < (int)s.booleanNodes.size(); ++i) {
+        if (s.booleanNodes[i].nested) continue;
+        Hit t;
+        if (intersectNested(s, i, r, tmax, t, skip)) { h = t; tmax = t.t; any = true; }
     }
     return any;
 }
@@ -794,8 +1210,8 @@ void wireframe(const Object& o, std::vector<V3>& s) {
             };
             a = shape(a); b = shape(b);
         }
-        s.push_back(o.pos + o.fwd * a);
-        s.push_back(o.pos + o.fwd * b);
+        s.push_back(o.worldPos + o.fwd * a);
+        s.push_back(o.worldPos + o.fwd * b);
     };
     auto ring = [&](float y, float r, int segs, float start = 0.f, float sweep = 2 * PI) {
         for (int i = 0; i < segs; i++) {
@@ -816,9 +1232,9 @@ void wireframe(const Object& o, std::vector<V3>& s) {
     auto grid = [&](const Heightfield& f, float sign) {
         int step = std::max(1, (f.res - 1) / 48);
         float cs = 2.f / (f.res - 1);
-        auto P = [&](int x, int z) { return V3(-1 + x * cs, f.at(x, z) * sign, -1 + z * cs); };
+        auto P = [&](int x, int z) { return V3(-1 + x * cs, o.terrainAt(x, z) * sign, -1 + z * cs); };
         auto E = [&](int x0, int z0, int x1, int z1) {
-            if (f.at(x0, z0) > 1e-4f || f.at(x1, z1) > 1e-4f) L(P(x0, z0), P(x1, z1));
+            if (o.terrainAt(x0, z0) > 1e-4f || o.terrainAt(x1, z1) > 1e-4f) L(P(x0, z0), P(x1, z1));
         };
         for (int a = 0; a < f.res; a += step)
             for (int b = 0; b + step < f.res; b += step) { E(b, a, b + step, a); E(a, b, a, b + step); }
@@ -893,7 +1309,7 @@ void wireframe(const Object& o, std::vector<V3>& s) {
     case ObjType::Light:
         for (int i = 0; i < 3; i++) {
             V3 a(i == 0 ? .8f : 0, i == 1 ? .8f : 0, i == 2 ? .8f : 0);
-            s.push_back(o.pos - a); s.push_back(o.pos + a);
+            s.push_back(o.worldPos - a); s.push_back(o.worldPos + a);
         }
         break;
     case ObjType::Spotlight: case ObjType::Parallel: {
@@ -903,10 +1319,10 @@ void wireframe(const Object& o, std::vector<V3>& s) {
         for (int i = 0; i < 8; i++) {
             float a0 = 2 * PI * i / 8, a1 = 2 * PI * (i + 1) / 8;
             V3 p0 = (u * std::cos(a0) + w * std::sin(a0)) * rr, p1 = (u * std::cos(a1) + w * std::sin(a1)) * rr;
-            V3 b0 = spot ? o.pos : o.pos + p0;
-            s.push_back(b0); s.push_back(o.pos + ax * len + p0);
-            s.push_back(o.pos + ax * len + p0); s.push_back(o.pos + ax * len + p1);
-            if (!spot) { s.push_back(o.pos + p0); s.push_back(o.pos + p1); }
+            V3 b0 = spot ? o.worldPos : o.worldPos + p0;
+            s.push_back(b0); s.push_back(o.worldPos + ax * len + p0);
+            s.push_back(o.worldPos + ax * len + p0); s.push_back(o.worldPos + ax * len + p1);
+            if (!spot) { s.push_back(o.worldPos + p0); s.push_back(o.worldPos + p1); }
         }
         break;
     }
@@ -1038,8 +1454,16 @@ static void rs(std::istream& i, std::string& s, int ver) {
 }
 template <class T> static void rb(std::istream& i, T& b) { int v = 0; i >> v; b = v != 0; }
 
-static void writeCam(std::ostream& f, const Camera& c) { wv(f, c.target); f << c.yaw << ' ' << c.pitch << ' ' << c.dist << ' ' << c.fov << ' '; }
-static void readCam(std::istream& f, Camera& c) { rv(f, c.target); f >> c.yaw >> c.pitch >> c.dist >> c.fov; }
+static void writeCam(std::ostream& f, const Camera& c) {
+    wv(f, c.target);
+    f << c.yaw << ' ' << c.pitch << ' ' << c.dist << ' ' << c.fov << ' ' << c.orthographic << ' ' << c.orthoScale << ' ' << c.lookAt << ' ';
+}
+static void readCam(std::istream& f, Camera& c, int ver) {
+    rv(f, c.target);
+    f >> c.yaw >> c.pitch >> c.dist >> c.fov;
+    if (ver >= 4) { rb(f, c.orthographic); f >> c.orthoScale >> c.lookAt; }
+    c.orthoScale = clampf(c.orthoScale, 0.1f, 5000);
+}
 
 static void writeSky(std::ostream& f, const Sky& k) {
     ws(f, k.name);
@@ -1056,6 +1480,8 @@ static void writeSky(std::ostream& f, const Sky& k) {
     ws(f, k.category);
     f << k.mode << ' ' << (int)k.sunVisible << ' ' << k.stratus << ' ' << (int)k.moon << ' ' << k.moonAlt << ' ' << k.moonAz << ' '
       << k.moonPhase << ' ' << k.moonSize << ' ' << k.rainbow << ' ';
+    f << k.cloudAltitude << ' ' << k.cloudThickness << ' ' << k.cloudShadow << ' ' << k.skylight << ' ';
+    wv(f, k.stratusColor); wv(f, k.moonColor);
 }
 static void readSky(std::istream& f, Sky& k, int ver) {
     rs(f, k.name, ver);
@@ -1077,6 +1503,12 @@ static void readSky(std::istream& f, Sky& k, int ver) {
     f >> k.stratus;
     rb(f, k.moon);
     f >> k.moonAlt >> k.moonAz >> k.moonPhase >> k.moonSize >> k.rainbow;
+    if (ver >= 4) {
+        f >> k.cloudAltitude >> k.cloudThickness >> k.cloudShadow >> k.skylight;
+        rv(f, k.stratusColor); rv(f, k.moonColor);
+        k.cloudAltitude = clampf(k.cloudAltitude, 1, 200);
+        k.cloudThickness = clampf(k.cloudThickness, 0.1f, 30);
+    }
 }
 
 static void writeLayer(std::ostream& f, const TextureLayer& l) {
@@ -1131,6 +1563,7 @@ static void writeMat(std::ostream& f, const Material& m) {
     ws(f, m.image);
     f << m.layers.size() << ' ';
     for (const auto& layer : m.layers) writeLayer(f, layer);
+    f << m.absorption << ' ' << m.volumeDensity << ' ' << m.volumeScatter << ' ' << m.volumeNoise << ' ';
 }
 static bool readMat(std::istream& f, Material& m, int ver) {
     int t = 0;
@@ -1154,25 +1587,222 @@ static bool readMat(std::istream& f, Material& m, int ver) {
     m.layers.resize(count);
     for (auto& layer : m.layers)
         if (!readLayer(f, layer)) return false;
+    if (ver >= 4) {
+        f >> m.absorption >> m.volumeDensity >> m.volumeScatter >> m.volumeNoise;
+        m.absorption = clampf(m.absorption, 0, 10);
+        m.volumeDensity = clampf(m.volumeDensity, 0, 8);
+        m.volumeScatter = clampf(m.volumeScatter, 0, 1);
+        m.volumeNoise = clampf(m.volumeNoise, 0, 1);
+    }
     return (bool)f;
 }
 
+static bool readEase(std::istream& f, Ease& ease) {
+    int value = 0;
+    if (!(f >> value) || value < 0 || value >= (int)Ease::COUNT) return false;
+    ease = (Ease)value;
+    return true;
+}
+
+static void writePicture(std::ostream& f, const Picture& p) {
+    ws(f, p.path); wv(f, p.keyColor);
+    f << p.aspect << ' ' << p.keyTolerance << ' ' << p.billboard << ' ' << p.chroma << ' ' << p.shadows << ' ' << p.reflections << ' ';
+}
+
+static bool readPicture(std::istream& f, Picture& p, int ver) {
+    rs(f, p.path, ver); rv(f, p.keyColor);
+    f >> p.aspect >> p.keyTolerance;
+    rb(f, p.billboard); rb(f, p.chroma); rb(f, p.shadows); rb(f, p.reflections);
+    return f && p.aspect >= 1.f / 16385 && p.aspect <= 16385 && p.keyTolerance >= 0 && p.keyTolerance <= 1;
+}
+
+static bool readTerrainShape(std::istream& f, TerrainShape& t) {
+    return (f >> t.height >> t.clip >> t.thickness) &&
+           t.height >= 0.05f && t.height <= 5 && t.clip >= 0 && t.clip <= 1 && t.thickness >= 0 && t.thickness <= 2;
+}
+
+template <class S, class F> static void sceneAssets(S& scene, F visit) {
+    auto material = [&](auto& mat) {
+        visit(mat.image, mat.img);
+        for (auto& layer : mat.layers) visit(layer.image, layer.img);
+    };
+    for (auto& o : scene.objs) {
+        material(o.mat);
+        visit(o.picture.path, o.picture.image);
+        visit(o.lighting.gel, o.lighting.gelImage);
+        for (auto& key : o.appearances) {
+            material(key.material);
+            visit(key.picture.path, key.picture.image);
+        }
+    }
+}
+
+static bool assetIsFile(const std::string& path) {
+    return !path.empty() && path.rfind("builtin:", 0) != 0 && path.rfind("embed:", 0) != 0;
+}
+
+bool Scene::embedAssets(std::string& error) {
+    Scene output = *this;
+    std::map<std::string, std::string> names;
+    size_t total = 0;
+    for (auto& entry : embeddedImages) total += entry.second->px.size();
+    std::string prefix = "embed:" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "_";
+    sceneAssets(output, [&](std::string& value, auto& data) {
+        if (!error.empty() || !assetIsFile(value)) return;
+        if (names.count(value)) { value = names[value]; data = output.embeddedImages[value]; return; }
+        auto image = data ? data : loadImageCached(value, true);
+        if (!image) { error = "could not decode " + value; return; }
+        if ((total += image->px.size()) > 8000000) { error = "embedded-image limit is eight million pixels"; return; }
+        std::string key = prefix + std::to_string(names.size());
+        names.emplace(value, key);
+        output.embeddedImages.emplace(key, image);
+        value = key;
+        data = image;
+    });
+    if (!error.empty()) return false;
+    *this = std::move(output);
+    return true;
+}
+
 bool Scene::save(const std::string& path) const {
+    namespace fs = std::filesystem;
+    std::error_code error;
+    auto dest = fs::absolute(path, error);
+    if (error) return false;
+    auto root = dest.parent_path();
+    Scene output = *this;
+    sceneAssets(output, [&](std::string& value, auto&) {
+        if (!assetIsFile(value)) return;
+        auto absolute = fs::absolute(value, error);
+        if (error) { error.clear(); return; }
+        auto relative = absolute.lexically_normal().lexically_relative(root.lexically_normal());
+        value = relative.empty() ? absolute.string() : relative.generic_string();
+    });
+    std::string temp = dest.string() + ".tmp-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    if (output.writeFile(temp)) {
+        fs::rename(temp, dest, error);
+        if (!error) return true;
+    }
+    fs::remove(temp, error);
+    return false;
+}
+
+bool Scene::package(const std::string& path, std::string& error) const {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    auto file = fs::absolute(path, ec);
+    if (ec) { error = "invalid destination"; return false; }
+    auto folder = file.parent_path() / (file.stem().string() + "_assets");
+    fs::create_directories(folder, ec);
+    if (ec) { error = "cannot create the asset folder"; return false; }
+    Scene output = *this;
+    std::map<std::string, std::string> copies;
+    sceneAssets(output, [&](std::string& value, auto&) {
+        if (!error.empty() || !assetIsFile(value)) return;
+        auto old = copies.find(value);
+        if (old != copies.end()) { value = old->second; return; }
+        auto source = fs::path(value);
+        if (!fs::is_regular_file(source, ec)) { error = "missing asset " + value; return; }
+        std::string stem = source.filename().string();
+        auto dest = folder / stem;
+        for (unsigned suffix = 2; fs::exists(dest, ec) && !ec; ++suffix) dest = folder / (std::to_string(suffix) + "_" + stem);
+        if (ec || !fs::copy_file(source, dest, fs::copy_options::none, ec)) { error = "could not copy " + value; return; }
+        value = copies.emplace(value, dest.string()).first->second;
+    });
+    if (!error.empty()) return false;
+    if (output.save(path)) return true;
+    error = "could not save the scene";
+    return false;
+}
+
+std::vector<std::string> Scene::missingAssets() const {
+    std::set<std::string> paths;
+    sceneAssets(*this, [&](const std::string& value, const auto&) {
+        std::error_code ec;
+        if (assetIsFile(value) && !std::filesystem::is_regular_file(value, ec)) paths.insert(value);
+    });
+    return {paths.begin(), paths.end()};
+}
+
+bool Scene::relinkAsset(const std::string& source, const std::string& replacement) {
+    auto image = loadImageCached(replacement, true);
+    if (!image) return false;
+    bool found = false;
+    sceneAssets(*this, [&](std::string& value, auto& data) {
+        if (value == source) { value = replacement; data = image; found = true; }
+    });
+    return found;
+}
+
+void Scene::reloadAssets() {
+    std::map<std::string, std::shared_ptr<const Image>> loaded;
+    sceneAssets(*this, [&](std::string& value, auto& data) {
+        if (value.empty()) return;
+        if (value.rfind("embed:", 0) == 0) return;
+        auto [at, added] = loaded.emplace(value, nullptr);
+        if (added) at->second = loadImageCached(value, true);
+        data = at->second;
+    });
+}
+
+bool Scene::writeFile(const std::string& path) const {
     std::ofstream f(path);
     if (!f) return false;
-    f << std::setprecision(7) << "CANYON3D 3\ncamera ";
+    f << std::setprecision(9) << "CANYON3D 4\ncamera ";
     writeCam(f, cam);
     f << "\nsky ";
     writeSky(f, sky);
+    if (!title.empty() || !description.empty()) {
+        f << "\nmetadata ";
+        ws(f, title); ws(f, description);
+    }
     const RenderSettings& r = render;
     f << "\nrender " << r.width << ' ' << r.height << ' ' << r.quality << ' ' << r.samples << ' ' << r.dof << ' ' << r.panorama << ' '
       << r.softShadows << ' ' << r.blurReflections << ' ' << r.focusDist << ' ' << r.aperture << ' ' << r.gamma << ' ' << r.brightness
       << ' ' << r.contrast << ' ' << r.saturation << "\nanim " << frames << ' ' << fps << ' ' << frame << "\n";
+    f << "renderfx " << r.bounces << ' ' << r.seed << ' ' << r.transparentShadows << ' ' << r.adaptive << ' '
+      << r.denoise << ' ' << r.region << ' ' << r.cropX << ' ' << r.cropY << ' ' << r.cropW << ' ' << r.cropH << ' '
+      << r.alpha << ' ' << r.depthOutput << ' ' << r.idOutput << '\n';
+    if (cutterMaterial) f << "cuttermaterial\n";
+    for (auto& link : booleanLinks) f << "booleanlink " << link.child << ' ' << link.parent << ' ' << (int)link.mode << '\n';
     for (int i = 0; i < 6; i++)
         if (memorySet[i]) { f << "memory " << i << ' '; writeCam(f, memory[i]); f << "\n"; }
-    for (auto& k : camKeys) { f << "camkey " << k.frame << ' '; writeCam(f, k.cam); f << "\n"; }
+    for (auto& k : camKeys) { f << "camkey " << k.frame << ' '; writeCam(f, k.cam); f << (int)k.ease << '\n'; }
+    if (!cameras.empty()) f << "activecamera " << activeCamera << '\n';
+    for (size_t i = 0; i < cameras.size(); ++i) {
+        const auto& slot = cameras[i];
+        bool active = (int)i == activeCamera;
+        f << "cameraslot "; ws(f, slot.name); writeCam(f, active ? cam : slot.view);
+        const auto& keys = active ? camKeys : slot.keys;
+        f << keys.size() << ' ';
+        for (const auto& key : keys) {
+            f << key.frame << ' '; writeCam(f, key.cam); f << (int)key.ease << ' ';
+        }
+        f << '\n';
+    }
     for (auto& k : skyKeys) { f << "skykey " << k.frame << ' '; writeSky(f, k.sky); f << "\n"; }
-    for (const Object& o : objs) {
+    const char* hex = "0123456789abcdef";
+    size_t totalEmbedded = 0;
+    for (const auto& [key, image] : embeddedImages) {
+        if ((totalEmbedded += image->px.size()) > 8000000) return false;
+        f << "embedded "; ws(f, key); f << image->w << ' ' << image->h << ' ';
+        std::string pixels;
+        pixels.resize(image->px.size() * 8);
+        size_t mark = 0;
+        auto byte = [&](unsigned value) { pixels[mark++] = hex[value >> 4]; pixels[mark++] = hex[value & 15]; };
+        for (size_t i = 0; i < image->px.size(); ++i) {
+            V3 c = image->px[i];
+            byte((unsigned)(clampf(c.x, 0, 1) * 255 + 0.5f));
+            byte((unsigned)(clampf(c.y, 0, 1) * 255 + 0.5f));
+            byte((unsigned)(clampf(c.z, 0, 1) * 255 + 0.5f));
+            byte(image->alpha.empty() ? 255 : image->alpha[i]);
+        }
+        f << pixels << '\n';
+    }
+    std::map<const Heightfield*, int> storedHeights;
+    std::map<const Mesh*, int> storedMeshes;
+    for (int objectIndex = 0; objectIndex < (int)objs.size(); ++objectIndex) {
+        const Object& o = objs[objectIndex];
         f << "object " << (int)o.type << ' ';
         ws(f, o.name);
         wv(f, o.pos); wv(f, o.rot); wv(f, o.scl); wv(f, o.lightColor);
@@ -1180,12 +1810,20 @@ bool Scene::save(const std::string& path) const {
           << o.hidden << ' ' << o.locked << ' ' << o.seed << ' ' << o.treePart << "\nmaterial ";
         writeMat(f, o.mat);
         f << "\n";
-        if (o.type == ObjType::Metaball) f << "metaball " << o.metaRadius << ' ' << o.metaStrength << ' ' << o.metaNegative << "\n";
-        if (o.type == ObjType::Picture) {
-            const Picture& p = o.picture;
-            f << "picture "; ws(f, p.path); wv(f, p.keyColor);
-            f << p.aspect << ' ' << p.keyTolerance << ' ' << p.billboard << ' ' << p.chroma << ' ' << p.shadows << ' ' << p.reflections << "\n";
+        if (o.hasBind || o.parent >= 0) {
+            f << "parent " << o.parent << ' ';
+            wv(f, o.bindOffset);
+            for (const auto& row : o.bind.m) for (float v : row) f << v << ' ';
+            f << '\n';
         }
+        if (o.type == ObjType::Metaball) f << "metaball " << o.metaRadius << ' ' << o.metaStrength << ' ' << o.metaNegative << "\n";
+        if (isLight(o.type)) {
+            const auto& l = o.lighting;
+            f << "lightfx " << (int)l.falloff << ' ' << l.range << ' ' << l.samples << ' ' << l.casts << ' ' << l.disk << ' '
+              << l.enabled << ' ' << l.visible << ' ';
+            ws(f, l.gel); f << '\n';
+        }
+        if (o.type == ObjType::Picture) { f << "picture "; writePicture(f, o.picture); f << '\n'; }
         if (o.type == ObjType::Torus)
             f << "torus " << o.torus.major << ' ' << o.torus.minor << ' ' << o.torus.section << ' ' << o.torus.start << ' ' << o.torus.sweep << "\n";
         if (o.type == ObjType::Stone)
@@ -1196,20 +1834,39 @@ bool Scene::save(const std::string& path) const {
             f << "tree " << t.height << ' ' << t.spread << ' ' << t.trunkRadius << ' ' << t.leafSize << ' ' << t.leafDensity << ' ' << t.levels
               << ' ' << t.branches << ' ' << t.seed << "\n";
         }
-        for (auto& k : o.keys) { f << "key " << k.frame << ' '; wv(f, k.pos); wv(f, k.rot); wv(f, k.scl); f << "\n"; }
+        for (auto& k : o.keys) {
+            f << "key " << k.frame << ' '; wv(f, k.pos); wv(f, k.rot); wv(f, k.scl); f << (int)k.ease << '\n';
+        }
+        for (auto& k : o.appearances) {
+            f << "appearance " << k.frame << ' ' << (int)k.ease << ' ' << k.hidden << ' ';
+            wv(f, k.lightColor);
+            for (float v : k.light) f << v << ' ';
+            f << k.terrain.height << ' ' << k.terrain.clip << ' ' << k.terrain.thickness << ' ';
+            writePicture(f, k.picture);
+            writeMat(f, k.material);
+            f << '\n';
+        }
         if (isHeightfield(o.type) && o.hf) {
-            f << "terrain " << o.hf->res << "\n";
-            for (size_t i = 0; i < o.hf->h.size(); i++) f << o.hf->h[i] << ((i % 16 == 15) ? '\n' : ' ');
-            f << "\n";
+            f << "terrainshape " << o.terrain.height << ' ' << o.terrain.clip << ' ' << o.terrain.thickness << '\n';
+            auto [at, added] = storedHeights.emplace(o.hf.get(), objectIndex);
+            if (added) {
+                f << "terrain " << o.hf->res << "\n";
+                for (size_t i = 0; i < o.hf->h.size(); i++) f << o.hf->h[i] << ((i % 16 == 15) ? '\n' : ' ');
+                f << "\n";
+            } else f << "terrainref " << at->second << '\n';
         }
         if (o.type == ObjType::Mesh && o.mesh && !o.treePart) {
-            const Mesh& m = *o.mesh;
-            f << "mesh " << m.v.size() << ' ' << m.triCount() << "\n";
-            for (size_t i = 0; i < m.v.size(); i++) { wv(f, m.v[i]); wv(f, m.n[i]); f << "\n"; }
-            for (size_t i = 0; i < m.tri.size(); i++) f << m.tri[i] << ((i % 3 == 2) ? '\n' : ' ');
+            auto [at, added] = storedMeshes.emplace(o.mesh.get(), objectIndex);
+            if (added) {
+                const Mesh& m = *o.mesh;
+                f << "mesh " << m.v.size() << ' ' << m.triCount() << "\n";
+                for (size_t i = 0; i < m.v.size(); i++) { wv(f, m.v[i]); wv(f, m.n[i]); f << "\n"; }
+                for (size_t i = 0; i < m.tri.size(); i++) f << m.tri[i] << ((i % 3 == 2) ? '\n' : ' ');
+            } else f << "meshref " << at->second << '\n';
         }
     }
     f << "end\n";
+    f.close();
     return (bool)f;
 }
 
@@ -1217,39 +1874,105 @@ bool Scene::load(const std::string& path) {
     std::ifstream f(path);
     std::string tok;
     int ver = 0;
-    if (!(f >> tok >> ver) || tok != "CANYON3D" || ver < 1 || ver > 3) return false;
+    if (!(f >> tok >> ver) || tok != "CANYON3D" || ver < 1 || ver > 4) return false;
     Scene s;
+    size_t embeddedPixels = 0;
     s.sky = skyPresets()[0];
     while (f >> tok) {
-        if (tok == "camera") readCam(f, s.cam);
+        if (tok == "camera") readCam(f, s.cam, ver);
         else if (tok == "sky") readSky(f, s.sky, ver);
-        else if (tok == "render") {
+        else if (tok == "metadata") {
+            if (ver < 4) return false;
+            rs(f, s.title, ver); rs(f, s.description, ver);
+        } else if (tok == "render") {
             RenderSettings& r = s.render;
             f >> r.width >> r.height >> r.quality >> r.samples;
             rb(f, r.dof); rb(f, r.panorama); rb(f, r.softShadows); rb(f, r.blurReflections);
             f >> r.focusDist >> r.aperture >> r.gamma >> r.brightness >> r.contrast >> r.saturation;
             r.width = std::min(std::max(r.width, 0), 8192); r.height = std::min(std::max(r.height, 0), 8192);
             r.quality = std::min(std::max(r.quality, 0), 2); r.samples = std::min(std::max(r.samples, 1), 256);
+        } else if (tok == "renderfx") {
+            if (ver < 4) return false;
+            auto& r = s.render;
+            f >> r.bounces >> r.seed;
+            rb(f, r.transparentShadows); rb(f, r.adaptive); rb(f, r.denoise); rb(f, r.region);
+            f >> r.cropX >> r.cropY >> r.cropW >> r.cropH;
+            rb(f, r.alpha); rb(f, r.depthOutput); rb(f, r.idOutput);
+            r.bounces = std::clamp(r.bounces, 0, 16);
+            r.cropX = clampf(r.cropX, 0, 0.99f); r.cropY = clampf(r.cropY, 0, 0.99f);
+            r.cropW = clampf(r.cropW, 0.01f, 1); r.cropH = clampf(r.cropH, 0.01f, 1);
         } else if (tok == "anim") {
             f >> s.frames >> s.fps >> s.frame;
             s.frames = std::min(std::max(s.frames, 2), 100000); s.fps = std::min(std::max(s.fps, 1), 120);
             s.frame = std::min(std::max(s.frame, 0), s.frames - 1);
+        } else if (tok == "cuttermaterial") {
+            if (ver < 4) return false;
+            s.cutterMaterial = true;
+        } else if (tok == "booleanlink") {
+            int child = 0, parent = 0, mode = 0;
+            if (ver < 4 || !(f >> child >> parent >> mode) || mode < 1 || mode >= (int)BoolMode::COUNT ||
+                !s.setBooleanParent(child, parent, (BoolMode)mode)) return false;
         } else if (tok == "memory") {
             int i = -1;
             f >> i;
             if (i < 0 || i >= 6) return false;
-            readCam(f, s.memory[i]);
+            readCam(f, s.memory[i], ver);
             s.memorySet[i] = true;
         } else if (tok == "camkey") {
             CamKey k;
             f >> k.frame;
-            readCam(f, k.cam);
+            readCam(f, k.cam, ver);
+            if (ver >= 4 && !readEase(f, k.ease)) return false;
             putKey(s.camKeys, k);
+        } else if (tok == "activecamera") {
+            if (ver < 4) return false;
+            f >> s.activeCamera;
+        } else if (tok == "cameraslot") {
+            if (ver < 4 || s.cameras.size() >= 128) return false;
+            NamedCamera camera;
+            rs(f, camera.name, ver);
+            readCam(f, camera.view, ver);
+            int count = 0;
+            if (!(f >> count) || count < 0 || count > 100000) return false;
+            for (int i = 0; i < count; ++i) {
+                CamKey key;
+                f >> key.frame;
+                readCam(f, key.cam, ver);
+                if (!readEase(f, key.ease) || (!camera.keys.empty() && key.frame <= camera.keys.back().frame)) return false;
+                camera.keys.push_back(key);
+            }
+            s.cameras.push_back(std::move(camera));
         } else if (tok == "skykey") {
             SkyKey k;
             f >> k.frame;
             readSky(f, k.sky, ver);
             putKey(s.skyKeys, k);
+        } else if (tok == "embedded") {
+            if (ver < 4) return false;
+            std::string key, pixels;
+            auto img = std::make_shared<Image>();
+            rs(f, key, ver);
+            if (!(f >> img->w >> img->h) || img->w <= 0 || img->h <= 0 || img->w > 16384 || img->h > 16384 ||
+                key.rfind("embed:", 0) != 0 || s.embeddedImages.count(key)) return false;
+            size_t count = (size_t)img->w * img->h;
+            if ((embeddedPixels += count) > 8000000) return false;
+            f.width((std::streamsize)(count * 8 + 1));
+            if (!(f >> pixels) || pixels.size() != count * 8) return false;
+            auto nibble = [](char c) { return c >= '0' && c <= '9' ? c - '0' : (c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1); };
+            img->px.resize(count);
+            img->alpha.resize(count);
+            for (size_t i = 0; i < count; ++i) {
+                int channels[4];
+                for (int j = 0; j < 4; ++j) {
+                    int a = nibble(pixels[i * 8 + j * 2]), b = nibble(pixels[i * 8 + j * 2 + 1]);
+                    if (a < 0 || b < 0) return false;
+                    channels[j] = a * 16 + b;
+                }
+                img->px[i] = V3((float)channels[0], (float)channels[1], (float)channels[2]) / 255.f;
+                img->alpha[i] = (uint8_t)channels[3];
+            }
+            if (std::all_of(img->alpha.begin(), img->alpha.end(), [](uint8_t a) { return a == 255; })) img->alpha.clear();
+            s.embeddedImages.emplace(std::move(key), std::move(img));
         } else if (tok == "object") {
             Object o;
             int t = 0;
@@ -1269,8 +1992,26 @@ bool Scene::load(const std::string& path) {
                 if (o.treePart < 0 || o.treePart > 2 || (o.treePart && o.type != ObjType::Mesh)) return false;
             }
             s.objs.push_back(o);
+        } else if (tok == "parent") {
+            if (ver < 4 || s.objs.empty()) return false;
+            Object& o = s.objs.back();
+            f >> o.parent;
+            rv(f, o.bindOffset);
+            for (auto& row : o.bind.m) for (float& v : row) f >> v;
+            o.hasBind = true;
         } else if (tok == "material") {
             if (s.objs.empty() || !readMat(f, s.objs.back().mat, ver)) return false;
+        } else if (tok == "lightfx") {
+            if (ver < 4 || s.objs.empty() || !isLight(s.objs.back().type)) return false;
+            auto& l = s.objs.back().lighting;
+            int falloff = 0;
+            f >> falloff >> l.range >> l.samples;
+            if (falloff < 0 || falloff >= (int)Falloff::COUNT) return false;
+            l.falloff = (Falloff)falloff;
+            l.range = clampf(l.range, 0.05f, 10000);
+            l.samples = std::clamp(l.samples, 1, 16);
+            rb(f, l.casts); rb(f, l.disk); rb(f, l.enabled); rb(f, l.visible);
+            rs(f, l.gel, ver);
         } else if (tok == "metaball") {
             if (ver < 3 || s.objs.empty() || s.objs.back().type != ObjType::Metaball) return false;
             Object& o = s.objs.back();
@@ -1279,11 +2020,7 @@ bool Scene::load(const std::string& path) {
             if (o.metaRadius < 0.2f || o.metaRadius > 4 || o.metaStrength < 0.1f || o.metaStrength > 4) return false;
         } else if (tok == "picture") {
             if (ver < 3 || s.objs.empty() || s.objs.back().type != ObjType::Picture) return false;
-            Picture& p = s.objs.back().picture;
-            rs(f, p.path, ver); rv(f, p.keyColor);
-            f >> p.aspect >> p.keyTolerance;
-            rb(f, p.billboard); rb(f, p.chroma); rb(f, p.shadows); rb(f, p.reflections);
-            if (p.aspect < 1.f / 16385 || p.aspect > 16385 || p.keyTolerance < 0 || p.keyTolerance > 1) return false;
+            if (!readPicture(f, s.objs.back().picture, ver)) return false;
         } else if (tok == "torus") {
             if (ver < 3 || s.objs.empty() || s.objs.back().type != ObjType::Torus) return false;
             TorusShape& t = s.objs.back().torus;
@@ -1310,7 +2047,30 @@ bool Scene::load(const std::string& path) {
             Key k;
             f >> k.frame;
             rv(f, k.pos); rv(f, k.rot); rv(f, k.scl);
+            if (ver >= 4 && !readEase(f, k.ease)) return false;
             putKey(s.objs.back().keys, k);
+        } else if (tok == "appearance") {
+            if (ver < 4 || s.objs.empty()) return false;
+            AppearanceKey k;
+            f >> k.frame;
+            if (!readEase(f, k.ease)) return false;
+            rb(f, k.hidden);
+            rv(f, k.lightColor);
+            for (float& v : k.light) f >> v;
+            if (!readTerrainShape(f, k.terrain) || !readPicture(f, k.picture, ver) || !readMat(f, k.material, ver)) return false;
+            putKey(s.objs.back().appearances, k);
+        } else if (tok == "terrainshape") {
+            if (ver < 4 || s.objs.empty() || !isHeightfield(s.objs.back().type) || !readTerrainShape(f, s.objs.back().terrain)) return false;
+        } else if (tok == "terrainref" || tok == "meshref") {
+            int i = -1;
+            if (ver < 4 || !(f >> i) || i < 0 || i + 1 >= (int)s.objs.size()) return false;
+            if (tok == "terrainref") {
+                if (!isHeightfield(s.objs.back().type) || !s.objs[i].hf) return false;
+                s.objs.back().hf = s.objs[i].hf;
+            } else {
+                if (s.objs.back().type != ObjType::Mesh || !s.objs[i].mesh) return false;
+                s.objs.back().mesh = s.objs[i].mesh;
+            }
         } else if (tok == "terrain") {
             int res = 0;
             f >> res;
@@ -1340,6 +2100,20 @@ bool Scene::load(const std::string& path) {
         else return false;
         if (!f) return false;
     }
+    std::vector<int> order;
+    if (tok != "end" || !hierarchyOrder(s.objs, order)) return false;
+    if (s.activeCamera < -1 || s.activeCamera >= (int)s.cameras.size()) return false;
+    std::error_code assetError;
+    auto assetRoot = std::filesystem::absolute(path, assetError).parent_path();
+    if (!assetError) sceneAssets(s, [&](std::string& value, auto&) {
+        if (!assetIsFile(value)) return;
+        std::filesystem::path file(value);
+        if (!file.is_relative()) return;
+        std::error_code error;
+        if (ver < 4 && std::filesystem::is_regular_file(file, error)) file = std::filesystem::absolute(file, error);
+        else file = assetRoot / file;
+        value = file.lexically_normal().string();
+    });
     for (Object& o : s.objs) {
         if (isHeightfield(o.type) && !o.hf) { o.hf = std::make_shared<Heightfield>(); hfInit(*o.hf, 129); }
         if (o.treePart) regenTree(o);
@@ -1352,19 +2126,35 @@ bool Scene::load(const std::string& path) {
 bool Scene::merge(const std::string& path) {
     Scene o;
     if (!o.load(path)) return false;
+    append(std::move(o));
+    return true;
+}
+
+void Scene::append(Scene other) {
     int g = maxGroup();
-    for (Object& x : o.objs) {
+    int first = (int)objs.size();
+    for (const auto& entry : other.embeddedImages) {
+        const auto& key = entry.first;
+        const auto& image = entry.second;
+        std::string id = key;
+        for (unsigned i = 2; embeddedImages.count(id) && embeddedImages[id] != image; ++i)
+            id = key + "_" + std::to_string(i);
+        if (id != key) sceneAssets(other, [&](std::string& path, auto&) { if (path == key) path = id; });
+        embeddedImages.emplace(id, image);
+    }
+    for (auto& link : other.booleanLinks) booleanLinks.push_back({link.child + g, link.parent + g, link.mode});
+    for (Object& x : other.objs) {
         if (x.group > 0) x.group += g;
+        if (x.parent >= 0) x.parent += first;
         objs.push_back(std::move(x));
     }
     updateAll();
-    return true;
 }
 
 bool Library::save(const std::string& path) const {
     std::ofstream f(path);
     if (!f) return false;
-    f << std::setprecision(7) << "CANYONLIB 3\n";
+    f << std::setprecision(7) << "CANYONLIB 4\n";
     for (auto& m : mats) { f << "material "; writeMat(f, m); f << "\n"; }
     for (auto& k : skies) { f << "sky "; writeSky(f, k); f << "\n"; }
     return (bool)f;
@@ -1374,7 +2164,7 @@ bool Library::load(const std::string& path) {
     std::ifstream f(path);
     std::string tok;
     int ver = 0;
-    if (!(f >> tok >> ver) || tok != "CANYONLIB" || ver < 2 || ver > 3) return false;
+    if (!(f >> tok >> ver) || tok != "CANYONLIB" || ver < 2 || ver > 4) return false;
     Library l;
     while (f >> tok) {
         if (tok == "material") {
@@ -1390,4 +2180,152 @@ bool Library::load(const std::string& path) {
     }
     *this = std::move(l);
     return true;
+}
+
+namespace {
+
+Mesh contourScene(const Scene& scene, V3 lo, V3 hi, int resolution) {
+    Mesh mesh;
+    float step = maxc(hi - lo) / std::clamp(resolution, 8, 96);
+    if (step <= 1e-6f) return mesh;
+    lo -= V3(step);
+    hi += V3(step);
+    int nx = (int)std::ceil((hi.x - lo.x) / step) + 1;
+    int ny = (int)std::ceil((hi.y - lo.y) / step) + 1;
+    int nz = (int)std::ceil((hi.z - lo.z) / step) + 1;
+    auto index = [=](int x, int y, int z) { return (z * ny + y) * nx + x; };
+    std::vector<uint8_t> inside((size_t)nx * ny * nz);
+    V3 ray = normalize({1, 0.317f, 0.253f});
+    for (int z = 0; z < nz; ++z)
+        for (int y = 0; y < ny; ++y)
+            for (int x = 0; x < nx; ++x) {
+                Hit hit;
+                V3 p = lo + V3((float)x, (float)y, (float)z) * step;
+                inside[index(x, y, z)] = intersectScene(scene, {p, ray}, 1e30f, hit) && dot(hit.n, ray) > 0;
+            }
+    auto edge = [&](V3 a, V3 b) {
+        Hit hit;
+        return intersectScene(scene, {a, normalize(b - a)}, length(b - a) + 1e-5f, hit) ? hit.p : (a + b) * 0.5f;
+    };
+    auto triangle = [&](V3 a, V3 b, V3 c, V3 out) {
+        V3 n = cross(b - a, c - a);
+        if (length(n) <= 1e-10f) return;
+        if (dot(n, out) < 0) std::swap(b, c);
+        auto start = (uint32_t)mesh.v.size();
+        mesh.v.insert(mesh.v.end(), {a, b, c});
+        mesh.tri.insert(mesh.tri.end(), {start, start + 1, start + 2});
+    };
+    const int tetra[][4] = {{0, 1, 3, 7}, {0, 3, 2, 7}, {0, 2, 6, 7}, {0, 6, 4, 7}, {0, 4, 5, 7}, {0, 5, 1, 7}};
+    for (int z = 0; z + 1 < nz; ++z)
+        for (int y = 0; y + 1 < ny; ++y)
+            for (int x = 0; x + 1 < nx; ++x) {
+                V3 p[8];
+                bool in[8];
+                int count = 0;
+                for (int i = 0; i < 8; ++i) {
+                    int a = x + (i & 1), b = y + ((i >> 1) & 1), c = z + (i >> 2);
+                    p[i] = lo + V3((float)a, (float)b, (float)c) * step;
+                    count += in[i] = inside[index(a, b, c)] != 0;
+                }
+                if (!count || count == 8) continue;
+                for (const auto& t : tetra) {
+                    V3 a[4], b[4];
+                    int na = 0, nb = 0;
+                    for (int i : t) {
+                        if (in[i]) a[na++] = p[i];
+                        else b[nb++] = p[i];
+                    }
+                    if (na == 1) triangle(edge(a[0], b[0]), edge(a[0], b[1]), edge(a[0], b[2]), b[0] - a[0]);
+                    else if (nb == 1) triangle(edge(b[0], a[0]), edge(b[0], a[1]), edge(b[0], a[2]), b[0] - a[0]);
+                    else if (na == 2) {
+                        V3 p0 = edge(a[0], b[0]), p1 = edge(a[0], b[1]), p2 = edge(a[1], b[0]), p3 = edge(a[1], b[1]);
+                        triangle(p0, p1, p2, b[0] - a[0]);
+                        triangle(p1, p2, p3, b[0] - a[0]);
+                    }
+                }
+            }
+    return mesh;
+}
+
+Mesh meshSurface(const Object& o) {
+    Mesh m;
+    if (o.type == ObjType::Mesh && o.mesh) {
+        m.v = o.mesh->v;
+        m.tri = o.mesh->tri;
+    } else if (isHeightfield(o.type) && o.hf && o.hf->res > 1) {
+        int n = std::min(o.hf->res, 513);
+        for (int side = 0; side < (o.type == ObjType::Lattice ? 2 : 1); ++side) {
+            uint32_t base = (uint32_t)m.v.size();
+            for (int z = 0; z < n; ++z)
+                for (int x = 0; x < n; ++x)
+                    m.v.push_back({2.f * x / (n - 1) - 1, (side ? -1.f : 1.f) * o.terrainAt(x * (o.hf->res - 1) / (n - 1),
+                        z * (o.hf->res - 1) / (n - 1)), 2.f * z / (n - 1) - 1});
+            for (int z = 0; z + 1 < n; ++z)
+                for (int x = 0; x + 1 < n; ++x) {
+                    uint32_t a = base + z * n + x, b = a + 1, c = a + n, d = c + 1;
+                    if (side) m.tri.insert(m.tri.end(), {a, b, d, a, d, c});
+                    else m.tri.insert(m.tri.end(), {a, d, b, a, c, d});
+                }
+        }
+    } else if (o.type == ObjType::Disc) {
+        m.v.emplace_back();
+        for (int i = 0; i < 48; ++i) {
+            float a = 2 * PI * i / 48;
+            m.v.push_back({std::cos(a), 0, -std::sin(a)});
+        }
+        for (uint32_t i = 0; i < 48; ++i) m.tri.insert(m.tri.end(), {0, i + 1, (i + 1) % 48 + 1});
+    } else if (o.type == ObjType::Square || o.type == ObjType::Picture) {
+        if (o.type == ObjType::Picture) {
+            V3 a = o.picture.halfExtent();
+            m.v = {{-a.x, -a.y, 0}, {a.x, -a.y, 0}, {-a.x, a.y, 0}, {a.x, a.y, 0}};
+        } else {
+            m.v = {{-1, 0, 1}, {1, 0, 1}, {-1, 0, -1}, {1, 0, -1}};
+        }
+        m.tri = {0, 1, 2, 2, 1, 3};
+    }
+    for (V3& p : m.v) p = o.worldPos + o.fwd * p;
+    return m;
+}
+
+}  // namespace
+
+std::vector<MeshLayer> meshSelection(const Scene& scene, const std::vector<int>& indices, int resolution) {
+    std::vector<MeshLayer> parts;
+    std::set<int> done;
+    std::set<int> seen;
+    for (int i : indices) {
+        if (i < 0 || i >= (int)scene.objs.size() || !seen.insert(i).second) continue;
+        const Object& o = scene.objs[i];
+        if (o.hidden || isInfinite(o.type) || isLight(o.type)) continue;
+        Mesh m = o.csg ? Mesh{} : meshSurface(o);
+        std::string name = o.name;
+        if (m.tri.empty()) {
+            std::vector<int> members{i};
+            if (o.csg && o.group > 0) {
+                int id = o.group;
+                for (int level = 0; level < 32; ++level) {
+                    auto link = std::find_if(scene.booleanLinks.begin(), scene.booleanLinks.end(), [=](const BooleanLink& l) { return l.child == id; });
+                    if (link == scene.booleanLinks.end()) break;
+                    id = link->parent;
+                }
+                if (!done.insert(id).second) continue;
+                name = "Boolean " + std::to_string(id);
+                std::set<int> assembly{id};
+                for (size_t level = 0; level < scene.booleanLinks.size(); ++level)
+                    for (auto& link : scene.booleanLinks) if (assembly.count(link.parent)) assembly.insert(link.child);
+                members.clear();
+                for (int k = 0; k < (int)scene.objs.size(); ++k)
+                    if (assembly.count(scene.objs[k].group) && scene.objs[k].csg) members.push_back(k);
+            }
+            Scene sub = scene.subset(members);
+            V3 lo(1e30f), hi(-1e30f), a, b;
+            for (const auto& p : sub.objs) if (worldBounds(p, a, b)) {
+                lo = {std::min(lo.x, a.x), std::min(lo.y, a.y), std::min(lo.z, a.z)};
+                hi = {std::max(hi.x, b.x), std::max(hi.y, b.y), std::max(hi.z, b.z)};
+            }
+            m = contourScene(sub, lo, hi, resolution);
+        }
+        if (!m.tri.empty()) parts.push_back({std::move(name), std::move(m)});
+    }
+    return parts;
 }

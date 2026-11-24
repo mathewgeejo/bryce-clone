@@ -1,4 +1,4 @@
-param([string]$proc = "Canyon3D", [int]$x, [int]$y, [int]$ms = 1500, [int]$hover = 0)
+param([string]$proc = "Brycescape", [int]$x, [int]$y, [int]$ms = 1500, [int]$hover = 0)
 Add-Type @"
 using System; using System.Runtime.InteropServices;
 public class H {
