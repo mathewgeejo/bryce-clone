@@ -1,5 +1,12 @@
 # Implementation log
 
+## Native Linux desktop
+
+- Added a GTK 3 desktop backend for the shared editor on Linux. It handles the canvas, keyboard and mouse input, and native file and color dialogs.
+- Added CMake build and test targets, plus build instructions for Linux Mint, Ubuntu, and Arch Linux.
+- Shared the headless renderer entry point across both platforms. Quoted paths with spaces work in command-line renders and scene exports.
+- Store the Linux material and sky library in the user's XDG config directory.
+
 ## Project name and README
 
 - Named the studio **Two Hoodoos and a Floppy** in the README and desktop window. The README covers setup, editing, rendering, and project checks.

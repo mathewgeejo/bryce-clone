@@ -1,11 +1,9 @@
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
 #define _CRT_SECURE_NO_WARNINGS
-#include <windows.h>
-#include <windowsx.h>
-#include <commdlg.h>
 
 #include <algorithm>
+#include <charconv>
+#include <chrono>
+#include <climits>
 #include <cstdio>
 #include <cstring>
 #include <functional>
@@ -14,16 +12,15 @@
 #include <string>
 #include <vector>
 
+#include "desktop.h"
 #include "render.h"
 #include "scene.h"
 #include "terrain.h"
 
 namespace {
 
-struct R {
-    int x, y, w, h;
-    bool in(int px, int py) const { return px >= x && py >= y && px < x + w && py < y + h; }
-};
+using namespace desktop;
+using R = Rect;
 
 const int TOP = 98, LEFT = 170, RIGHT = 236, STATUS = 24, TIMELINE = 34;
 const int NANO_W = 150, NANO_H = 112, ICW = 48, ICH = 32, STW = 64, STH = 40;
@@ -33,12 +30,9 @@ const ObjType kCreate[] = {ObjType::Sphere, ObjType::Cube,    ObjType::Cylinder,
                            ObjType::Disc,   ObjType::Square,  ObjType::Stone,    ObjType::Terrain, ObjType::Lattice, ObjType::Ground,
                            ObjType::Water,  ObjType::Cloud,   ObjType::Light,    ObjType::Spotlight, ObjType::Parallel, ObjType::Metaball};
 
-HWND gWnd;
 int gW = 1440, gH = 900;
-HDC gDC;
-HBITMAP gBmp;
 uint32_t* gBits;
-HFONT gFont, gSmall, gBold, gTitle;
+constexpr Font gFont = Font::Regular, gSmall = Font::Small, gBold = Font::Bold, gTitle = Font::Title;
 
 struct Input {
     int mx = 0, my = 0, dx = 0, dy = 0;
@@ -46,6 +40,7 @@ struct Input {
 } gIn;
 int gActive = 0, gIdc = 0;
 bool gBlocked = false, gModal = false;
+bool gResizeHovered = false;
 std::vector<std::function<void()>> gDeferred;
 
 Scene gScene;
@@ -56,7 +51,7 @@ Renderer gMainR, gNanoR, gLabR;
 enum Lab { LabNone, LabMat, LabSky, LabTerrain, LabTree, LabRender, LabTools, LabExamples, LabObject, LabAttributes } gLab = LabNone;
 Scene gLabBackup;
 bool gLabChanged = false, gNanoDirty = true, gLabDirty = false, gMainWasBusy = false;
-DWORD gLastChange = 0, gRenderStart = 0;
+uint64_t gLastChange = 0, gRenderStart = 0;
 std::string gStatus = "Open Examples or add objects from the Create palette, then press Render.", gPath;
 V3 gOrthoC[4];
 float gOrthoS[4] = {40, 40, 40, 40};
@@ -69,7 +64,7 @@ BrushMode gBrush = BrushMode::Raise;
 enum Drag { DragNone, DragObj, DragCam, DragSculpt, DragLightAim } gDrag = DragNone;
 const int TOOL_SCULPT = 3;
 struct SculptHit { int obj = -1; float u = 0, v = 0; } gSculptHover, gSculpt;
-DWORD gSculptLast = 0;
+uint64_t gSculptLast = 0;
 bool gRDrag = false, gMDrag = false;
 std::vector<uint32_t> gIcons[(int)ObjType::COUNT], gTreeIcon;
 std::vector<std::vector<uint32_t>> gSkyThumbs;
@@ -86,80 +81,46 @@ std::string gLibPath;
 TreeParams gTreeP;
 bool gPlaying = false, gAutoKey = false, gAnimRender = false;
 int gAnimFrame = -1;
-DWORD gPlayLast = 0;
+uint64_t gPlayLast = 0;
 std::string gAnimBase;
 float gRepCount = 3, gRepScale = 1, gRandPos = 4, gRandRot = 45, gRandSize = 0.3f;
 V3 gRepOff{3, 0, 0}, gRepRot{0, 0, 0};
 
 // ---------------------------------------------------------------- drawing primitives
 
-COLORREF rgb(int r, int g, int b) { return RGB(r, g, b); }
-const COLORREF TXT = RGB(232, 232, 236), TXT_DIM = RGB(190, 194, 204);
+constexpr Color TXT = rgb(232, 232, 236), TXT_DIM = rgb(190, 194, 204);
 
-void resizeCanvas(int w, int h) {
-    gW = std::max(w, 1); gH = std::max(h, 1);
-    if (!gDC) { HDC s = GetDC(gWnd); gDC = CreateCompatibleDC(s); ReleaseDC(gWnd, s); }
-    BITMAPINFO bi{};
-    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth = gW;
-    bi.bmiHeader.biHeight = -gH;
-    bi.bmiHeader.biPlanes = 1;
-    bi.bmiHeader.biBitCount = 32;
-    void* p = nullptr;
-    HBITMAP b = CreateDIBSection(gDC, &bi, DIB_RGB_COLORS, &p, nullptr, 0);
-    SelectObject(gDC, b);
-    if (gBmp) DeleteObject(gBmp);
-    gBmp = b;
-    gBits = (uint32_t*)p;
-    SetBkMode(gDC, TRANSPARENT);
+uint64_t nowMs() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
-void fill(R r, COLORREF c) {
-    SetDCBrushColor(gDC, c);
-    RECT rc{r.x, r.y, r.x + r.w, r.y + r.h};
-    FillRect(gDC, &rc, (HBRUSH)GetStockObject(DC_BRUSH));
-}
-
-void vgrad(R r, COLORREF a, COLORREF b) {
-    GdiFlush();
+void vgrad(R r, Color a, Color b) {
+    beginPixelWrite();
     int x0 = std::max(r.x, 0), x1 = std::min(r.x + r.w, gW), y0 = std::max(r.y, 0), y1 = std::min(r.y + r.h, gH);
     for (int y = y0; y < y1; y++) {
         float t = (y - r.y) / (float)std::max(1, r.h - 1);
-        uint32_t v = ((uint32_t)lerpf(GetRValue(a), GetRValue(b), t) << 16) | ((uint32_t)lerpf(GetGValue(a), GetGValue(b), t) << 8) |
-                     (uint32_t)lerpf(GetBValue(a), GetBValue(b), t);
+        uint32_t v = ((uint32_t)lerpf(red(a), red(b), t) << 16) | ((uint32_t)lerpf(green(a), green(b), t) << 8) |
+                     (uint32_t)lerpf(blue(a), blue(b), t);
         std::fill(gBits + (size_t)y * gW + x0, gBits + (size_t)y * gW + std::max(x0, x1), v);
     }
 }
 
-void line(int x0, int y0, int x1, int y1, COLORREF c) {
-    SelectObject(gDC, GetStockObject(DC_PEN));
-    SetDCPenColor(gDC, c);
-    MoveToEx(gDC, x0, y0, nullptr);
-    LineTo(gDC, x1, y1);
-}
-
 void bevel(R r, bool sunken) {
-    COLORREF hi = rgb(160, 160, 168), lo = rgb(34, 34, 38);
+    Color hi = rgb(160, 160, 168), lo = rgb(34, 34, 38);
     if (sunken) std::swap(hi, lo);
     line(r.x, r.y + r.h - 1, r.x, r.y, hi);
-    LineTo(gDC, r.x + r.w - 1, r.y);
+    line(r.x, r.y, r.x + r.w - 1, r.y, hi);
     line(r.x + r.w - 1, r.y, r.x + r.w - 1, r.y + r.h - 1, lo);
-    LineTo(gDC, r.x - 1, r.y + r.h - 1);
+    line(r.x + r.w - 1, r.y + r.h - 1, r.x - 1, r.y + r.h - 1, lo);
 }
 
-void textIn(R r, const char* s, COLORREF c, HFONT f, UINT fmt = DT_CENTER | DT_VCENTER | DT_SINGLELINE) {
-    SelectObject(gDC, f);
-    SetTextColor(gDC, c);
-    RECT rc{r.x, r.y, r.x + r.w, r.y + r.h};
-    DrawTextA(gDC, s, -1, &rc, fmt | DT_NOPREFIX | DT_END_ELLIPSIS);
-}
-
-void label(int x, int y, const char* s, int w = 400) { textIn({x, y, w, 16}, s, TXT_DIM, gBold, DT_LEFT | DT_VCENTER | DT_SINGLELINE); }
-void note(R r, const char* s) { textIn(r, s, TXT_DIM, gSmall, DT_LEFT | DT_WORDBREAK); }
+void label(int x, int y, const char* s, int w = 400) { textIn({x, y, w, 16}, s, TXT_DIM, gBold, TextLeft | TextMiddle); }
+void note(R r, const char* s) { textIn(r, s, TXT_DIM, gSmall, TextLeft | TextWrap); }
 
 void blit(R d, const uint32_t* src, int sw, int sh) {
     if (d.w <= 0 || d.h <= 0 || sw <= 0 || sh <= 0) return;
-    GdiFlush();
+    beginPixelWrite();
     int x0 = std::max(d.x, 0), x1 = std::min(d.x + d.w, gW), y0 = std::max(d.y, 0), y1 = std::min(d.y + d.h, gH);
     for (int y = y0; y < y1; y++) {
         const uint32_t* row = src + (size_t)((y - d.y) * sh / d.h) * sw;
@@ -178,7 +139,7 @@ void blitFit(const Renderer& r, R area) {
 }
 
 void shadedBall(int cx, int cy, int r, V3 base, bool hot) {
-    GdiFlush();
+    beginPixelWrite();
     V3 L = normalize(V3(-0.5f, 0.6f, 0.6f));
     for (int y = -r; y <= r; y++)
         for (int x = -r; x <= r; x++) {
@@ -193,7 +154,7 @@ void shadedBall(int cx, int cy, int r, V3 base, bool hot) {
 }
 
 void dimAll() {
-    GdiFlush();
+    beginPixelWrite();
     for (size_t i = 0, n = (size_t)gW * gH; i < n; i++) gBits[i] = (gBits[i] >> 1) & 0x7F7F7F;
 }
 
@@ -207,7 +168,7 @@ void press(R r, int id) {
 }
 bool clicked(R r, int id) { return gActive == id && gIn.released && hov(r); }
 
-bool button(R r, const char* text, bool on = false, HFONT f = nullptr) {
+bool button(R r, const char* text, bool on = false, Font f = gFont) {
     int id = newId();
     press(r, id);
     bool h = hov(r), act = gActive == id && h;
@@ -216,7 +177,7 @@ bool button(R r, const char* text, bool on = false, HFONT f = nullptr) {
     else if (h) vgrad(r, rgb(140, 140, 148), rgb(96, 96, 104));
     else vgrad(r, rgb(114, 114, 120), rgb(78, 78, 84));
     bevel(r, act);
-    textIn(r, text, on ? rgb(255, 255, 255) : TXT, f ? f : gFont);
+    textIn(r, text, on ? rgb(255, 255, 255) : TXT, f);
     return clicked(r, id);
 }
 
@@ -257,8 +218,8 @@ bool slider(R r, const char* text, float& v, float lo, float hi, const char* fmt
     if (fw > 0) vgrad({r.x + 2, r.y + 2, fw, r.h - 4}, hov(r) || gActive == id ? rgb(130, 150, 200) : rgb(108, 126, 172), rgb(64, 78, 118));
     char buf[64];
     snprintf(buf, sizeof buf, fmt, v);
-    textIn({r.x + 6, r.y, r.w - 12, r.h}, text, TXT, gFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    textIn({r.x + 6, r.y, r.w - 12, r.h}, buf, TXT, gFont, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+    textIn({r.x + 6, r.y, r.w - 12, r.h}, text, TXT, gFont, TextLeft | TextMiddle);
+    textIn({r.x + 6, r.y, r.w - 12, r.h}, buf, TXT, gFont, TextRight | TextMiddle);
     return ch;
 }
 
@@ -280,9 +241,9 @@ bool dragF(R r, const char* text, float& v, float speed, float minV = -1e9f, flo
     bevel(r, true);
     char buf[32];
     snprintf(buf, sizeof buf, fmt ? fmt : (std::fabs(speed) >= 1 ? "%.0f" : "%.2f"), v);
-    textIn({r.x + 4, r.y, r.w - 8, r.h}, text, TXT_DIM, gSmall, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    textIn({r.x + 4, r.y, r.w - 8, r.h}, buf, TXT, gSmall, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-    if (hov(r)) SetCursor(LoadCursor(nullptr, IDC_SIZEWE));
+    textIn({r.x + 4, r.y, r.w - 8, r.h}, text, TXT_DIM, gSmall, TextLeft | TextMiddle);
+    textIn({r.x + 4, r.y, r.w - 8, r.h}, buf, TXT, gSmall, TextRight | TextMiddle);
+    if (hov(r)) gResizeHovered = true;
     return ch;
 }
 
@@ -301,26 +262,25 @@ bool dragI(R r, const char* text, int& v, float speed, int lo, int hi) {
 void sceneChanged() {
     gScene.updateAll();
     gNanoDirty = true;
-    gLastChange = GetTickCount();
+    gLastChange = nowMs();
     gChanged = true;
     if (gLab != LabNone) { gLabDirty = true; gLabChanged = true; }
 }
 
-bool pickColor(V3& c) {
-    static COLORREF cust[16];
-    CHOOSECOLORA cc{};
-    cc.lStructSize = sizeof(cc);
-    cc.hwndOwner = gWnd;
-    cc.rgbResult = RGB((int)(clampf(c.x, 0, 1) * 255), (int)(clampf(c.y, 0, 1) * 255), (int)(clampf(c.z, 0, 1) * 255));
-    cc.lpCustColors = cust;
-    cc.Flags = CC_FULLOPEN | CC_RGBINIT;
-    gModal = true;
-    BOOL ok = ChooseColorA(&cc);
+void finishDialog() {
     gModal = false;
-    gIn.down = false;
+    gIn.down = gRDrag = gMDrag = false;
     gActive = 0;
-    if (ok) c = V3(GetRValue(cc.rgbResult) / 255.f, GetGValue(cc.rgbResult) / 255.f, GetBValue(cc.rgbResult) / 255.f);
-    return ok != 0;
+    capturePointer(false);
+}
+
+bool pickColor(V3& c) {
+    Color color = rgb((int)(clampf(c.x, 0, 1) * 255), (int)(clampf(c.y, 0, 1) * 255), (int)(clampf(c.z, 0, 1) * 255));
+    gModal = true;
+    bool ok = chooseColor(color);
+    finishDialog();
+    if (ok) c = V3(red(color) / 255.f, green(color) / 255.f, blue(color) / 255.f);
+    return ok;
 }
 
 void swatch(R r, const char* text, V3& c) {
@@ -329,23 +289,14 @@ void swatch(R r, const char* text, V3& c) {
     bool h = hov(r);
     vgrad(r, h ? rgb(130, 130, 138) : rgb(108, 108, 114), rgb(74, 74, 80));
     bevel(r, gActive == id && h);
-    textIn({r.x + 6, r.y, r.w - 60, r.h}, text, TXT, gFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    textIn({r.x + 6, r.y, r.w - 60, r.h}, text, TXT, gFont, TextLeft | TextMiddle);
     R sw{r.x + r.w - 52, r.y + 3, 46, r.h - 6};
-    fill(sw, RGB((int)(clampf(c.x, 0, 1) * 255), (int)(clampf(c.y, 0, 1) * 255), (int)(clampf(c.z, 0, 1) * 255)));
+    fill(sw, rgb((int)(clampf(c.x, 0, 1) * 255), (int)(clampf(c.y, 0, 1) * 255), (int)(clampf(c.z, 0, 1) * 255)));
     bevel(sw, true);
     if (clicked(r, id)) {
         V3* pc = &c;
         defer([pc] { if (pickColor(*pc)) sceneChanged(); });
     }
-}
-
-int modalBox(const char* text, UINT flags) {
-    gModal = true;
-    int r = MessageBoxA(gWnd, text, APP_NAME, flags);
-    gModal = false;
-    gIn.down = false;
-    gActive = 0;
-    return r;
 }
 
 // ---------------------------------------------------------------- selection & undo
@@ -629,22 +580,10 @@ void setBoolMode(BoolMode b) {
 }
 
 bool fileDialog(bool save, const char* filter, const char* ext, std::string& out) {
-    char buf[MAX_PATH] = "";
-    OPENFILENAMEA ofn{};
-    ofn.lStructSize = sizeof(ofn);
-    ofn.hwndOwner = gWnd;
-    ofn.lpstrFilter = filter;
-    ofn.lpstrFile = buf;
-    ofn.nMaxFile = MAX_PATH;
-    ofn.lpstrDefExt = ext;
-    ofn.Flags = save ? (OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST) : (OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST);
     gModal = true;
-    BOOL ok = save ? GetSaveFileNameA(&ofn) : GetOpenFileNameA(&ofn);
-    gModal = false;
-    gIn.down = false;
-    gActive = 0;
-    if (ok) out = buf;
-    return ok != 0;
+    bool ok = chooseFile(save, filter, ext, out);
+    finishDialog();
+    return ok;
 }
 
 const char* SCENE_FILTER = "Landscape Scene (*.c3d)\0*.c3d\0All Files (*.*)\0*.*\0";
@@ -694,7 +633,13 @@ void actCreatePicture() {
     addObject(std::move(o));
 }
 
-bool confirmDiscard() { return !gDirty || modalBox("Discard unsaved changes to the current scene?", MB_YESNO | MB_ICONQUESTION) == IDYES; }
+bool confirmDiscard() {
+    if (!gDirty) return true;
+    gModal = true;
+    bool discard = confirm("Discard unsaved changes to the current scene?");
+    finishDialog();
+    return discard;
+}
 
 void actNew() {
     if (!confirmDiscard()) return;
@@ -790,7 +735,7 @@ void actRender() {
     }
     gView = 0;
     gShowRender = true;
-    gRenderStart = GetTickCount();
+    gRenderStart = nowMs();
     int w, h;
     renderSize(w, h);
     gMainR.start(gScene, w, h);
@@ -810,7 +755,7 @@ void actRenderAnim() {
     gPlaying = false;
     gView = 0;
     gShowRender = true;
-    gRenderStart = GetTickCount();
+    gRenderStart = nowMs();
 }
 
 void setFrame(int f) {
@@ -970,7 +915,7 @@ void drawTop() {
     const char* tabs[3] = {"Create", "Edit", "Sky & Fog"};
     for (int i = 0; i < 3; i++)
         if (button({10 + i * 96, 4, 92, 22}, tabs[i], gTab == i, gBold)) gTab = i;
-    textIn({310, 4, 260, 22}, APP_NAME, rgb(240, 240, 245), gTitle, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    textIn({310, 4, 260, 22}, APP_NAME, rgb(240, 240, 245), gTitle, TextLeft | TextMiddle);
     const char* fb[6] = {"New", "Open...", "Merge...", "Save", "Save As...", "Examples..."};
     int fx = gW - 6 * 76 - 6;
     for (int i = 0; i < 6; i++)
@@ -1016,18 +961,18 @@ void drawTop() {
             x += b.w + 4;
         }
         if (gTool == TOOL_SCULPT) {
-            textIn({10, 64, 60, 24}, "Brush:", TXT_DIM, gSmall, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            textIn({10, 64, 60, 24}, "Brush:", TXT_DIM, gSmall, TextLeft | TextMiddle);
             int bx = 56;
             for (int i = 0; i < (int)BrushMode::COUNT; i++, bx += 70)
                 if (button({bx, 64, 66, 24}, brushName((BrushMode)i), gBrush == (BrushMode)i, gSmall)) gBrush = (BrushMode)i;
             slider({bx + 6, 64, 190, 24}, "Size", gBrushSize, 0.01f, 0.3f, "%.2f", true);
             slider({bx + 202, 64, 190, 24}, "Strength", gBrushStr, 0.05f, 1);
-            textIn({bx + 400, 64, gW - bx - 410, 24}, "Hold to build up  |  Ctrl invert  |  Shift smooth", TXT_DIM, gSmall, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            textIn({bx + 400, 64, gW - bx - 410, 24}, "Hold to build up  |  Ctrl invert  |  Shift smooth", TXT_DIM, gSmall, TextLeft | TextMiddle);
             return;
         }
         auto cats = categories(false);
         gQuickCat = (gQuickCat + (int)cats.size()) % (int)cats.size();
-        textIn({10, 64, 100, 24}, "Quick materials:", TXT_DIM, gSmall, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        textIn({10, 64, 100, 24}, "Quick materials:", TXT_DIM, gSmall, TextLeft | TextMiddle);
         if (button({112, 64, 22, 24}, "<")) gQuickCat--;
         textIn({136, 64, 92, 24}, cats[gQuickCat].c_str(), rgb(255, 255, 255), gBold);
         if (button({230, 64, 22, 24}, ">")) gQuickCat++;
@@ -1176,9 +1121,9 @@ void drawRight() {
         if (isSel(idx)) fill(row, idx == gSel ? rgb(92, 108, 156) : rgb(72, 84, 120));
         else if (hov(row)) fill(row, rgb(60, 60, 70));
         std::string nm = (o.group ? "[" + std::to_string(o.group) + "] " : "") + o.name;
-        textIn({row.x + 6, row.y, row.w - 74, row.h}, nm.c_str(), o.hidden ? TXT_DIM : TXT, gFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        textIn({row.x + 6, row.y, row.w - 74, row.h}, nm.c_str(), o.hidden ? TXT_DIM : TXT, gFont, TextLeft | TextMiddle);
         std::string tn = std::string(o.hidden ? "hidden " : "") + (o.boolMode != BoolMode::Neutral ? boolName(o.boolMode) : objTypeName(o.type));
-        textIn({row.x, row.y, row.w - 6, row.h}, tn.c_str(), TXT_DIM, gSmall, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        textIn({row.x, row.y, row.w - 6, row.h}, tn.c_str(), TXT_DIM, gSmall, TextRight | TextMiddle);
         int id = newId();
         press(row, id);
         if (gActive == id && gIn.pressed) selectObj(idx, gIn.shift, gIn.alt || gIn.ctrl);
@@ -1189,7 +1134,7 @@ void drawRight() {
         if (gSelSet.size() > 1) {
             char b[64];
             snprintf(b, sizeof b, "%d objects selected", (int)gSelSet.size());
-            textIn({x, y, w, 16}, b, TXT_DIM, gSmall, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            textIn({x, y, w, 16}, b, TXT_DIM, gSmall, TextLeft | TextMiddle);
             y += 16;
         }
         int id = newId();
@@ -1199,7 +1144,7 @@ void drawRight() {
         fill(nr, editing ? rgb(28, 28, 34) : (hov(nr) ? rgb(70, 70, 80) : rgb(56, 56, 64)));
         bevel(nr, true);
         std::string shown = editing ? gEditBuf + "|" : o.name;
-        textIn({nr.x + 6, nr.y, nr.w - 12, nr.h}, shown.c_str(), rgb(255, 255, 255), gBold, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        textIn({nr.x + 6, nr.y, nr.w - 12, nr.h}, shown.c_str(), rgb(255, 255, 255), gBold, TextLeft | TextMiddle);
         if (gActive == id && gIn.pressed && !editing) { gEditObj = gSel; gEditBuf = o.name; }
         y += 28;
         row3(x, y, w, "Position", o.pos, 0.05f);
@@ -1207,7 +1152,7 @@ void drawRight() {
         if (!isLight(o.type)) {
             row3(x, y, w, "Size", o.scl, 0.02f, 0.01f);
             label(x, y, "Material");
-            textIn({x + 66, y, w - 66, 16}, o.mat.name.c_str(), TXT, gFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            textIn({x + 66, y, w - 66, 16}, o.mat.name.c_str(), TXT, gFont, TextLeft | TextMiddle);
             y += 20;
             int bw = (w - 4) / 2;
             Lab editor = objectEditor(o);
@@ -1231,7 +1176,7 @@ void drawRight() {
         }
         int tw = (w - 8) / 3;
         std::string gl = o.group ? "Group " + std::to_string(o.group) : "No group";
-        textIn({x, y, tw, 22}, gl.c_str(), TXT_DIM, gSmall, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        textIn({x, y, tw, 22}, gl.c_str(), TXT_DIM, gSmall, TextLeft | TextMiddle);
         bool hid = o.hidden, lock = o.locked;
         if (toggle({x + tw + 4, y, tw, 22}, "Hidden", hid)) { for (int i : gSelSet) gScene.objs[i].hidden = hid; sceneChanged(); }
         if (toggle({x + 2 * (tw + 4), y, tw, 22}, "Locked", lock)) { for (int i : gSelSet) gScene.objs[i].locked = lock; gChanged = true; }
@@ -1241,7 +1186,7 @@ void drawRight() {
         if (button({x + 2 * (tw + 4), y, tw, 24}, "Delete")) actDelete();
     } else {
         Camera& c = gScene.cam;
-        textIn({x, y, w, 20}, "Camera", rgb(255, 255, 255), gTitle, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        textIn({x, y, w, 20}, "Camera", rgb(255, 255, 255), gTitle, TextLeft | TextMiddle);
         y += 26;
         if (slider({x, y, w, 22}, "Field of View", c.fov, 15, 120, "%.0f")) sceneChanged();
         y += 28;
@@ -1367,8 +1312,8 @@ void drawViewport() {
         vgrad(vp, rgb(84, 86, 92), rgb(132, 134, 140));
         ViewBasis vb = curBasis();
         float hh = vp.h * 0.5f, cx = vp.x + vp.w * 0.5f, cy = vp.y + hh;
-        IntersectClipRect(gDC, vp.x, vp.y, vp.x + vp.w, vp.y + vp.h);
-        SelectObject(gDC, GetStockObject(DC_PEN));
+        setClip(vp);
+        Color pen = rgb(112, 114, 122);
         auto seg = [&](V3 a, V3 b) {
             V3 ca = vb.toCam(a), cb = vb.toCam(b);
             if (!vb.ortho) {
@@ -1385,22 +1330,20 @@ void drawViewport() {
             int x0, y0, x1, y1;
             P(ca, x0, y0);
             P(cb, x1, y1);
-            MoveToEx(gDC, x0, y0, nullptr);
-            LineTo(gDC, x1, y1);
+            line(x0, y0, x1, y1, pen);
         };
-        SetDCPenColor(gDC, rgb(112, 114, 122));
         for (int k = -10; k <= 10; k++) { seg(V3(k * 5.f, 0, -50), V3(k * 5.f, 0, 50)); seg(V3(-50, 0, k * 5.f), V3(50, 0, k * 5.f)); }
         std::vector<V3> s;
         auto drawObj = [&](int i) {
             const Object& o = gScene.objs[i];
             bool sel = isSel(i);
-            COLORREF c = isInfinite(o.type) ? rgb(58, 78, 122) : rgb(24, 42, 140);
+            Color c = isInfinite(o.type) ? rgb(58, 78, 122) : rgb(24, 42, 140);
             if (isLight(o.type)) c = sel ? rgb(255, 140, 0) : rgb(240, 220, 60);
             else if (sel) c = i == gSel ? rgb(225, 28, 28) : rgb(235, 90, 70);
             else if (o.boolMode == BoolMode::Negative || (o.type == ObjType::Metaball && o.metaNegative)) c = rgb(20, 110, 40);
             else if (o.boolMode == BoolMode::Intersect) c = rgb(120, 40, 140);
             else if (o.locked) c = rgb(70, 70, 76);
-            SetDCPenColor(gDC, c);
+            pen = c;
             s.clear();
             wireframe(o, s);
             for (size_t j = 0; j + 1 < s.size(); j += 2) seg(s[j], s[j + 1]);
@@ -1418,7 +1361,7 @@ void drawViewport() {
                 if (d > 0.1f) {
                     int x = (int)clampf(cx + c.x / (d * vb.k) * hh, -30000, 30000);
                     int y = (int)clampf(cy - c.y / (d * vb.k) * hh, -30000, 30000);
-                    SetDCPenColor(gDC, rgb(255, 218, 120));
+                    pen = rgb(255, 218, 120);
                     seg(selected.pos, tip);
                     if (vp.in(x, y) && vp.w >= 38 && vp.h >= 20) {
                         aim = {std::clamp(x - 19, vp.x, vp.x + vp.w - 38), std::clamp(y - 10, vp.y, vp.y + vp.h - 20), 38, 20};
@@ -1437,7 +1380,7 @@ void drawViewport() {
             float depth = vb.ortho ? 1.f : c.z;
             if (depth > 0.1f) {
                 V3 corner[8];
-                SetDCPenColor(gDC, rgb(255, 218, 120));
+                pen = rgb(255, 218, 120);
                 if (bounded) {
                     for (int i = 0; i < 8; i++) corner[i] = {(i & 1) ? hi.x : lo.x, (i & 2) ? hi.y : lo.y, (i & 4) ? hi.z : lo.z};
                     for (int i = 0; i < 8; i++)
@@ -1496,7 +1439,7 @@ void drawViewport() {
                     return lerpf(lerpf(f.at(ix, iz), f.at(ix + 1, iz), fx), lerpf(f.at(ix, iz + 1), f.at(ix + 1, iz + 1), fx), fz);
                 };
                 BrushMode bm = sculptMode();
-                SetDCPenColor(gDC, bm == BrushMode::Lower ? rgb(80, 200, 255) : (bm == BrushMode::Smooth ? rgb(140, 255, 140) : rgb(255, 150, 30)));
+                pen = bm == BrushMode::Lower ? rgb(80, 200, 255) : (bm == BrushMode::Smooth ? rgb(140, 255, 140) : rgb(255, 150, 30));
                 float cxl = gSculptHover.u * 2 - 1, czl = gSculptHover.v * 2 - 1;
                 for (float rr : {1.f, 0.5f}) {
                     float R2 = gBrushSize * 2 * rr;
@@ -1512,12 +1455,12 @@ void drawViewport() {
                 seg(c0, c0 + up * (o.scl.y * 0.25f + 0.5f));
             }
         }
-        SelectClipRgn(gDC, nullptr);
+        clearClip();
         const char* vn[4] = {"Camera View", "Top View", "Front View", "Side View"};
         const char* tn[4] = {"Move", "Rotate", "Resize", "Sculpt Terrain"};
         char buf[160];
         snprintf(buf, sizeof buf, "%s   |   Tool: %s   |   Frame %d", vn[gView], tn[gTool], gScene.frame);
-        textIn({vp.x + 10, vp.y + 6, vp.w - 20, 18}, buf, rgb(240, 240, 245), gBold, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        textIn({vp.x + 10, vp.y + 6, vp.w - 20, 18}, buf, rgb(240, 240, 245), gBold, TextLeft | TextMiddle);
     }
     line(vp.x, vp.y, vp.x + vp.w, vp.y, rgb(28, 28, 32));
 
@@ -1529,7 +1472,7 @@ void drawViewport() {
             if (!isSel(sh.obj) || gSel != sh.obj) selectObj(sh.obj, false);
             gSculpt = sh;
             gDrag = DragSculpt;
-            gSculptLast = GetTickCount();
+            gSculptLast = nowMs();
             sculptStep();
             gStatus = "Sculpting " + gScene.objs[sh.obj].name + ": hold to build up, Ctrl inverts, Shift smooths, [ ] resize brush.";
         } else {
@@ -1545,7 +1488,7 @@ void drawViewport() {
     if (gActive == VIEW_ID && gIn.down && gDrag == DragSculpt && (gIn.dx || gIn.dy)) {
         SculptHit sh = sculptPick(gIn.mx, gIn.my);
         if (sh.obj == gSculpt.obj) gSculpt = sh;
-        DWORD now = GetTickCount();
+        uint64_t now = nowMs();
         if (now - gSculptLast >= 30) { gSculptLast = now; sculptStep(); }
     } else if (gActive == VIEW_ID && gIn.down && (gIn.dx || gIn.dy)) {
         if (gDrag == DragObj && validSel()) dragObject();
@@ -1564,7 +1507,7 @@ void drawTimeline() {
     int y = tl.y + 5, x = 8, last = gScene.frames - 1;
     if (button({x, y, 28, 24}, "|<")) setFrame(0);
     if (button({x + 30, y, 28, 24}, "<")) jumpKey(-1);
-    if (button({x + 60, y, 50, 24}, gPlaying ? "Stop" : "Play", gPlaying)) { gPlaying = !gPlaying; gPlayLast = GetTickCount(); }
+    if (button({x + 60, y, 50, 24}, gPlaying ? "Stop" : "Play", gPlaying)) { gPlaying = !gPlaying; gPlayLast = nowMs(); }
     if (button({x + 112, y, 28, 24}, ">")) jumpKey(1);
     if (button({x + 142, y, 28, 24}, ">|")) setFrame(last);
     int rx = gW - 600;
@@ -1599,7 +1542,7 @@ void drawStatus() {
     R sb{0, gH - STATUS, gW, STATUS};
     vgrad(sb, rgb(70, 70, 76), rgb(44, 44, 48));
     line(0, sb.y, gW, sb.y, rgb(28, 28, 32));
-    textIn({10, sb.y, gW - 360, sb.h}, gStatus.c_str(), TXT, gFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    textIn({10, sb.y, gW - 360, sb.h}, gStatus.c_str(), TXT, gFont, TextLeft | TextMiddle);
     if (gMainR.busy() || gAnimRender) {
         R pb{gW - 330, sb.y + 5, 320, 14};
         fill(pb, rgb(30, 30, 34));
@@ -1609,7 +1552,7 @@ void drawStatus() {
         else snprintf(buf, sizeof buf, "Rendering %d%%", (int)(gMainR.progress() * 100));
         textIn(pb, buf, rgb(255, 255, 255), gSmall);
     } else
-        textIn({gW - 600, sb.y, 590, sb.h}, "Shift+click multi-select   RMB orbit   MMB pan   Wheel zoom   Ctrl+Z undo   Ctrl+R render", TXT_DIM, gSmall, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        textIn({gW - 600, sb.y, 590, sb.h}, "Shift+click multi-select   RMB orbit   MMB pan   Wheel zoom   Ctrl+Z undo   Ctrl+R render", TXT_DIM, gSmall, TextRight | TextMiddle);
 }
 
 // ---------------------------------------------------------------- labs
@@ -1620,7 +1563,7 @@ R panel(int w, int h, const std::string& title) {
     bevel(P, false);
     R t{P.x + 2, P.y + 2, P.w - 4, 30};
     vgrad(t, rgb(74, 86, 126), rgb(44, 52, 82));
-    textIn({t.x + 12, t.y, t.w - 24, t.h}, title.c_str(), rgb(255, 255, 255), gTitle, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    textIn({t.x + 12, t.y, t.w - 24, t.h}, title.c_str(), rgb(255, 255, 255), gTitle, TextLeft | TextMiddle);
     return P;
 }
 
@@ -1648,7 +1591,7 @@ void drawObjectLab() {
         if (button({x, y, 288, 24}, "Replace BMP..."))
             defer([sel] { if (loadPicture(gScene.objs[sel].picture)) sceneChanged(); });
         std::string filename = picture.image ? baseName(picture.path) : "Missing image: " + baseName(picture.path);
-        textIn({x, y + 28, 288, 18}, filename.c_str(), TXT_DIM, gSmall, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        textIn({x, y + 28, 288, 18}, filename.c_str(), TXT_DIM, gSmall, TextLeft | TextMiddle);
         ch |= toggle({x, y + 52, 142, 24}, "Face Camera", picture.billboard);
         ch |= toggle({x + 146, y + 52, 142, 24}, "Chroma Cutout", picture.chroma);
         ch |= toggle({x, y + 82, 142, 24}, "Cast Shadows", picture.shadows);
@@ -1919,7 +1862,7 @@ void drawMatLab() {
         });
     }
     y += 28;
-    textIn({x2, y, 224, 18}, m.image.empty() ? "(no picture loaded)" : baseName(m.image).c_str(), TXT_DIM, gSmall, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    textIn({x2, y, 224, 18}, m.image.empty() ? "(no picture loaded)" : baseName(m.image).c_str(), TXT_DIM, gSmall, TextLeft | TextMiddle);
     int x3 = P.x + 504, sw = 200;
     y = P.y + 46;
     label(x3, y, "Channels");
@@ -2040,10 +1983,7 @@ void drawTerrainLab() {
     press(hm, id);
     if (hov(hm)) {
         int rp = (int)(gBrushSize * hm.w);
-        SelectObject(gDC, GetStockObject(HOLLOW_BRUSH));
-        SelectObject(gDC, GetStockObject(DC_PEN));
-        SetDCPenColor(gDC, rgb(255, 80, 60));
-        Ellipse(gDC, gIn.mx - rp, gIn.my - rp, gIn.mx + rp, gIn.my + rp);
+        circle(gIn.mx, gIn.my, rp, rgb(255, 80, 60));
     }
     if (gActive == id && gIn.down) {
         BrushMode bm = gBrush;
@@ -2320,7 +2260,7 @@ void drawExamplesLab() {
             closeLab(true);
             defer([n] { loadExample(n); });
         }
-        textIn({P.x + 214, y, P.w - 234, 28}, exampleDescriptions()[i].c_str(), TXT, gFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        textIn({P.x + 214, y, P.w - 234, 28}, exampleDescriptions()[i].c_str(), TXT, gFont, TextLeft | TextMiddle);
         y += 32;
     }
     note({P.x + 20, y + 6, P.w - 40, 40}, "Loading an example replaces the current scene.");
@@ -2330,9 +2270,10 @@ void drawExamplesLab() {
 // ---------------------------------------------------------------- frame
 
 void drawUI() {
-    gIn.shift = GetKeyState(VK_SHIFT) < 0;
-    gIn.ctrl = GetKeyState(VK_CONTROL) < 0;
-    gIn.alt = GetKeyState(VK_MENU) < 0;
+    Modifiers input = modifiers();
+    gIn.shift = input.shift;
+    gIn.ctrl = input.ctrl;
+    gIn.alt = input.alt;
     gVP = {LEFT, TOP, std::max(1, gW - LEFT - RIGHT), std::max(1, gH - TOP - STATUS - TIMELINE)};
     gBlocked = gLab != LabNone || gModal;
     drawTop();
@@ -2360,8 +2301,10 @@ void drawUI() {
 }
 
 void doFrame() {
+    if (!gBits) return;
     for (int guard = 0; guard < 3; guard++) {
         gIdc = 0;
+        gResizeHovered = false;
         drawUI();
         if (gIn.released) gActive = 0;
         gIn.pressed = gIn.released = false;
@@ -2371,17 +2314,18 @@ void doFrame() {
         gDeferred.clear();
         for (auto& f : d) f();
     }
-    InvalidateRect(gWnd, nullptr, FALSE);
+    showResizeCursor(gResizeHovered);
+    present();
 }
 
 void tick() {
-    DWORD now = GetTickCount();
+    uint64_t now = nowMs();
     if (gDrag == DragSculpt && gIn.down && gActive == VIEW_ID && !gModal && now - gSculptLast >= 33) {
         gSculptLast = now;
         sculptStep();
         doFrame();
     }
-    if (gPlaying && now - gPlayLast >= 1000u / (DWORD)std::max(1, gScene.fps)) {
+    if (gPlaying && now - gPlayLast >= 1000u / (uint64_t)std::max(1, gScene.fps)) {
         gPlayLast = now;
         gScene.applyFrame((gScene.frame + 1) % gScene.frames);
         gShowRender = false;
@@ -2506,9 +2450,10 @@ void buildIcons() {
 
 // ---------------------------------------------------------------- window
 
-void handleKey(WPARAM wp) {
-    bool ctrl = GetKeyState(VK_CONTROL) < 0, shift = GetKeyState(VK_SHIFT) < 0;
-    if (wp == VK_ESCAPE) {
+void handleKey(int wp) {
+    Modifiers input = modifiers();
+    bool ctrl = input.ctrl, shift = input.shift;
+    if (wp == KeyCode::Escape) {
         if (gLab != LabNone) { closeLab(true); endInteraction(); }
         else if (gMainR.busy() || gAnimRender) actRender();
         else gShowRender = false;
@@ -2516,7 +2461,7 @@ void handleKey(WPARAM wp) {
     }
     if (gLab != LabNone) return;
     beginInteraction();
-    if (wp == VK_DELETE) actDelete();
+    if (wp == KeyCode::Delete) actDelete();
     else if (ctrl && wp == 'Z') undoRedo(shift);
     else if (ctrl && wp == 'Y') undoRedo(true);
     else if (ctrl && wp == 'D') actDuplicate();
@@ -2533,167 +2478,171 @@ void handleKey(WPARAM wp) {
     else if (!ctrl && wp == 'M' && validSel()) openLab(LabMat);
     else if (!ctrl && wp == 'E' && validSel()) openLab(objectEditor(gScene.objs[gSel]));
     else if (!ctrl && wp == 'F') frameView(validSel());
-    else if (wp == VK_SPACE) { gPlaying = !gPlaying; gPlayLast = GetTickCount(); }
-    else if (wp == VK_OEM_4 || wp == VK_OEM_6) gBrushSize = clampf(gBrushSize * (wp == VK_OEM_6 ? 1.2f : 1 / 1.2f), 0.01f, 0.3f);
+    else if (wp == ' ') { gPlaying = !gPlaying; gPlayLast = nowMs(); }
+    else if (wp == KeyCode::LeftBracket || wp == KeyCode::RightBracket) gBrushSize = clampf(gBrushSize * (wp == KeyCode::RightBracket ? 1.2f : 1 / 1.2f), 0.01f, 0.3f);
     else if (wp >= '1' && wp <= '4') { gView = (int)(wp - '1'); gShowRender = false; }
     endInteraction();
 }
 
-LRESULT CALLBACK wndProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
-    switch (msg) {
-    case WM_SIZE:
-        if (LOWORD(lp) > 0 && HIWORD(lp) > 0) { resizeCanvas(LOWORD(lp), HIWORD(lp)); doFrame(); }
-        return 0;
-    case WM_GETMINMAXINFO: ((MINMAXINFO*)lp)->ptMinTrackSize = {1220, 780}; return 0;
-    case WM_ERASEBKGND: return 1;
-    case WM_PAINT: {
-        PAINTSTRUCT ps;
-        HDC dc = BeginPaint(hw, &ps);
-        if (gDC) BitBlt(dc, 0, 0, gW, gH, gDC, 0, 0, SRCCOPY);
-        EndPaint(hw, &ps);
-        return 0;
-    }
-    case WM_MOUSEMOVE: {
-        if (gModal) return 0;
-        int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
-        gIn.dx = x - gIn.mx; gIn.dy = y - gIn.my; gIn.mx = x; gIn.my = y;
-        if (gRDrag) { if (gView == 0) orbitCam((float)gIn.dx, (float)gIn.dy); else panView((float)gIn.dx, (float)gIn.dy); }
-        if (gMDrag) panView((float)gIn.dx, (float)gIn.dy);
-        doFrame();
-        return 0;
-    }
-    case WM_LBUTTONDOWN:
-        if (gModal) return 0;
-        SetCapture(hw);
-        commitRename();
-        beginInteraction();
-        gIn.down = gIn.pressed = true;
-        doFrame();
-        return 0;
-    case WM_LBUTTONUP:
-        if (gModal) return 0;
-        if (!gRDrag && !gMDrag) ReleaseCapture();
-        gIn.down = false;
-        gIn.released = true;
-        doFrame();
-        endInteraction();
-        return 0;
-    case WM_RBUTTONDOWN:
-    case WM_MBUTTONDOWN:
-        if (gModal || gLab != LabNone || !gVP.in(GET_X_LPARAM(lp), GET_Y_LPARAM(lp))) return 0;
-        (msg == WM_RBUTTONDOWN ? gRDrag : gMDrag) = true;
-        gShowRender = false;
-        SetCapture(hw);
-        doFrame();
-        return 0;
-    case WM_RBUTTONUP:
-    case WM_MBUTTONUP:
-        (msg == WM_RBUTTONUP ? gRDrag : gMDrag) = false;
-        if (!gIn.down && !gRDrag && !gMDrag) ReleaseCapture();
-        return 0;
-    case WM_MOUSEWHEEL: {
-        if (gModal || gLab != LabNone) return 0;
-        POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-        ScreenToClient(hw, &pt);
-        float d = GET_WHEEL_DELTA_WPARAM(wp) / 120.f;
-        if (gListR.in(pt.x, pt.y)) gListScroll -= (int)(d * 2);
-        else if (gVP.in(pt.x, pt.y)) { gShowRender = false; zoomView(d); }
-        doFrame();
-        return 0;
-    }
-    case WM_CHAR:
-        if (gModal || gEditObj < 0) return 0;
-        if (wp == 8) { if (!gEditBuf.empty()) gEditBuf.pop_back(); }
-        else if (wp == 13) commitRename();
-        else if (wp == 27) gEditObj = -1;
-        else if (wp >= 32 && wp < 256 && gEditBuf.size() < 60) gEditBuf += (char)wp;
-        doFrame();
-        return 0;
-    case WM_KEYDOWN:
-        if (gModal || gEditObj >= 0) return 0;
-        handleKey(wp);
-        doFrame();
-        return 0;
-    case WM_TIMER: tick(); return 0;
-    case WM_CLOSE:
-        if (gModal || !confirmDiscard()) return 0;
-        DestroyWindow(hw);
-        return 0;
-    case WM_DESTROY:
-        gMainR.cancel(); gNanoR.cancel(); gLabR.cancel();
-        PostQuitMessage(0);
-        return 0;
-    }
-    return DefWindowProcA(hw, msg, wp, lp);
+bool parseInt(const char* arg, int& value) {
+    const char* end = arg + std::strlen(arg);
+    auto parsed = std::from_chars(arg, end, value);
+    return parsed.ec == std::errc{} && parsed.ptr == end;
 }
 
-HFONT makeFont(int px, int weight) {
-    return CreateFontA(-px, 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                       DEFAULT_PITCH | FF_SWISS, "Segoe UI");
+void usage(FILE* out) {
+    std::fputs("Usage:\n"
+               "  Canyon3D --render OUTPUT.bmp [WIDTH HEIGHT [SCENE.c3d]]\n"
+               "  Canyon3D --example INDEX OUTPUT.bmp [WIDTH HEIGHT [QUALITY]]\n"
+               "  Canyon3D --export-example INDEX OUTPUT.c3d\n", out);
 }
 
-// --render out.bmp [w h [scene.c3d]] | --example N out.bmp [w h [quality]] | --export-example N out.c3d
-int headless(const char* cmd) {
-    char out[MAX_PATH] = "", scene[MAX_PATH] = "";
-    int w = 800, h = 500, q = -1, ex = 0;
-    Scene s;
-    if (std::strncmp(cmd, "--export-example", 16) == 0) {
-        if (sscanf(cmd, "--export-example %d %259s", &ex, out) != 2) return 2;
-        return makeExample(ex).save(out) ? 0 : 4;
-    }
-    if (std::strncmp(cmd, "--example", 9) == 0) {
-        if (sscanf(cmd, "--example %d %259s %d %d %d", &ex, out, &w, &h, &q) < 2) return 2;
-        s = makeExample(ex);
+int headless(int argc, char** argv) {
+    std::string_view command = argv[1];
+    if (command == "--help") { usage(stdout); return 0; }
+    Scene scene;
+    int w = 800, h = 500, quality = -1, example = 0;
+    const char* output;
+    if (command == "--export-example" || command == "--example") {
+        if (argc < 4 || argc > 7 || !parseInt(argv[2], example) ||
+            example < 0 || example >= (int)exampleNames().size()) { usage(stderr); return 2; }
+        output = argv[3];
+        if (command == "--export-example")
+            return argc == 4 ? (makeExample(example).save(output) ? 0 : 4) : 2;
+        if ((argc >= 5 && !parseInt(argv[4], w)) || (argc >= 6 && !parseInt(argv[5], h)) ||
+            (argc == 7 && (!parseInt(argv[6], quality) || quality < -1 || quality > 2))) { usage(stderr); return 2; }
+        scene = makeExample(example);
+    } else if (command == "--render") {
+        if (argc < 3 || argc > 6 || (argc >= 4 && !parseInt(argv[3], w)) ||
+            (argc >= 5 && !parseInt(argv[4], h))) { usage(stderr); return 2; }
+        output = argv[2];
+        if (argc == 6) {
+            if (!scene.load(argv[5])) { std::fprintf(stderr, "Could not read scene: %s\n", argv[5]); return 3; }
+        } else {
+            scene = makeDefaultScene();
+        }
     } else {
-        if (sscanf(cmd, "--render %259s %d %d %259s", out, &w, &h, scene) < 1) return 2;
-        s = makeDefaultScene();
-        if (scene[0] && !s.load(scene)) return 3;
+        usage(stderr);
+        return 2;
     }
-    if (w < 1 || h < 1 || w > 16384 || h > 16384) return 2;
+    if (w < 1 || h < 1 || w > 16384 || h > 16384) { usage(stderr); return 2; }
     std::vector<uint32_t> px((size_t)w * h);
-    renderImage(s, w, h, px.data(), q);
-    return saveBMP(out, w, h, px) ? 0 : 4;
+    renderImage(scene, w, h, px.data(), quality);
+    if (saveBMP(output, w, h, px)) return 0;
+    std::fprintf(stderr, "Could not write image: %s\n", output);
+    return 4;
 }
 
 }  // namespace
 
-int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmd, int show) {
-    if (cmd && std::strncmp(cmd, "--", 2) == 0) return headless(cmd);
-    SetProcessDPIAware();
-    char exe[MAX_PATH] = "";
-    GetModuleFileNameA(nullptr, exe, MAX_PATH);
-    gLibPath = exe;
-    gLibPath = gLibPath.substr(0, gLibPath.find_last_of("\\/") + 1) + "canyon3d_library.txt";
+namespace studio {
+
+int entry(int argc, char** argv) {
+    if (argc > 1 && std::string_view(argv[1]).rfind("--", 0) == 0) return headless(argc, argv);
+    int status = desktop::run(APP_NAME);
+    gMainR.cancel();
+    gNanoR.cancel();
+    gLabR.cancel();
+    return status;
+}
+
+void initialize() {
+    gLibPath = libraryPath();
     gLib.load(gLibPath);
     gScene = makeDefaultScene();
     sceneReplaced();
     buildIcons();
-    gFont = makeFont(15, FW_NORMAL);
-    gSmall = makeFont(13, FW_NORMAL);
-    gBold = makeFont(15, FW_SEMIBOLD);
-    gTitle = makeFont(19, FW_BOLD);
-
-    WNDCLASSA wc{};
-    wc.style = CS_HREDRAW | CS_VREDRAW;
-    wc.lpfnWndProc = wndProc;
-    wc.hInstance = inst;
-    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
-    wc.lpszClassName = "Canyon3DWnd";
-    RegisterClassA(&wc);
-    RECT wa;
-    SystemParametersInfoA(SPI_GETWORKAREA, 0, &wa, 0);
-    int ww = std::min<int>(1440, wa.right - wa.left), wh = std::min<int>(900, wa.bottom - wa.top);
-    gWnd = CreateWindowExA(0, wc.lpszClassName, APP_NAME, WS_OVERLAPPEDWINDOW,
-                           wa.left + (wa.right - wa.left - ww) / 2, wa.top + (wa.bottom - wa.top - wh) / 2, ww, wh, nullptr, nullptr, inst, nullptr);
-    if (!gWnd) return 1;
-    bool small = ww < 1440 || wh < 900;
-    ShowWindow(gWnd, show == SW_SHOWMINIMIZED ? SW_SHOWNORMAL : (small && (show == SW_SHOWNORMAL || show == SW_SHOWDEFAULT) ? SW_SHOWMAXIMIZED : show));
-    SetTimer(gWnd, 1, 33, nullptr);
-    MSG m;
-    while (GetMessageA(&m, nullptr, 0, 0) > 0) {
-        TranslateMessage(&m);
-        DispatchMessageA(&m);
-    }
-    return 0;
 }
+
+void resized(int width, int height) {
+    if (width <= 0 || height <= 0) return;
+    uint32_t* canvas = resizeCanvas(width, height);
+    if (!canvas) return;
+    gW = width; gH = height; gBits = canvas;
+    doFrame();
+}
+
+void timer() { tick(); }
+
+void pointerMoved(int x, int y) {
+    if (gModal) return;
+    gIn.dx = x - gIn.mx; gIn.dy = y - gIn.my; gIn.mx = x; gIn.my = y;
+    if (gRDrag) {
+        if (gView == 0) orbitCam((float)gIn.dx, (float)gIn.dy);
+        else panView((float)gIn.dx, (float)gIn.dy);
+    }
+    if (gMDrag) panView((float)gIn.dx, (float)gIn.dy);
+    doFrame();
+}
+
+void pointerButton(Mouse button, bool down, int x, int y) {
+    if (gModal) return;
+    gIn.mx = x; gIn.my = y;
+    if (button != Mouse::Left) {
+        bool& dragging = button == Mouse::Right ? gRDrag : gMDrag;
+        if (down && (gLab != LabNone || !gVP.in(x, y))) return;
+        dragging = down;
+        capturePointer(gIn.down || gRDrag || gMDrag);
+        if (down) { gShowRender = false; doFrame(); }
+        return;
+    }
+    if (down) {
+        capturePointer(true);
+        commitRename();
+        beginInteraction();
+        gIn.down = gIn.pressed = true;
+    } else {
+        capturePointer(gRDrag || gMDrag);
+        gIn.down = false;
+        gIn.released = true;
+    }
+    doFrame();
+    if (!down) endInteraction();
+}
+
+void pointerWheel(float steps, int x, int y) {
+    if (gModal || gLab != LabNone) return;
+    if (gListR.in(x, y)) {
+        static float remainder = 0;
+        remainder += steps * 2;
+        int rows = (int)remainder;
+        remainder -= rows;
+        gListScroll -= rows;
+    } else if (gVP.in(x, y)) {
+        gShowRender = false;
+        zoomView(steps);
+    }
+    doFrame();
+}
+
+void keyDown(int key) {
+    if (gModal) return;
+    if (gEditObj >= 0) {
+        if (key == KeyCode::Backspace && !gEditBuf.empty()) {
+            size_t end = gEditBuf.size() - 1;
+#ifndef _WIN32
+            while (end > 0 && (gEditBuf[end] & 0xc0) == 0x80) --end;
+#endif
+            gEditBuf.resize(end);
+        } else if (key == KeyCode::Enter) {
+            commitRename();
+        } else if (key == KeyCode::Escape) {
+            gEditObj = -1;
+        } else {
+            return;
+        }
+    } else {
+        handleKey(key);
+    }
+    doFrame();
+}
+
+void textInput(std::string_view text) {
+    if (gModal || gEditObj < 0 || gEditBuf.size() + text.size() > 60) return;
+    gEditBuf += text;
+    doFrame();
+}
+
+bool shouldClose() { return !gModal && confirmDiscard(); }
+
+}  // namespace studio
