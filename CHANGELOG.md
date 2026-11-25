@@ -1,10 +1,18 @@
 # Implementation log
 
+## Edge bevels and mesh symmetry
+
+- Added edge bevels on closed manifold topology, with an adjustable offset, up to 16 segments, rounded profiles, closed junctions, and UVs on the new faces.
+- Added a local symmetry plane with a selectable axis, source side, and seam tolerance. Symmetrize clips the source side, mirrors geometry and normals, and shares positions along the seam.
+- Added mirrored component transforms for matched vertices and locked transformed seam vertices to the plane.
+- Passed the Windows core suite and Linux-target C++17 syntax checks. Verified every nonempty cube edge selection with one and three bevel segments, for 8,190 cases. Exercised a rounded bevel, symmetrize, and a mirrored vertex move on the Windows desktop, then reopened and rendered both saved meshes.
+
 ## Boundary bridging and knife paths
 
 - Added boundary selection from edge seeds and quad bridging for equal-length open chains and closed loops. Closed loops align by distance with an adjustable twist. Bridges can add intermediate rows and create a UV strip.
 - Added multi-face knife paths with an on-mesh preview and vertex and midpoint snapping. Edge crossings split neighboring faces consistently and retain separate UV and normal data at seams.
 - Updated polygon triangulation to use the face plane, allowing twisted bridge quads that collapse in an axis-aligned projection.
+- Passed the Windows core suite and Linux-target C++17 syntax checks. Verified both tools on the Windows desktop and saved the resulting topology.
 
 ## Polygon mesh editing
 

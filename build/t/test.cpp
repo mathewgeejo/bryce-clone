@@ -31,6 +31,21 @@ static bool saveBMP(const std::string& p, int w, int h, const std::vector<uint32
 
 static double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
+static bool closedPolygonShell(const PolygonMesh& mesh) {
+    std::map<std::pair<uint32_t, uint32_t>, std::pair<int, int>> uses;
+    for (const auto& face : mesh.faces) {
+        for (size_t i = 0; i < face.size(); ++i) {
+            uint32_t a = face[i].vertex, b = face[(i + 1) % face.size()].vertex;
+            auto& use = uses[std::minmax(a, b)];
+            ++use.first;
+            use.second += a < b ? 1 : -1;
+        }
+    }
+    return !uses.empty() && std::all_of(uses.begin(), uses.end(), [](const auto& edge) {
+        return edge.second.first == 2 && edge.second.second == 0;
+    });
+}
+
 static std::vector<uint32_t> render(const Scene& s, int w, int h, int q, const char* out) {
     std::vector<uint32_t> px((size_t)w * h);
     double t = now();
@@ -321,6 +336,104 @@ int main() {
             CHECK(reopened.objs[0].mesh->triCount() == 78 && reopened.objs[0].mesh->uv.size() == mesh->uv.size());
             CHECK(std::fabs(reopened.objs[0].sampleTransform(2.5f).pos.x - 2.5f) < .001f);
         }
+    }
+    printf("independent transform curves and Bezier handles\n");
+    {
+        CurveTrack bezier{{0, 0, CurveEase::Bezier, {}, {.2f, 6}}, {20, 10, CurveEase::Linear, {.4f, -1}}};
+        CHECK(std::fabs(sampleCurve(bezier, 8.5f, 0) - 6.875f) < .0001f);
+        CHECK(sampleCurve(bezier, -1, 5) == 0 && sampleCurve(bezier, 22, 5) == 10);
+        auto divided = bezier;
+        CHECK(insertCurveSample(divided, 8, 0) && !insertCurveSample(divided, 8, 0) && divided.size() == 3);
+        for (float f = 0; f <= 20; f += .25f) CHECK(std::fabs(sampleCurve(bezier, f, 0) - sampleCurve(divided, f, 0)) < .0001f);
+
+        Object legacy = makeObject(ObjType::Cube, 1);
+        legacy.keys = {{0, {0,1,2}, {3,4,5}, {2,3,4}, Ease::Spline},
+                       {9, {3,5,7}, {10,12,14}, {3,4,5}, Ease::Hold},
+                       {16, {6,7,8}, {20,24,28}, {2,5,3}, Ease::Smooth},
+                       {22, {8,9,10}, {5,10,15}, {1,2,3}, Ease::Linear}};
+        Object object = legacy;
+        CHECK(replaceTransformChannel(object.keys, object.curves, 0, divided) && object.keys.empty());
+        for (float f = 0; f <= 22; f += .5f) {
+            Key before = legacy.sampleTransform(f), after = object.sampleTransform(f);
+            for (int channel = 1; channel < TRANSFORM_CHANNELS; ++channel)
+                CHECK(std::fabs(transformChannelValue(before, channel) - transformChannelValue(after, channel)) < .0001f);
+        }
+        auto snapshot = object.curves;
+        CHECK(!retimeTransformKeys(object.curves, 8, 20) && object.curves == snapshot);
+        CHECK(retimeTransformKeys(object.curves, 8, 7) && object.curves->channels[0][1].frame == 7 &&
+              object.curves->channels[1][1].frame == 9 && snapshot->channels[0][1].frame == 8);
+        CHECK((transformKeyFrames(object.keys, object.curves.get()) == std::vector<int>{0,7,9,16,20,22}));
+        CHECK(!replaceTransformChannel(object.keys, object.curves, 0, {{0,1}, {0,2}}));
+        CHECK(!replaceTransformChannel(object.keys, object.curves, 0, {{0,1,CurveEase::Bezier, {1.1f, 0}}}));
+        auto existing = object.curves->channels[0].front();
+        CHECK(setTransformKey(object.keys, object.curves, Key{0, {2,1,2}, {3,4,5}, {2,3,4}}));
+        CHECK(object.curves->channels[0].front().value == 2 &&
+              object.curves->channels[0].front().out.offset == existing.out.offset &&
+              object.curves->channels[0].front().ease == CurveEase::Bezier);
+        CHECK(removeTransformKeys(object.keys, object.curves, 7) && object.curves->channels[0].size() == 2);
+
+        Rig rig;
+        Joint root;
+        root.name = "Root";
+        CHECK(replaceTransformChannel(root.keys, root.curves, 0, bezier, true));
+        CHECK(setTransformKey(root.keys, root.curves, Key{3, {0,4,0}}, true, 1u << 1));
+        CHECK(root.curves->channels[0].size() == 2 && root.curves->channels[1].size() == 1);
+        rig.joints = {root};
+        Object actor = makeObject(ObjType::Mesh, 1);
+        actor.mesh = std::make_shared<Mesh>(makeEditableBox());
+        CHECK(bindRig(rig, *actor.mesh));
+        actor.rig = std::make_shared<Rig>(rig);
+        Scene scene;
+        scene.objs = {object, actor, legacy};
+        scene.frames = 24;
+        scene.applyFrame(2);
+        auto first = scene.objs[1].posedMesh;
+        scene.applyFrame(8);
+        CHECK(first && scene.objs[1].posedMesh && length(first->v[0] - scene.objs[1].posedMesh->v[0]) > 2);
+        const char* path = "build/t/curves-roundtrip.c3d";
+        CHECK(scene.save(path));
+        {
+            std::ifstream file(path);
+            std::string header;
+            std::getline(file, header);
+            CHECK(header == "CANYON3D 11");
+        }
+        Scene loaded;
+        CHECK(loaded.load(path) && loaded.objs.size() == 3);
+        if (loaded.objs.size() == 3) {
+            CHECK(loaded.objs[0].curves && loaded.objs[0].keys.empty() && loaded.objs[1].rig &&
+                  loaded.objs[1].rig->joints[0].curves && loaded.objs[2].keys.size() == 4);
+            loaded.applyFrame(8);
+            CHECK(length(loaded.objs[0].pos - scene.objs[0].pos) < .0001f);
+            CHECK(loaded.objs[1].posedMesh && scene.objs[1].posedMesh &&
+                  length(loaded.objs[1].posedMesh->v[0] - scene.objs[1].posedMesh->v[0]) < .0001f);
+        }
+        std::remove(path);
+        auto action = captureRigAction(rig, 0, 4, "Curved motion");
+        CHECK(action && action->joints.size() == 1 && action->joints[0].keys.back().pos.x > 1);
+        if (action) {
+            rig.actions.push_back(action);
+            rig.clips.push_back({0, 6});
+            CHECK(bakeRigClips(rig, 16) && rig.joints[0].curves && rig.joints[0].keys.empty());
+            CHECK(rig.joints[0].curves->channels[0].back().frame == 20 &&
+                  rig.joints[0].curves->channels[0].back().in.offset == -1);
+        }
+    }
+    {
+        Scene scene;
+        Object ball = makeObject(ObjType::Sphere, 1);
+        ball.pos = {0, 6, 0};
+        CHECK(replaceTransformChannel(ball.keys, ball.curves, 1, {{0,6,CurveEase::Hold}, {60,3,CurveEase::Linear}}));
+        scene.objs.push_back(ball);
+        RigidSettings settings;
+        settings.time.frames = 12;
+        settings.time.startFrame = 8;
+        std::string error;
+        CHECK(bakeRigidBodies(scene, {0}, settings, error));
+        const auto& track = scene.objs[0].curves->channels[1];
+        CHECK(track.front().frame == 0 && track.front().ease == CurveEase::Hold &&
+              track.back().frame == 60 && track.back().value == 3 &&
+              scene.objs[0].transformAt(16).pos.y < 6 && scene.objs[0].keys.empty());
     }
     printf("rigid-body and liquid simulation bakes\n");
     {
@@ -716,7 +829,6 @@ int main() {
     }
     printf("polygon boundary bridging and knife paths\n");
     {
-        using Edge = std::pair<uint32_t, uint32_t>;
         auto ends = makePolygonBox();
         ends.faces.resize(2);
         auto loops = expandPolygonBoundary(ends, {{0,1}, {4,5}});
@@ -729,16 +841,7 @@ int main() {
         if (twist.faces.size() > 2) CHECK(twist.faces[2][3].vertex == 5);
         CHECK(bridgePolygonBoundaries(ends, loops, 3, 0) && ends.faces.size() == 14 && ends.positions.size() == 16);
         CHECK(buildPolygonMesh(ends, mesh) && mesh.triCount() == 28);
-        std::map<Edge, std::pair<int, int>> edgeUses;
-        for (const auto& face : ends.faces) {
-            for (size_t i = 0; i < face.size(); ++i) {
-                auto a = face[i].vertex, b = face[(i + 1) % face.size()].vertex;
-                auto& use = edgeUses[std::minmax(a, b)];
-                ++use.first;
-                use.second += a < b ? 1 : -1;
-            }
-        }
-        for (const auto& item : edgeUses) CHECK(item.second.first == 2 && item.second.second == 0);
+        CHECK(closedPolygonShell(ends));
         CHECK(ends.uv.size() == 20 && ends.uv[0].x == 0 && ends.uv[4].x == 1);
 
         PolygonMesh separate;
@@ -786,6 +889,80 @@ int main() {
         concave.faces = {{{0},{1},{2},{3},{4},{5}}};
         CHECK(!cutPolygonPath(concave, {{{2,2}, 0}, {{4,4}, 0}}) &&
               concave.positions.size() == 6 && concave.faces.size() == 1);
+    }
+    printf("polygon bevels and symmetry\n");
+    {
+        using Edge = std::pair<uint32_t, uint32_t>;
+        Mesh mesh;
+        auto chamfer = makePolygonBox();
+        CHECK(bevelPolygonEdges(chamfer, {{0,1}}, .25f, 1) && chamfer.faces.size() == 7 && chamfer.positions.size() == 10);
+        CHECK(buildPolygonMesh(chamfer, mesh) && closedPolygonShell(chamfer));
+        CHECK(mesh.triCount() == 16 && !mesh.uv.empty());
+        auto rounded = makePolygonBox();
+        CHECK(bevelPolygonEdges(rounded, {{0,1}}, .25f, 2) && rounded.faces.size() == 10 && rounded.positions.size() == 12);
+        CHECK(buildPolygonMesh(rounded, mesh) && closedPolygonShell(rounded));
+        float arc = -1 + .25f * (1 - std::sqrt(.5f));
+        CHECK(std::any_of(rounded.positions.begin(), rounded.positions.end(), [&](V3 p) {
+            return length(p - V3(-1, arc, arc)) < .001f;
+        }));
+        auto adjoining = makePolygonBox();
+        CHECK(bevelPolygonEdges(adjoining, {{0,1}, {0,3}}, .12f, 3) && closedPolygonShell(adjoining) &&
+              buildPolygonMesh(adjoining, mesh));
+        auto cube = makePolygonBox();
+        std::set<Edge> unique;
+        for (const auto& face : cube.faces)
+            for (size_t i = 0; i < face.size(); ++i)
+                unique.insert(std::minmax(face[i].vertex, face[(i + 1) % face.size()].vertex));
+        std::vector<Edge> all(unique.begin(), unique.end());
+        CHECK(!bevelPolygonEdges(cube, all, 1.1f, 2) && cube.faces.size() == 6 && cube.positions.size() == 8);
+        CHECK(bevelPolygonEdges(cube, all, .15f, 1) && cube.faces.size() == 26 && cube.positions.size() == 24);
+        CHECK(buildPolygonMesh(cube, mesh) && closedPolygonShell(cube) && mesh.triCount() == 44);
+        auto multi = makePolygonBox();
+        projectPolygonUV(multi, 2);
+        CHECK(bevelPolygonEdges(multi, {{0,1}, {0,3}, {0,4}}, .12f, 3));
+        CHECK(buildPolygonMesh(multi, mesh) && closedPolygonShell(multi));
+        CHECK(std::all_of(multi.faces.begin(), multi.faces.end(), [](const auto& face) {
+            return std::all_of(face.begin(), face.end(), [](const auto& c) { return c.uv >= 0; });
+        }));
+        auto open = makePolygonBox();
+        open.faces.resize(1);
+        CHECK(!bevelPolygonEdges(open, {{0,1}}, .15f, 1) && open.faces.size() == 1);
+    }
+    {
+        Mesh mesh;
+        auto half = makePolygonBox();
+        for (V3& p : half.positions) if (p.x > 0) p.x = .3502f;
+        for (V3& p : half.positions) if (p.x < 0) p.x = -.65f;
+        projectPolygonUV(half, 2);
+        half.normals = {{1,0,0}};
+        for (auto& corner : half.faces[4]) corner.normal = 0;
+        CHECK(symmetrizePolygons(half, 0, .35f, false, .001f) && half.faces.size() == 10 && half.positions.size() == 12);
+        CHECK(buildPolygonMesh(half, mesh) && closedPolygonShell(half));
+        CHECK(std::count_if(half.positions.begin(), half.positions.end(), [](V3 p) { return p.x == .35f; }) == 4);
+        CHECK(std::fabs(mesh.bmin.x + .65f) < .0001f && std::fabs(mesh.bmax.x - 1.35f) < .0001f);
+        CHECK(half.faces[4].front().uv == half.faces[9].back().uv);
+        CHECK(half.normals[half.faces[4].front().normal].x == 1 && half.normals[half.faces[9].back().normal].x == -1);
+        auto pairs = matchPolygonSymmetry(half, 0, .35f, .0001f);
+        for (uint32_t i = 0; i < pairs.size(); ++i)
+            CHECK(pairs[i] != UINT32_MAX && pairs[pairs[i]] == i &&
+                  std::fabs(half.positions[i].x + half.positions[pairs[i]].x - .7f) < .0001f);
+        CHECK(!symmetrizePolygons(half, 2, 20, true, .0001f) && half.faces.size() == 10);
+        PolygonMesh neighbors;
+        neighbors.positions = {{-1,0,0}, {1,.0005f,0}, {1,2,0}, {0,3,0}};
+        pairs = matchPolygonSymmetry(neighbors, 0, 0, .001f);
+        CHECK(pairs == (std::vector<uint32_t>{1,0,UINT32_MAX,3}));
+        neighbors.positions.push_back(neighbors.positions[1]);
+        pairs = matchPolygonSymmetry(neighbors, 0, 0, .001f);
+        CHECK(pairs[0] == UINT32_MAX && pairs[1] == UINT32_MAX && pairs[4] == UINT32_MAX);
+
+        PolygonMesh islands;
+        islands.positions = {{-2,-2,0}, {2,-2,0}, {2,2,0}, {1,2,0}, {1,0,0}, {-1,0,0}, {-1,2,0}, {-2,2,0}};
+        islands.faces = {{{0},{1},{2},{3},{4},{5},{6},{7}}};
+        CHECK(symmetrizePolygons(islands, 1, 1, true, 0) && buildPolygonMesh(islands, mesh));
+        V3 normal;
+        float distance = 0;
+        CHECK(!mesh.intersect({0,1.25f,1}, {0,0,-1}, .001f, 5, distance, normal));
+        CHECK(mesh.intersect({1.5f,.75f,1}, {0,0,-1}, .001f, 5, distance, normal));
     }
     printf("DXF import/export and implicit geometry\n");
     {

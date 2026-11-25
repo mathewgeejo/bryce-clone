@@ -133,6 +133,36 @@ enum class Ease { Spline, Linear, Smooth, Hold, COUNT };
 const char* easeName(Ease ease);
 struct Key { int frame = 0; V3 pos, rot, scl{1, 1, 1}; Ease ease = Ease::Spline; };
 Key sampleTransformTrack(const std::vector<Key>& keys, float frame, const Key& fallback);
+enum class CurveEase { Spline, Linear, Smooth, Hold, Bezier, COUNT };
+struct CurveHandle { float fraction = 1.f / 3, offset = 0; };
+struct CurveKey {
+    int frame = 0;
+    float value = 0;
+    CurveEase ease = CurveEase::Smooth;
+    CurveHandle in, out;
+};
+constexpr int TRANSFORM_CHANNELS = 9;
+using CurveTrack = std::vector<CurveKey>;
+struct TransformCurves { std::array<CurveTrack, TRANSFORM_CHANNELS> channels; };
+
+const char* curveEaseName(CurveEase ease);
+float transformChannelValue(const Key& key, int channel);
+std::array<CurveHandle, 2> bezierHandles(const CurveKey& first, const CurveKey& last);
+float sampleCurve(const CurveTrack& keys, float frame, float fallback);
+bool insertCurveSample(CurveTrack& keys, int frame, float fallback);
+CurveTrack splitTransformChannel(const std::vector<Key>& keys, int channel);
+Key sampleTransformAnimation(const std::vector<Key>& keys, const TransformCurves* curves, float frame,
+                             const Key& fallback, bool joint = false);
+bool validTransformCurves(const TransformCurves& curves, bool joint);
+bool replaceTransformChannel(std::vector<Key>& legacy, std::shared_ptr<const TransformCurves>& curves,
+                             int channel, CurveTrack replacement, bool joint = false);
+bool setTransformKey(std::vector<Key>& legacy, std::shared_ptr<const TransformCurves>& curves, const Key& key,
+                     bool joint = false, unsigned channels = (1u << TRANSFORM_CHANNELS) - 1);
+bool removeTransformKeys(std::vector<Key>& legacy, std::shared_ptr<const TransformCurves>& curves, int frame);
+bool retimeTransformKeys(std::shared_ptr<const TransformCurves>& curves, int from, int to);
+std::vector<int> transformKeyFrames(const std::vector<Key>& legacy, const TransformCurves* curves);
+std::shared_ptr<const TransformCurves> bakeTransformCurves(const TransformCurves& original, const std::vector<Key>& samples,
+                                                          const Key& fallback, bool guardBoundaries, bool joint);
 constexpr int MAX_RIG_JOINTS = 256;
 constexpr size_t MAX_SKIN_VERTICES = 1000000;
 constexpr int MAX_JOINT_KEYS = 10000;
@@ -143,6 +173,9 @@ struct Joint {
     V3 head, tail{0, 1, 0};
     Key pose;
     std::vector<Key> keys;
+    std::shared_ptr<const TransformCurves> curves;
+    bool animatedTransform() const { return curves || !keys.empty(); }
+    Key sampleTransform(float frame) const { return sampleTransformAnimation(keys, curves.get(), frame, pose, true); }
 };
 struct SkinWeights {
     std::array<uint16_t, 4> joint{};
@@ -273,6 +306,7 @@ struct Object {
     std::shared_ptr<const Mesh> mesh;
     std::shared_ptr<const Rig> rig;
     std::vector<Key> keys;
+    std::shared_ptr<const TransformCurves> curves;
     std::vector<AppearanceKey> appearances;
     std::vector<TerrainKey> terrainKeys;
     // derived by update()
@@ -290,6 +324,7 @@ struct Object {
     const Mesh* visibleMesh() const { return posedMesh ? posedMesh.get() : mesh.get(); }
     void moveWorld(V3 delta) { pos += parentInv * delta; }
     Key transformAt(int frame) const { return sampleTransform((float)frame); }
+    bool animatedTransform() const { return curves || !keys.empty(); }
     Key sampleTransform(float frame) const;
     float rawTerrainAt(int x, int z) const;
     float terrainAt(int x, int z) const {

@@ -243,7 +243,7 @@ void Scene::updateAll() {
             continue;
         }
         bool animated = !o.rig->clips.empty() ||
-                        std::any_of(o.rig->joints.begin(), o.rig->joints.end(), [](const Joint& j) { return !j.keys.empty(); }) ||
+                        std::any_of(o.rig->joints.begin(), o.rig->joints.end(), [](const Joint& j) { return j.animatedTransform(); }) ||
                         std::any_of(o.rig->ik.begin(), o.rig->ik.end(), [](const RigIK& chain) { return !chain.keys.empty(); });
         int poseFrame = animated ? frame : 0;
         if (o.skinFrame != poseFrame || o.skinSource.lock() != o.mesh || o.skinRig.lock() != o.rig) {
@@ -527,6 +527,7 @@ int Scene::scatter(const std::vector<int>& sources, int surface, const std::vect
         copy.pos = copy.rot = {};
         copy.scl = V3(1);
         copy.keys.clear();
+        copy.curves.reset();
         copy.appearances.clear();
         copy.terrainKeys.clear();
         prototypes.push_back(std::move(copy));
@@ -714,8 +715,249 @@ Key sampleTransformTrack(const std::vector<Key>& keys, float frame, const Key& f
             {std::max(scale.x, .01f), std::max(scale.y, .01f), std::max(scale.z, .01f)}, keys[first].ease};
 }
 
+namespace {
+static_assert((int)Ease::COUNT == (int)CurveEase::Bezier);
+constexpr size_t MAX_OBJECT_CURVE_KEYS = 100000;
+
+float& transformChannelSlot(Key& key, int channel) {
+    V3& values = channel < 3 ? key.pos : channel < 6 ? key.rot : key.scl;
+    int axis = channel % 3;
+    return axis == 0 ? values.x : axis == 1 ? values.y : values.z;
+}
+
+double cubic(double a, double b, double c, double d, double t) {
+    double u = 1 - t;
+    return u*u*u*a + 3*u*u*t*b + 3*u*t*t*c + t*t*t*d;
+}
+
+double curveParameter(double time, const std::array<CurveHandle, 2>& handles) {
+    double lo = 0, hi = 1;
+    for (int i = 0; i < 26; ++i) {
+        double t = (lo + hi) * .5;
+        if (cubic(0, handles[0].fraction, 1 - handles[1].fraction, 1, t) < time) lo = t;
+        else hi = t;
+    }
+    return (lo + hi) * .5;
+}
+
+CurveKey toCurveKey(const Key& key, int channel) {
+    return {key.frame, transformChannelValue(key, channel), (CurveEase)key.ease};
+}
+
+bool validCurveTrack(const CurveTrack& track, int channel, bool joint) {
+    if (track.size() > (joint ? (size_t)MAX_JOINT_KEYS : MAX_OBJECT_CURVE_KEYS)) return false;
+    auto handle = [](const CurveHandle& h) {
+        return h.fraction >= 0 && h.fraction <= 1 && std::fabs(h.offset) <= 2e6f;
+    };
+    int last = -1;
+    for (const auto& key : track) {
+        if (key.frame <= last || key.frame >= 100000 || !(std::fabs(key.value) <= 1e6f) ||
+            (joint && channel >= 6 && !(key.value >= .01f && key.value <= 100.f)) ||
+            key.ease < CurveEase::Spline || key.ease >= CurveEase::COUNT || !handle(key.in) || !handle(key.out)) return false;
+        last = key.frame;
+    }
+    return true;
+}
+
+bool hasCurveKeys(const TransformCurves& curves) {
+    return std::any_of(curves.channels.begin(), curves.channels.end(), [](const auto& track) { return !track.empty(); });
+}
+}  // namespace
+
+const char* curveEaseName(CurveEase ease) {
+    return ease == CurveEase::Bezier ? "Bezier" : easeName((Ease)ease);
+}
+
+float transformChannelValue(const Key& key, int channel) {
+    return (channel < 3 ? key.pos : channel < 6 ? key.rot : key.scl)[channel % 3];
+}
+
+std::array<CurveHandle, 2> bezierHandles(const CurveKey& first, const CurveKey& last) {
+    std::array<CurveHandle, 2> handles{first.out, last.in};
+    float extent = handles[0].fraction + handles[1].fraction;
+    if (extent > 1) {
+        for (auto& h : handles) { h.fraction /= extent; h.offset /= extent; }
+    }
+    return handles;
+}
+
+float sampleCurve(const CurveTrack& keys, float frame, float fallback) {
+    int first, next;
+    float t;
+    if (!keySpan(keys, frame, first, next, t)) return fallback;
+    const auto& a = keys[first];
+    const auto& b = keys[next];
+    if (first == next || t == 0 || a.ease == CurveEase::Hold) return a.value;
+    if (a.ease == CurveEase::Bezier) {
+        auto handles = bezierHandles(a, b);
+        double u = curveParameter(t, handles);
+        return (float)cubic(a.value, (double)a.value + handles[0].offset,
+                           (double)b.value + handles[1].offset, b.value, u);
+    }
+    if (a.ease == CurveEase::Spline) return spline(keys, first, next, t, [](const auto& k) { return k.value; });
+    return lerpf(a.value, b.value, easeTime((Ease)a.ease, t));
+}
+
+bool insertCurveSample(CurveTrack& keys, int frame, float fallback) {
+    auto at = std::lower_bound(keys.begin(), keys.end(), frame, [](const CurveKey& key, int time) { return key.frame < time; });
+    if (at != keys.end() && at->frame == frame) return false;
+    CurveKey key{frame, sampleCurve(keys, (float)frame, fallback)};
+    if (at != keys.begin() && at != keys.end()) {
+        auto& a = *(at - 1);
+        auto& b = *at;
+        key.ease = a.ease;
+        if (a.ease == CurveEase::Bezier) {
+            auto handles = bezierHandles(a, b);
+            double atTime = (double)(frame - a.frame) / (b.frame - a.frame);
+            double t = curveParameter(atTime, handles);
+            struct Point { double x, y; };
+            auto mix = [t](Point p, Point q) { return Point{p.x + (q.x - p.x) * t, p.y + (q.y - p.y) * t}; };
+            Point p{0, a.value}, q{handles[0].fraction, (double)a.value + handles[0].offset};
+            Point r{1 - handles[1].fraction, (double)b.value + handles[1].offset}, s{1, b.value};
+            Point pq = mix(p,q), qr = mix(q,r), rs = mix(r,s);
+            Point l = mix(pq,qr), h = mix(qr,rs), mid = mix(l,h);
+            key.value = (float)mid.y;
+            a.out = {clampf((float)(pq.x / atTime), 0, 1), (float)(pq.y - p.y)};
+            key.in = {clampf((float)((atTime - l.x) / atTime), 0, 1), (float)(l.y - mid.y)};
+            key.out = {clampf((float)((h.x - atTime) / (1 - atTime)), 0, 1), (float)(h.y - mid.y)};
+            b.in = {clampf((float)((1 - rs.x) / (1 - atTime)), 0, 1), (float)(rs.y - s.y)};
+        }
+    }
+    keys.insert(at, key);
+    return true;
+}
+
+CurveTrack splitTransformChannel(const std::vector<Key>& keys, int channel) {
+    CurveTrack track;
+    track.reserve(keys.size());
+    for (const auto& key : keys) track.push_back(toCurveKey(key, channel));
+    return track;
+}
+
+Key sampleTransformAnimation(const std::vector<Key>& keys, const TransformCurves* curves, float frame,
+                             const Key& fallback, bool joint) {
+    if (!curves) return sampleTransformTrack(keys, frame, fallback);
+    Key pose = fallback;
+    pose.frame = (int)frame;
+    for (int channel = 0; channel < TRANSFORM_CHANNELS; ++channel) {
+        const auto& track = curves->channels[channel];
+        if (track.empty()) continue;
+        float& v = transformChannelSlot(pose, channel);
+        v = sampleCurve(track, frame, v);
+        if (channel >= 6) v = clampf(v, .01f, joint ? 100.f : 1e6f);
+    }
+    return pose;
+}
+
+bool validTransformCurves(const TransformCurves& curves, bool joint) {
+    for (int channel = 0; channel < TRANSFORM_CHANNELS; ++channel)
+        if (!validCurveTrack(curves.channels[channel], channel, joint)) return false;
+    return hasCurveKeys(curves);
+}
+
+bool replaceTransformChannel(std::vector<Key>& legacy, std::shared_ptr<const TransformCurves>& curves,
+                             int channel, CurveTrack replacement, bool joint) {
+    if (channel < 0 || channel >= TRANSFORM_CHANNELS || !validCurveTrack(replacement, channel, joint)) return false;
+    auto edited = curves ? std::make_shared<TransformCurves>(*curves) : std::make_shared<TransformCurves>();
+    if (!curves) {
+        for (int i = 0; i < TRANSFORM_CHANNELS; ++i) {
+            if (i == channel) continue;
+            edited->channels[i] = splitTransformChannel(legacy, i);
+            if (!validCurveTrack(edited->channels[i], i, joint)) return false;
+        }
+    }
+    edited->channels[channel] = std::move(replacement);
+    curves = hasCurveKeys(*edited) ? std::move(edited) : nullptr;
+    legacy.clear();
+    return true;
+}
+
+bool setTransformKey(std::vector<Key>& legacy, std::shared_ptr<const TransformCurves>& curves, const Key& key,
+                     bool joint, unsigned channels) {
+    if (!curves) { putKey(legacy, key); return true; }
+    auto edited = std::make_shared<TransformCurves>(*curves);
+    for (int channel = 0; channel < TRANSFORM_CHANNELS; ++channel) {
+        if (!(channels & (1u << channel))) continue;
+        auto& track = edited->channels[channel];
+        auto at = std::lower_bound(track.begin(), track.end(), key.frame, [](const CurveKey& k, int time) { return k.frame < time; });
+        if (at != track.end() && at->frame == key.frame) at->value = transformChannelValue(key, channel);
+        else track.insert(at, toCurveKey(key, channel));
+        if (!validCurveTrack(track, channel, joint)) return false;
+    }
+    curves = std::move(edited);
+    return true;
+}
+
+bool removeTransformKeys(std::vector<Key>& legacy, std::shared_ptr<const TransformCurves>& curves, int frame) {
+    if (!curves) return eraseKey(legacy, frame);
+    auto edited = std::make_shared<TransformCurves>(*curves);
+    bool changed = false;
+    for (auto& track : edited->channels) changed |= eraseKey(track, frame);
+    if (changed) curves = hasCurveKeys(*edited) ? std::move(edited) : nullptr;
+    return changed;
+}
+
+bool retimeTransformKeys(std::shared_ptr<const TransformCurves>& curves, int from, int to) {
+    if (!curves || from == to || to < 0 || to >= 100000) return false;
+    auto edited = std::make_shared<TransformCurves>(*curves);
+    bool changed = false;
+    for (auto& track : edited->channels) {
+        auto at = std::lower_bound(track.begin(), track.end(), from, [](const CurveKey& k, int time) { return k.frame < time; });
+        if (at == track.end() || at->frame != from) continue;
+        if (std::any_of(track.begin(), track.end(), [to](const auto& k) { return k.frame == to; })) return false;
+        CurveKey moved = *at;
+        moved.frame = to;
+        track.erase(at);
+        putKey(track, moved);
+        changed = true;
+    }
+    if (changed) curves = std::move(edited);
+    return changed;
+}
+
+std::vector<int> transformKeyFrames(const std::vector<Key>& legacy, const TransformCurves* curves) {
+    std::vector<int> frames;
+    if (!curves) {
+        frames.reserve(legacy.size());
+        for (const auto& key : legacy) frames.push_back(key.frame);
+    } else {
+        for (const auto& track : curves->channels) for (const auto& key : track) frames.push_back(key.frame);
+        std::sort(frames.begin(), frames.end());
+        frames.erase(std::unique(frames.begin(), frames.end()), frames.end());
+    }
+    return frames;
+}
+
+std::shared_ptr<const TransformCurves> bakeTransformCurves(const TransformCurves& original, const std::vector<Key>& samples,
+                                                          const Key& fallback, bool guardBoundaries, bool joint) {
+    if (samples.empty()) return {};
+    auto result = std::make_shared<TransformCurves>();
+    int start = samples.front().frame, end = samples.back().frame + 1;
+    for (int channel = 0; channel < TRANSFORM_CHANNELS; ++channel) {
+        const auto& source = original.channels[channel];
+        auto lower = [&](int frame) {
+            return std::lower_bound(source.begin(), source.end(), frame, [](const CurveKey& key, int f) { return key.frame < f; });
+        };
+        auto channelFallback = transformChannelValue(fallback, channel);
+        auto& track = result->channels[channel];
+        track.assign(source.begin(), lower(start));
+        if (guardBoundaries && start && (track.empty() || track.back().frame < start - 1))
+            track.push_back({start - 1, sampleCurve(source, (float)(start - 1), channelFallback), CurveEase::Hold});
+        for (const auto& sample : samples) track.push_back(toCurveKey(sample, channel));
+        auto after = lower(end);
+        if (guardBoundaries && after != source.end() && after->frame > end) {
+            auto bridge = source;
+            insertCurveSample(bridge, end, channelFallback);
+            auto cut = std::lower_bound(bridge.begin(), bridge.end(), end, [](const CurveKey& key, int f) { return key.frame < f; });
+            track.insert(track.end(), cut, bridge.end());
+        } else track.insert(track.end(), after, source.end());
+        if (!validCurveTrack(track, channel, joint)) return {};
+    }
+    return result;
+}
+
 Key Object::sampleTransform(float frame) const {
-    return sampleTransformTrack(keys, frame, {0, pos, rot, scl});
+    return sampleTransformAnimation(keys, curves.get(), frame, {0, pos, rot, scl});
 }
 
 IKKey sampleIKTrack(const std::vector<IKKey>& keys, float frame, const IKKey& fallback) {
@@ -789,7 +1031,7 @@ void Scene::applyFrame(int f) {
     int i0, i1;
     float t;
     for (Object& o : objs) {
-        if (!o.keys.empty()) {
+        if (o.animatedTransform()) {
             Key pose = o.transformAt(f);
             o.pos = pose.pos;
             o.rot = pose.rot;
@@ -2112,6 +2354,42 @@ void Scene::reloadAssets() {
     });
 }
 
+static void writeTransformCurves(std::ostream& f, const TransformCurves& curves) {
+    auto count = std::count_if(curves.channels.begin(), curves.channels.end(), [](const auto& track) { return !track.empty(); });
+    f << count << '\n';
+    for (int i = 0; i < TRANSFORM_CHANNELS; ++i) {
+        const auto& channel = curves.channels[i];
+        if (channel.empty()) continue;
+        f << i << ' ' << channel.size() << '\n';
+        for (const auto& key : channel)
+            f << key.frame << ' ' << key.value << ' ' << (int)key.ease << ' ' << key.in.fraction << ' '
+              << key.in.offset << ' ' << key.out.fraction << ' ' << key.out.offset << '\n';
+    }
+}
+
+static std::shared_ptr<const TransformCurves> readTransformCurves(std::istream& f, bool joint) {
+    int count;
+    if (!(f >> count) || count < 1 || count > TRANSFORM_CHANNELS) return {};
+    auto curves = std::make_shared<TransformCurves>();
+    for (int i = 0; i < count; ++i) {
+        int channel;
+        size_t size;
+        size_t limit = joint ? (size_t)MAX_JOINT_KEYS : MAX_OBJECT_CURVE_KEYS;
+        if (!(f >> channel >> size) || channel < 0 || channel >= TRANSFORM_CHANNELS ||
+            !curves->channels[channel].empty() || size == 0 || size > limit) return {};
+        auto& track = curves->channels[channel];
+        track.resize(size);
+        for (auto& k : track) {
+            int mode;
+            if (!(f >> k.frame >> k.value >> mode >> k.in.fraction >> k.in.offset >> k.out.fraction >> k.out.offset) ||
+                mode < 0 || mode >= (int)CurveEase::COUNT) return {};
+            k.ease = (CurveEase)mode;
+        }
+    }
+    if (!validTransformCurves(*curves, joint)) return {};
+    return curves;
+}
+
 bool Scene::writeFile(const std::string& path) const {
     std::ofstream f(path);
     if (!f) return false;
@@ -2121,7 +2399,10 @@ bool Scene::writeFile(const std::string& path) const {
     bool hasPolygons = std::any_of(objs.begin(), objs.end(), [](const Object& o) {
         return o.mesh && o.mesh->polygons && o.instanceSource < 0;
     });
-    f << std::setprecision(9) << "CANYON3D " << (hasPolygons ? 10 : hasActions ? 9 : hasIK ? 8 : hasRig ? 7 : 6) << "\ncamera ";
+    bool hasCurves = std::any_of(objs.begin(), objs.end(), [](const Object& o) {
+        return o.curves || (o.rig && std::any_of(o.rig->joints.begin(), o.rig->joints.end(), [](const Joint& j) { return bool(j.curves); }));
+    });
+    f << std::setprecision(9) << "CANYON3D " << (hasCurves ? 11 : hasPolygons ? 10 : hasActions ? 9 : hasIK ? 8 : hasRig ? 7 : 6) << "\ncamera ";
     writeCam(f, cam);
     f << "\nsky ";
     writeSky(f, sky);
@@ -2221,6 +2502,11 @@ bool Scene::writeFile(const std::string& path) const {
         for (auto& k : o.keys) {
             f << "key " << k.frame << ' '; wv(f, k.pos); wv(f, k.rot); wv(f, k.scl); f << (int)k.ease << '\n';
         }
+        if (o.curves) {
+            if (!o.keys.empty() || !validTransformCurves(*o.curves, false)) return false;
+            f << "curves ";
+            writeTransformCurves(f, *o.curves);
+        }
         for (auto& k : o.appearances) {
             f << "appearance " << k.frame << ' ' << (int)k.ease << ' ' << k.hidden << ' ';
             wv(f, k.lightColor);
@@ -2298,6 +2584,16 @@ bool Scene::writeFile(const std::string& path) const {
                     f << vertex.joint[i] << ' ' << vertex.weight[i] << ' ';
                 f << '\n';
             }
+            const auto& joints = o.rig->joints;
+            auto curveJoints = std::count_if(joints.begin(), joints.end(), [](const Joint& joint) { return bool(joint.curves); });
+            if (curveJoints) {
+                f << "rigcurves " << curveJoints << '\n';
+                for (size_t i = 0; i < joints.size(); ++i) {
+                    if (!joints[i].curves) continue;
+                    f << i << ' ';
+                    writeTransformCurves(f, *joints[i].curves);
+                }
+            }
             auto writeGoal = [&](const IKKey& key) {
                 wv(f, key.target); wv(f, key.pole);
                 f << key.influence << ' ' << (int)key.ease << ' ';
@@ -2352,7 +2648,7 @@ bool Scene::load(const std::string& path) {
     std::ifstream f(path);
     std::string tok;
     int ver = 0;
-    if (!(f >> tok >> ver) || tok != "CANYON3D" || ver < 1 || ver > 10) return false;
+    if (!(f >> tok >> ver) || tok != "CANYON3D" || ver < 1 || ver > 11) return false;
     Scene s;
     size_t embeddedPixels = 0;
     s.sky = skyPresets()[0];
@@ -2544,7 +2840,12 @@ bool Scene::load(const std::string& path) {
             f >> k.frame;
             rv(f, k.pos); rv(f, k.rot); rv(f, k.scl);
             if (ver >= 4 && !readEase(f, k.ease)) return false;
+            if (s.objs.back().curves) return false;
             putKey(s.objs.back().keys, k);
+        } else if (tok == "curves") {
+            if (ver < 11 || s.objs.empty() || s.objs.back().animatedTransform()) return false;
+            s.objs.back().curves = readTransformCurves(f, false);
+            if (!s.objs.back().curves) return false;
         } else if (tok == "appearance") {
             if (ver < 4 || s.objs.empty()) return false;
             AppearanceKey k;
@@ -2674,6 +2975,21 @@ bool Scene::load(const std::string& path) {
                     f >> vertex.joint[i] >> vertex.weight[i];
             if (!f || !validRig(*rig, o.mesh->skinVertices().size())) return false;
             o.rig = std::move(rig);
+        } else if (tok == "rigcurves") {
+            if (ver < 11 || s.objs.empty() || !s.objs.back().rig) return false;
+            auto& object = s.objs.back();
+            if (std::any_of(object.rig->joints.begin(), object.rig->joints.end(), [](const Joint& j) { return bool(j.curves); }))
+                return false;
+            auto rig = std::make_shared<Rig>(*object.rig);
+            size_t joints;
+            if (!(f >> joints) || !joints || joints > rig->joints.size()) return false;
+            for (size_t n = 0; n < joints; ++n) {
+                size_t index;
+                if (!(f >> index) || index >= rig->joints.size() || rig->joints[index].animatedTransform()) return false;
+                rig->joints[index].curves = readTransformCurves(f, true);
+                if (!rig->joints[index].curves) return false;
+            }
+            object.rig = std::move(rig);
         } else if (tok == "rigik") {
             if (ver < 8 || s.objs.empty()) return false;
             Object& o = s.objs.back();

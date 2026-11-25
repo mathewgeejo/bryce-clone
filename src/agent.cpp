@@ -264,7 +264,7 @@ bool apply(Scene& s, const std::string& op, std::istream& in, bool first) {
         int columns, rows;
         if (!(in >> columns >> rows) || columns < 1 || columns > 16 || rows < 1 || rows > 16
             || obj.type != ObjType::Terrain || !obj.hf || obj.parent >= 0 || obj.instanceSource >= 0
-            || obj.group || !obj.keys.empty() || !obj.appearances.empty() || !obj.terrainKeys.empty()
+            || obj.group || obj.animatedTransform() || !obj.appearances.empty() || !obj.terrainKeys.empty()
             || s.objs.size() + columns * rows - 1 > 20000) return false;
         obj.update();
         Object prototype = obj;
@@ -304,7 +304,35 @@ bool apply(Scene& s, const std::string& op, std::istream& in, bool first) {
     if (op == "key") {
         Key k;
         if (!(in >> k.frame) || k.frame < 0 || k.frame >= s.frames || !transform(in, k.pos, k.rot, k.scl)) return false;
-        putKey(obj.keys, k);
+        return setTransformKey(obj.keys, obj.curves, k);
+    }
+    if (op == "curve_key") {
+        std::string joint, channelName, mode;
+        CurveKey k;
+        if (!(in >> std::quoted(joint) >> k.frame) || joint.size() > 120 || k.frame < 0 || k.frame >= s.frames ||
+            !name(in, channelName) || !scalar(in, k.value, -1e6f, 1e6f) || !name(in, mode) ||
+            !scalar(in, k.in.fraction, 0, 1) || !scalar(in, k.in.offset, -2e6f, 2e6f) ||
+            !scalar(in, k.out.fraction, 0, 1) || !scalar(in, k.out.offset, -2e6f, 2e6f)) return false;
+        const char* channels[] = {"location_x", "location_y", "location_z", "rotation_x", "rotation_y", "rotation_z",
+                                  "scale_x", "scale_y", "scale_z"};
+        int channel = 0, ease = 0;
+        while (channel < TRANSFORM_CHANNELS && channelName != channels[channel]) ++channel;
+        while (ease < (int)CurveEase::COUNT && mode != curveEaseName((CurveEase)ease)) ++ease;
+        if (channel >= TRANSFORM_CHANNELS || ease >= (int)CurveEase::COUNT ||
+            (channel >= 6 && k.value < .01f)) return false;
+        k.ease = (CurveEase)ease;
+        auto insert = [&](auto& target, bool rigged) {
+            auto track = target.curves ? target.curves->channels[channel] : splitTransformChannel(target.keys, channel);
+            putKey(track, k);
+            return replaceTransformChannel(target.keys, target.curves, channel, std::move(track), rigged);
+        };
+        if (joint.empty()) return insert(obj, false);
+        if (!obj.rig) return false;
+        auto rig = std::make_shared<Rig>(*obj.rig);
+        auto at = std::find_if(rig->joints.begin(), rig->joints.end(), [&](const Joint& j) { return j.name == joint; });
+        if (at == rig->joints.end() || std::any_of(at + 1, rig->joints.end(), [&](const Joint& j) { return j.name == joint; }) ||
+            !insert(*at, true)) return false;
+        obj.rig = std::move(rig);
         return true;
     }
     if (op == "parent") {

@@ -71,12 +71,27 @@ std::set<size_t> gMeshSelection;
 int gMeshView = 0, gCurveChannel = 0, gCurveAxis = 0, gCurveKey = -1;
 bool gCurveJointTrack = false;
 int gCurveJoint = 0;
+enum class CurveDragMode { Scrub, Selection, Keys, Incoming, Outgoing };
+struct CurveDrag {
+    CurveDragMode mode = CurveDragMode::Scrub;
+    int x = 0, y = 0, key = -1, lastDx = 0, lastDy = 0;
+    float low = 0, high = 1;
+    CurveTrack source;
+    std::set<int> selected;
+};
+std::set<int> gCurveSelection;
+CurveDrag gCurveDrag;
+float gCurveZoom = 1, gCurveCenter = .5f;
+std::string gCurveMessage;
 int gMeshTransform = 0;
 float gMeshDistance = .25f;
 float gMeshInset = .25f, gMeshLoopFraction = .5f;
 float gMeshWeldDistance = .001f;
 bool gMeshPreserveUV = true;
 int gMeshBridgeSegments = 1, gMeshBridgeTwist = 0;
+int gMeshBevelSegments = 1, gMeshSymmetryAxis = 0;
+float gMeshBevelWidth = .15f, gMeshSymmetryPlane = 0, gMeshSymmetryTolerance = .001f;
+bool gMeshSymmetryPanel = false, gMeshPositiveSource = false, gMeshMirrorEdits = false;
 bool gMeshKnife = false;
 std::vector<PolygonCutPoint> gMeshCutPoints;
 V3 gMeshOffset;
@@ -772,6 +787,7 @@ void replicate(int times, V3 off, V3 rot, float scl, bool linked = false) {
                 o.scl *= std::pow(scl, (float)k);
             }
             o.keys.clear();
+            o.curves.reset();
             o.appearances.clear();
         }
         int begin = (int)gScene.objs.size(), end = begin + (int)copy.objs.size();
@@ -1301,9 +1317,16 @@ void togglePlayback() {
 void addKey() {
     int f = gScene.frame;
     if (gSelSet.empty()) putKey(gScene.camKeys, CamKey{f, gScene.cam});
-    for (int i : gSelSet) { Object& o = gScene.objs[i]; putKey(o.keys, Key{f, o.pos, o.rot, o.scl}); }
-    gChanged = true;
-    gStatus = "Key set at frame " + std::to_string(f) + (gSelSet.empty() ? " for the camera." : " for the selection.");
+    bool any = gSelSet.empty(), failed = false;
+    for (int i : gSelSet) {
+        Object& o = gScene.objs[i];
+        bool saved = setTransformKey(o.keys, o.curves, Key{f, o.pos, o.rot, o.scl});
+        any |= saved;
+        failed |= !saved;
+    }
+    gChanged |= any;
+    gStatus = failed ? "Some transforms are outside the curve limits." :
+        "Key set at frame " + std::to_string(f) + (gSelSet.empty() ? " for the camera." : " for the selection.");
 }
 
 void autoKey() { addKey(); }
@@ -1312,7 +1335,10 @@ void delKey() {
     int f = gScene.frame;
     bool any = false;
     if (gSelSet.empty()) any = eraseKey(gScene.camKeys, f);
-    for (int i : gSelSet) any |= eraseKey(gScene.objs[i].keys, f);
+    for (int i : gSelSet) {
+        auto& object = gScene.objs[i];
+        any |= removeTransformKeys(object.keys, object.curves, f);
+    }
     gChanged = true;
     gStatus = any ? "Removed key at frame " + std::to_string(f) + "." : "No key at this frame.";
 }
@@ -1324,11 +1350,14 @@ std::vector<int> keyFrames(bool sky) {
     else
         for (int i : gSelSet) {
             const auto& object = gScene.objs[i];
-            for (const auto& key : object.keys) r.push_back(key.frame);
+            auto appendTransformFrames = [&](const auto& o) {
+                auto frames = transformKeyFrames(o.keys, o.curves.get());
+                r.insert(r.end(), frames.begin(), frames.end());
+            };
+            appendTransformFrames(object);
             const auto& source = object.instanceSource >= 0 ? gScene.objs[object.instanceSource] : object;
             if (source.rig) {
-                for (const auto& joint : source.rig->joints)
-                    for (const auto& key : joint.keys) r.push_back(key.frame);
+                for (const auto& joint : source.rig->joints) appendTransformFrames(joint);
                 for (const auto& chain : source.rig->ik)
                     for (const auto& key : chain.keys) r.push_back(key.frame);
                 for (const auto& clip : source.rig->clips) {
@@ -1473,11 +1502,17 @@ void openLab(Lab l) {
         gMeshSelection.clear();
         gMeshKnife = false;
         gMeshCutPoints.clear();
+        gMeshSymmetryPanel = gMeshMirrorEdits = false;
         gMeshOffset = gMeshTransform == 2 ? V3(1) : V3{};
         gMeshMessage.clear();
     }
     if (l == LabCurves) {
         gCurveKey = -1;
+        gCurveSelection.clear();
+        gCurveDrag = {};
+        gCurveZoom = 1;
+        gCurveCenter = .5f;
+        gCurveMessage.clear();
         gCurveJointTrack = false;
         gCurveJoint = 0;
     }
@@ -2215,7 +2250,24 @@ void drawViewport() {
             const Object& o = gScene.objs[gSel];
             pen = rgb(240, 180, 70);
             auto at = [&](const Key& k) { return o.worldPos + o.parentSpace * (k.pos - o.pos); };
-            for (size_t i = 1; i < o.keys.size(); ++i) seg(at(o.keys[i - 1]), at(o.keys[i]));
+            if (o.curves) {
+                int first = INT_MAX, last = -1;
+                for (int channel = 0; channel < 3; ++channel) {
+                    const auto& track = o.curves->channels[channel];
+                    if (track.empty()) continue;
+                    first = std::min(first, track.front().frame);
+                    last = std::max(last, track.back().frame);
+                }
+                if (first < last) {
+                    V3 previous = at(o.sampleTransform((float)first));
+                    int samples = std::clamp(last - first, 1, 128);
+                    for (int i = 1; i <= samples; ++i) {
+                        V3 next = at(o.sampleTransform(lerpf((float)first, (float)last, (float)i / samples)));
+                        seg(previous, next);
+                        previous = next;
+                    }
+                }
+            } else for (size_t i = 1; i < o.keys.size(); ++i) seg(at(o.keys[i - 1]), at(o.keys[i]));
         }
         if (gCameraPath && gScene.camKeys.size() >= 2) {
             pen = rgb(115, 224, 213);
@@ -2664,7 +2716,12 @@ void drawMotionLab() {
                 gStatus = "Captured the base heightfield at this frame.";
             } else gStatus = "Remove a terrain shape key before adding another.";
         } else if (appearance) putKey(object->appearances, object->appearance(frame));
-        else if (object) putKey(object->keys, Key{frame, object->pos, object->rot, object->scl});
+        else if (object) {
+            if (!setTransformKey(object->keys, object->curves, Key{frame, object->pos, object->rot, object->scl})) {
+                gStatus = "The motion key exceeds a curve limit.";
+                return;
+            }
+        }
         else putKey(gScene.camKeys, CamKey{frame, gScene.cam});
         sceneChanged();
     }
@@ -2739,6 +2796,35 @@ void drawMotionLab() {
             note({x, y + 34, w, 58}, "Edit materials, pictures, terrain or lights at the target frame, then set an appearance key here.");
             return changed;
         });
+    } else if (object && object->curves) {
+        auto frames = transformKeyFrames(object->keys, object->curves.get());
+        gMotionKey = std::clamp(gMotionKey, 0, (int)frames.size() - 1);
+        if (button({x, y, 30, 24}, "<") && gMotionKey > 0) --gMotionKey;
+        if (button({x + 34, y, 30, 24}, ">") && gMotionKey + 1 < (int)frames.size()) ++gMotionKey;
+        int keyFrame = frames[gMotionKey];
+        if (button({x + 68, y, 132, 24}, ("Go to Key " + std::to_string(keyFrame)).c_str())) setFrame(keyFrame);
+        if (button({x + 204, y, 140, 24}, "Remove Frame Keys")) {
+            removeTransformKeys(object->keys, object->curves, keyFrame);
+            gScene.applyFrame(gScene.frame);
+            sceneChanged();
+            return;
+        }
+        if (button({x + 348, y, 126, 24}, "Curve Editor")) {
+            closeLab(false);
+            defer([] { openLab(LabCurves); });
+            return;
+        }
+        y += 36;
+        int target = keyFrame;
+        if (sliderI({x, y, w, 24}, "Move Frame Keys", target, 0, gScene.frames - 1) && target != keyFrame) {
+            if (retimeTransformKeys(object->curves, keyFrame, target)) {
+                frames = transformKeyFrames(object->keys, object->curves.get());
+                gMotionKey = (int)(std::lower_bound(frames.begin(), frames.end(), target) - frames.begin());
+                setFrame(target);
+                sceneChanged();
+            } else gStatus = "A channel already has a key on the destination frame.";
+        }
+        note({x, y + 36, w, 46}, "Frame operations affect each channel keyed on that frame. Edit individual values and handles in Curve Editor.");
     } else if (object) {
         track(object->keys, [&](Key& k) {
             bool ch = row3(x, y, w, "Path Point", k.pos, 0.05f);
@@ -2932,24 +3018,31 @@ void drawMeshLab() {
             gMeshSelection.clear();
             gMeshKnife = false;
             gMeshCutPoints.clear();
+            gMeshSymmetryPanel = false;
             gMeshMessage.clear();
         }
     }
     const char* viewNames[] = {"3D", "Front", "Top", "Side"};
     for (int i = 0; i < 4; ++i)
         if (button({view.x + 282 + 69 * i, view.y - 33, 64, 25}, viewNames[i], i == gMeshView)) gMeshView = i;
+    if (polygon && !gMeshKnife &&
+        button({x, view.y - 33, width, 25}, gMeshMirrorEdits ? "Symmetry  |  Mirror On" : "Symmetry", gMeshSymmetryPanel)) {
+        gMeshSymmetryPanel = !gMeshSymmetryPanel;
+        gMeshMessage.clear();
+    }
     M3 direction;
     if (gMeshView == 0) direction = rotX(rad(-25.f)) * rotY(rad(35.f));
     if (gMeshView == 2) direction = rotX(rad(90.f));
     if (gMeshView == 3) direction = rotY(rad(90.f));
     V3 center = (mesh.bmin + mesh.bmax) * .5f;
     float factor = .82f * view.h / std::max(length(mesh.bmax - mesh.bmin), .001f);
+    auto project = [&](V3 v) {
+        V3 p = direction * (v - center);
+        return V3(view.x + view.w * .5f + p.x * factor, view.y + view.h * .5f - p.y * factor, p.z);
+    };
     std::vector<V3> points;
     points.reserve(positions.size());
-    for (V3 v : positions) {
-        V3 p = direction * (v - center);
-        points.push_back({view.x + view.w * .5f + p.x * factor, view.y + view.h * .5f - p.y * factor, p.z});
-    }
+    for (V3 v : positions) points.push_back(project(v));
     using Edge = std::pair<uint32_t, uint32_t>;
     static std::weak_ptr<const Mesh> previousMesh;
     static std::vector<Edge> edges;
@@ -2971,7 +3064,7 @@ void drawMeshLab() {
     }
     int id = newId();
     press(view, id);
-    if (clicked(view, id)) {
+    if (clicked(view, id) && !gMeshSymmetryPanel) {
         float bestDist = 81.f, bestDepth = -1e30f;
         float edgeFraction = .5f;
         size_t hit = SIZE_MAX;
@@ -3034,6 +3127,20 @@ void drawMeshLab() {
     };
     fill(view, rgb(25, 29, 36));
     setClip(view);
+    if (gMeshSymmetryPanel || gMeshMirrorEdits) {
+        V3 span = mesh.bmax - mesh.bmin;
+        float minSpan = std::max(.01f, .65f * maxc(span));
+        int u = (gMeshSymmetryAxis + 1) % 3, v = (gMeshSymmetryAxis + 2) % 3;
+        const V3 axes[] = {{1,0,0}, {0,1,0}, {0,0,1}};
+        V3 base = center + axes[gMeshSymmetryAxis] * (gMeshSymmetryPlane - center[gMeshSymmetryAxis]);
+        V3 a = axes[u] * std::max(minSpan, .62f * span[u]), b = axes[v] * std::max(minSpan, .62f * span[v]);
+        const V3 corners[] = {project(base - a - b), project(base + a - b),
+                              project(base + a + b), project(base - a + b)};
+        for (int i = 0; i < 4; ++i) {
+            V3 p = corners[i], q = corners[(i + 1) % 4];
+            line((int)p.x, (int)p.y, (int)q.x, (int)q.y, rgb(57, 142, 143));
+        }
+    }
     for (size_t i = 0; i < edges.size(); ++i)
         edgeLine(edges[i].first, edges[i].second, !gMeshKnife && gMeshPick == MeshPick::Edge && gMeshSelection.count(i) ?
                  rgb(255, 194, 83) : rgb(132, 153, 177));
@@ -3070,7 +3177,7 @@ void drawMeshLab() {
     y += 26;
     size_t limit = gMeshPick == MeshPick::Vertex ? positions.size() :
                    gMeshPick == MeshPick::Edge ? edges.size() : faceCount;
-    if (!gMeshKnife) {
+    if (!gMeshKnife && !gMeshSymmetryPanel) {
         if (button({x, y, 108, 24}, "Select All"))
             for (size_t i = 0; i < limit; ++i) gMeshSelection.insert(i);
         if (button({x + 114, y, 108, 24}, "Clear")) gMeshSelection.clear();
@@ -3092,6 +3199,39 @@ void drawMeshLab() {
         commit(std::move(edited), message, resetSelection);
         return true;
     };
+    if (gMeshSymmetryPanel) {
+        label(x, y - 29, "Mirror Plane in Mesh Space", width);
+        const char* axes[] = {"X", "Y", "Z"};
+        for (int axis = 0; axis < 3; ++axis)
+            if (button({x + 76 * axis, y, 70, 24}, axes[axis], gMeshSymmetryAxis == axis)) gMeshSymmetryAxis = axis;
+        y += 29;
+        dragF({x, y, width, 24}, "Plane Position", gMeshSymmetryPlane, .02f, -1000, 1000, "%.3f");
+        y += 29;
+        dragF({x, y, width, 24}, "Match and Seam Distance", gMeshSymmetryTolerance, .0001f, 0, 100, "%.4f");
+        y += 29;
+        if (button({x, y, 108, 24}, "Keep Negative", !gMeshPositiveSource)) gMeshPositiveSource = false;
+        if (button({x + 114, y, 108, 24}, "Keep Positive", gMeshPositiveSource)) gMeshPositiveSource = true;
+        y += 29;
+        toggle({x, y, width, 24}, "Mirror Component Transforms", gMeshMirrorEdits);
+        y += 31;
+        if (bound) note({x, y, width, 48}, "Unbind skin in the Rig Editor to symmetrize the topology.");
+        else if (button({x, y, width, 24}, "Symmetrize Mesh")) {
+            PolygonMesh edited = *polygon;
+            if (symmetrizePolygons(edited, gMeshSymmetryAxis, gMeshSymmetryPlane,
+                                  gMeshPositiveSource, gMeshSymmetryTolerance))
+                commitPolygons(std::move(edited), "Mirrored the chosen side and joined the seam.", true);
+            else gMeshMessage = "The chosen side is empty or the plane would create invalid faces.";
+            return;
+        }
+        if (button({x, y + 55, width, 24}, "Back to Components")) {
+            gMeshSymmetryPanel = false;
+            gMeshMessage.clear();
+        }
+        note({view.x, view.y + view.h + 8, view.w, 30}, gMeshMessage.empty() ?
+             "Symmetrize replaces the opposite side. Mirror Transforms pairs nearby vertices during edits." : gMeshMessage.c_str());
+        labFooter(panelRect);
+        return;
+    }
     if (gMeshKnife) {
         std::string count = std::to_string(gMeshCutPoints.size()) + " knife points";
         label(x, y - 30, count.c_str(), width);
@@ -3146,6 +3286,16 @@ void drawMeshLab() {
             else if (polygon) for (const auto& corner : polygon->faces[i]) vertices.insert(corner.vertex);
             else vertices.insert(mesh.tri.begin() + i * 3, mesh.tri.begin() + i * 3 + 3);
         }
+        std::vector<uint32_t> partners;
+        if (polygon && gMeshMirrorEdits) {
+            partners = matchPolygonSymmetry(*polygon, gMeshSymmetryAxis, gMeshSymmetryPlane, gMeshSymmetryTolerance);
+            for (auto i = vertices.begin(); i != vertices.end();) {
+                uint32_t other = partners[*i];
+                bool preferred = (positions[*i][gMeshSymmetryAxis] > gMeshSymmetryPlane) == gMeshPositiveSource;
+                if (other != UINT32_MAX && other != *i && vertices.count(other) && !preferred) i = vertices.erase(i);
+                else ++i;
+            }
+        }
         V3 pivot;
         for (uint32_t i : vertices) pivot += positions[i];
         pivot = pivot / (float)vertices.size();
@@ -3161,8 +3311,23 @@ void drawMeshLab() {
         if (polygon) {
             PolygonMesh edited = *polygon;
             transform(edited.positions);
+            int mirrored = 0, unpaired = 0;
+            if (!partners.empty()) {
+                for (uint32_t i : vertices) {
+                    uint32_t other = partners[i];
+                    if (other == UINT32_MAX) { ++unpaired; continue; }
+                    V3 p = edited.positions[i];
+                    float* coordinates[] = {&p.x, &p.y, &p.z};
+                    float& axis = *coordinates[gMeshSymmetryAxis];
+                    axis = other == i ? gMeshSymmetryPlane : gMeshSymmetryPlane + (gMeshSymmetryPlane - axis);
+                    edited.positions[other] = p;
+                    if (other != i) ++mirrored;
+                }
+            }
             clearPolygonNormals(edited);
-            if (!commitPolygons(std::move(edited), "Transformed the selected components.")) return;
+            std::string message = partners.empty() ? "Transformed the selected components." :
+                "Mirrored " + std::to_string(mirrored) + " vertex edits. " + std::to_string(unpaired) + " unpaired vertices edited on one side.";
+            if (!commitPolygons(std::move(edited), message.c_str())) return;
         } else {
             Mesh edited = mesh;
             transform(edited.v);
@@ -3317,6 +3482,17 @@ void drawMeshLab() {
                 gMeshKnife = true;
                 gMeshCutPoints.clear();
                 gMeshMessage.clear();
+                return;
+            }
+            y += 30;
+            dragF({x, y, 108, 24}, "Bevel Width", gMeshBevelWidth, .01f, .0001f, 1000, "%.3f");
+            dragI({x + 114, y, 108, 24}, "Bevel Segments", gMeshBevelSegments, .12f, 1, 16);
+            y += 28;
+            if (button({x, y, width, 24}, "Bevel Edges")) {
+                PolygonMesh edited = *polygon;
+                if (bevelPolygonEdges(edited, selectedEdges(), gMeshBevelWidth, gMeshBevelSegments))
+                    commitPolygons(std::move(edited), "Beveled the selected edges.", true);
+                else gMeshMessage = "Choose closed-manifold edges and reduce the width if faces overlap.";
                 return;
             }
             y += 30;
@@ -3667,7 +3843,8 @@ void drawRigLab() {
                 gViewPreviewDirty = gNanoDirty = true;
             }
             y += 30;
-            Key poseKey = sampleTransformTrack(joint.keys, (float)frame, joint.pose);
+            Key poseKey = joint.sampleTransform((float)frame);
+            Key original = poseKey;
             bool changed = vecRow("Local Translation", poseKey.pos, .025f, -100000, 100000);
             changed |= vecRow("Local Rotation", poseKey.rot, .5f, -100000, 100000);
             changed |= vecRow("Local Scale", poseKey.scl, .025f, .01f, 100);
@@ -3675,16 +3852,26 @@ void drawRigLab() {
             bool remove = button({x + 114, y, width - 114, 24}, "Delete Key");
             y += 30;
             bool reset = button({x, y, 108, 24}, "Reset Pose");
-            bool ease = button({x + 114, y, width - 114, 24}, (std::string("Ease ") + easeName(poseKey.ease)).c_str());
+            bool ease = !joint.curves &&
+                button({x + 114, y, width - 114, 24}, (std::string("Ease ") + easeName(poseKey.ease)).c_str());
             if (changed || key || remove || reset || ease) {
                 Rig edited = *rig;
                 auto& target = edited.joints[gRigJoint];
                 if (reset) { poseKey.pos = {}; poseKey.rot = {}; poseKey.scl = V3(1); }
                 if (ease) poseKey.ease = (Ease)(((int)poseKey.ease + 1) % (int)Ease::COUNT);
                 if (remove) {
-                    if (!eraseKey(target.keys, frame)) { gRigMessage = "There is no key on this frame."; return; }
-                } else if (key || !target.keys.empty()) {
-                    putKey(target.keys, poseKey);
+                    if (!removeTransformKeys(target.keys, target.curves, frame)) { gRigMessage = "There is no key on this frame."; return; }
+                } else if (key || target.animatedTransform()) {
+                    unsigned mask = (1u << TRANSFORM_CHANNELS) - 1;
+                    if (target.curves && !key && !reset) {
+                        mask = 0;
+                        for (int i = 0; i < TRANSFORM_CHANNELS; ++i)
+                            if (transformChannelValue(poseKey, i) != transformChannelValue(original, i)) mask |= 1u << i;
+                    }
+                    if (!setTransformKey(target.keys, target.curves, poseKey, true, mask)) {
+                        gRigMessage = "The pose key exceeds a curve limit.";
+                        return;
+                    }
                 } else target.pose = poseKey;
                 commit(std::move(edited), remove ? "Deleted the pose key." : "Updated the joint pose.");
                 return;
@@ -3780,182 +3967,350 @@ void drawRigLab() {
 
 void drawCurveLab() {
     Object& object = gScene.objs[gSel];
-    R p = panel(810, 510, "Curve Editor  -  " + object.name);
-    int x = p.x + 16, y = p.y + 48;
+    R p = panel(860, 540, "Curve Editor  -  " + object.name);
+    int x = p.x + 16, y = p.y + 44, width = p.w - 32;
+    auto clearSelection = [&] {
+        gCurveSelection.clear();
+        gCurveKey = -1;
+        gCurveMessage.clear();
+    };
+    auto select = [&](int frame) {
+        gCurveSelection = {frame};
+        gCurveKey = frame;
+    };
     const char* channels[] = {"Location", "Rotation", "Scale"};
     const char* axes[] = {"X", "Y", "Z"};
     for (int i = 0; i < 3; ++i) {
-        if (button({x + i * 96, y, 90, 24}, channels[i], i == gCurveChannel)) gCurveChannel = i;
-        if (button({x + 302 + i * 44, y, 40, 24}, axes[i], i == gCurveAxis)) gCurveAxis = i;
+        if (button({x + i * 96, y, 90, 24}, channels[i], i == gCurveChannel) && i != gCurveChannel) {
+            gCurveChannel = i;
+            clearSelection();
+        }
+        if (button({x + 294 + i * 42, y, 38, 24}, axes[i], i == gCurveAxis) && i != gCurveAxis) {
+            gCurveAxis = i;
+            clearSelection();
+        }
     }
     if (object.rig && !object.rig->joints.empty()) {
-        if (button({x + 438, y, 80, 24}, gCurveJointTrack ? "Joint" : "Object", gCurveJointTrack)) {
+        if (button({x + 426, y, 78, 24}, gCurveJointTrack ? "Joint" : "Object", gCurveJointTrack)) {
             gCurveJointTrack = !gCurveJointTrack;
-            gCurveKey = -1;
+            clearSelection();
         }
-        if (gCurveJointTrack && button({x + 523, y, 112, 24}, object.rig->joints[gCurveJoint].name.c_str(), false, gSmall)) {
+        if (gCurveJointTrack && button({x + 510, y, 140, 24}, object.rig->joints[gCurveJoint].name.c_str(), false, gSmall)) {
             int size = (int)object.rig->joints.size();
             gCurveJoint = (gCurveJoint + (gIn.shift ? size - 1 : 1)) % size;
-            gCurveKey = -1;
+            clearSelection();
         }
     }
     bool jointTrack = gCurveJointTrack && object.rig && !object.rig->joints.empty();
-    Key fallback{0, object.pos, object.rot, object.scl};
-    std::vector<Key> jointKeys;
-    if (jointTrack) {
-        const auto& joint = object.rig->joints[gCurveJoint];
-        fallback = joint.pose;
-        jointKeys = joint.keys;
-    }
-    auto& keys = jointTrack ? jointKeys : object.keys;
-    auto commitKeys = [&] {
-        if (jointTrack) {
-            auto rig = std::make_shared<Rig>(*object.rig);
-            rig->joints[gCurveJoint].keys = jointKeys;
-            object.rig = std::move(rig);
-        }
-        gScene.applyFrame(gScene.frame);
-        sceneChanged();
-    };
-    auto value = [&](Key& key) -> float& {
-        auto& v = gCurveChannel == 0 ? key.pos : gCurveChannel == 1 ? key.rot : key.scl;
-        return gCurveAxis == 0 ? v.x : gCurveAxis == 1 ? v.y : v.z;
+    const Joint* joint = jointTrack ? &object.rig->joints[gCurveJoint] : nullptr;
+    Key fallback = joint ? joint->pose : Key{0, object.pos, object.rot, object.scl};
+    const auto& legacy = joint ? joint->keys : object.keys;
+    const auto& curves = joint ? joint->curves : object.curves;
+    int channel = gCurveChannel * 3 + gCurveAxis;
+    CurveTrack keys = curves ? curves->channels[channel] : splitTransformChannel(legacy, channel);
+    float baseline = transformChannelValue(fallback, channel);
+    float minimum = gCurveChannel == 2 ? .01f : -1e6f, maximum = jointTrack && gCurveChannel == 2 ? 100.f : 1e6f;
+    int last = std::max(1, gScene.frames - 1);
+    auto sample = [&](float time) {
+        float value = sampleCurve(keys, time, baseline);
+        return gCurveChannel == 2 && !keys.empty() ? clampf(value, minimum, maximum) : value;
     };
     auto scrub = [&](int frame) {
-        if (gScene.frame == frame) return;
-        gScene.applyFrame(frame);
-        gShowRender = false;
-        gNanoDirty = gViewPreviewDirty = true;
+        if (gScene.frame != frame) {
+            gScene.applyFrame(frame);
+            gShowRender = false;
+            gNanoDirty = gViewPreviewDirty = true;
+        }
     };
-    auto choose = [&](int frame) {
-        gCurveKey = (int)(std::lower_bound(keys.begin(), keys.end(), frame,
-            [](const Key& key, int time) { return key.frame < time; }) - keys.begin());
+    auto commit = [&](CurveTrack edited) {
+        bool saved;
+        if (jointTrack) {
+            auto rig = std::make_shared<Rig>(*object.rig);
+            auto& target = rig->joints[gCurveJoint];
+            saved = replaceTransformChannel(target.keys, target.curves, channel, edited, true);
+            if (saved) object.rig = std::move(rig);
+        } else saved = replaceTransformChannel(object.keys, object.curves, channel, edited);
+        if (!saved) {
+            gCurveMessage = "The channel exceeds a key count, value or handle limit.";
+            return false;
+        }
+        keys = std::move(edited);
+        gCurveMessage.clear();
+        gScene.applyFrame(gScene.frame);
+        sceneChanged();
+        return true;
     };
-    if (button({p.x + p.w - 152, y, 136, 24}, "Set Key Here")) {
-        Key key = sampleTransformTrack(keys, (float)gScene.frame, fallback);
-        bool room = !jointTrack || keys.size() < MAX_JOINT_KEYS ||
-                    std::any_of(keys.begin(), keys.end(), [&](const Key& other) { return other.frame == key.frame; });
-        if (!room) return;
-        putKey(keys, key);
-        choose(key.frame);
-        commitKeys();
+    auto find = [](const CurveTrack& track, int frame) {
+        return std::lower_bound(track.begin(), track.end(), frame, [](const auto& key, int f) { return key.frame < f; });
+    };
+    auto shiftKeys = [&](CurveTrack& track, const std::set<int>& chosen, int frames, float amount) {
+        for (auto& point : track) {
+            if (!chosen.count(point.frame)) continue;
+            point.frame += frames;
+            if (point.frame < 0 || point.frame > last) return false;
+            if (amount != 0) point.value = clampf(point.value + amount, minimum, maximum);
+        }
+        std::sort(track.begin(), track.end(), [](const auto& a, const auto& b) { return a.frame < b.frame; });
+        return std::adjacent_find(track.begin(), track.end(), [](const auto& a, const auto& b) {
+            return a.frame == b.frame;
+        }) == track.end();
+    };
+    auto updateSelection = [&](const std::set<int>& before, int anchor, int delta) {
+        gCurveSelection.clear();
+        for (int frame : before) gCurveSelection.insert(frame + delta);
+        gCurveKey = anchor + delta;
+    };
+    if (button({p.x + p.w - 184, y, 168, 24}, "Set Channel Key")) {
+        auto edited = keys;
+        int frame = gScene.frame;
+        if (!insertCurveSample(edited, frame, baseline) || commit(std::move(edited))) select(frame);
     }
-    R area{x, y + 36, p.w - 32, 294};
+
+    y += 32;
+    slider({x, y, 174, 24}, "Time Zoom", gCurveZoom, 1, 64, "%.1fx", true);
+    int centerFrame = (int)std::lround(gCurveCenter * last);
+    if (sliderI({x + 180, y, 178, 24}, "Center Frame", centerFrame, 0, last))
+        gCurveCenter = (float)centerFrame / last;
+    if (button({x + 364, y, 116, 24}, "Fit Keys")) {
+        int firstKey = last, lastKey = 0;
+        for (const auto& point : keys) {
+            if (!gCurveSelection.empty() && !gCurveSelection.count(point.frame)) continue;
+            firstKey = std::min(firstKey, point.frame);
+            lastKey = std::max(lastKey, point.frame);
+        }
+        if (lastKey >= firstKey) {
+            float span = std::max(6.f, (lastKey - firstKey) * 1.18f);
+            gCurveZoom = clampf(last / span, 1, 64);
+            gCurveCenter = clampf((firstKey + lastKey) * .5f / last, 0, 1);
+        }
+    }
+    if (button({x + 486, y, 112, 24}, "Reset View")) { gCurveZoom = 1; gCurveCenter = .5f; }
+    label(x + 610, y + 3, ("Frame " + std::to_string(gScene.frame)).c_str(), 155);
+
+    R area{x, y + 34, width, 294};
     R graph{area.x + 64, area.y + 13, area.w - 82, area.h - 37};
-    int last = std::max(1, gScene.frames - 1);
-    auto posX = [&](float frame) { return (int)std::lround(graph.x + graph.w * clampf(frame / (float)last, 0, 1)); };
-    auto sample = [&](float frame) { Key key = sampleTransformTrack(keys, frame, fallback); return value(key); };
-    std::vector<float> samples(graph.w + 1);
-    float low = sample(0), high = low;
-    for (int i = 0; i <= graph.w; ++i) {
-        samples[i] = sample(last * (float)i / graph.w);
-        low = std::min(low, samples[i]);
-        high = std::max(high, samples[i]);
+    float span = std::min((float)last, std::max(1.f, last / gCurveZoom));
+    float first = clampf(gCurveCenter * last - span * .5f, 0, last - span);
+    auto visible = [&](float frame) { return frame >= first && frame <= first + span; };
+    auto posX = [&](float frame) { return (int)std::lround(graph.x + graph.w * ((frame - first) / span)); };
+    auto frameAt = [&](int px) { return first + span * clampf((px - graph.x) / (float)graph.w, 0, 1); };
+    struct HandlePoint { CurveDragMode mode; float frame, value; };
+    auto handlesFor = [&](int frame) {
+        std::vector<HandlePoint> points;
+        auto at = find(keys, frame);
+        if (at == keys.end() || at->frame != frame) return points;
+        if (at != keys.begin() && (at - 1)->ease == CurveEase::Bezier) {
+            auto handle = bezierHandles(*(at - 1), *at)[1];
+            points.push_back({CurveDragMode::Incoming, frame - handle.fraction * (frame - (at - 1)->frame),
+                              at->value + handle.offset});
+        }
+        if (at + 1 != keys.end() && at->ease == CurveEase::Bezier) {
+            auto handle = bezierHandles(*at, *(at + 1))[0];
+            points.push_back({CurveDragMode::Outgoing, frame + handle.fraction * ((at + 1)->frame - frame),
+                              at->value + handle.offset});
+        }
+        return points;
+    };
+
+    int id = newId();
+    bool dragging = gActive == id && gIn.down && gCurveDrag.mode != CurveDragMode::Scrub &&
+                    gCurveDrag.mode != CurveDragMode::Selection;
+    float low = sample(first), high = low;
+    for (int i = 1; i <= graph.w; ++i) {
+        float value = sample(first + span * i / graph.w);
+        low = std::min(low, value);
+        high = std::max(high, value);
     }
-    for (auto& key : keys) {
-        if (key.frame > last) break;
-        low = std::min(low, value(key));
-        high = std::max(high, value(key));
+    for (auto at = find(keys, (int)std::ceil(first)); at != keys.end() && visible((float)at->frame); ++at) {
+        low = std::min(low, at->value);
+        high = std::max(high, at->value);
     }
+    if (visible((float)gCurveKey))
+        for (const auto& handle : handlesFor(gCurveKey)) if (visible(handle.frame)) {
+            low = std::min(low, handle.value);
+            high = std::max(high, handle.value);
+        }
     float margin = std::max(gCurveChannel == 1 ? 5.f : gCurveChannel == 2 ? .1f : .5f, (high - low) * .12f);
     low -= margin;
     high += margin;
-    int id = newId();
-    static float dragLow = 0, dragHigh = 1;
-    static bool dragPoint = false;
-    if (gActive == id && gIn.down && dragPoint) { low = dragLow; high = dragHigh; }
-    auto posY = [&](float v) {
-        return (int)std::lround(graph.y + graph.h * (1 - clampf((v - low) / (high - low), 0, 1)));
+    if (dragging) { low = gCurveDrag.low; high = gCurveDrag.high; }
+    auto posY = [&](float value) {
+        return (int)std::lround(graph.y + graph.h * (1 - clampf((value - low) / (high - low), 0, 1)));
     };
     press(graph, id);
     if (gActive == id && gIn.pressed) {
-        int best = 121;
-        int hitKey = -1;
-        for (size_t i = 0; i < keys.size(); ++i) {
-            if (keys[i].frame > last) break;
-            int dx = posX((float)keys[i].frame) - gIn.mx, dy = posY(value(keys[i])) - gIn.my;
-            int distance = dx * dx + dy * dy;
-            if (distance < best) { best = distance; hitKey = (int)i; }
+        auto distance = [&](float frame, float value) {
+            int dx = posX(frame) - gIn.mx, dy = posY(value) - gIn.my;
+            return dx * dx + dy * dy;
+        };
+        CurveDragMode mode = CurveDragMode::Scrub;
+        int hit = -1, best = 100;
+        for (const auto& point : handlesFor(gCurveKey)) {
+            if (!visible(point.frame) || gIn.shift) continue;
+            int d = distance(point.frame, point.value);
+            if (d < best) { best = d; mode = point.mode; }
         }
-        dragPoint = hitKey >= 0;
-        dragLow = low;
-        dragHigh = high;
-        if (dragPoint) {
-            gCurveKey = hitKey;
-            scrub(keys[gCurveKey].frame);
+        if (mode == CurveDragMode::Scrub) {
+            for (auto at = find(keys, (int)std::ceil(first)); at != keys.end() && visible((float)at->frame); ++at) {
+                int d = distance((float)at->frame, at->value);
+                if (d < best) { best = d; hit = at->frame; }
+            }
+            if (hit >= 0) {
+                if (gIn.shift && gCurveSelection.erase(hit)) {
+                    gCurveKey = gCurveSelection.empty() ? -1 : *gCurveSelection.begin();
+                } else {
+                    if (!gIn.shift && !gCurveSelection.count(hit)) select(hit);
+                    else { gCurveSelection.insert(hit); gCurveKey = hit; }
+                }
+                mode = gIn.shift ? CurveDragMode::Selection : CurveDragMode::Keys;
+                scrub(hit);
+            }
         }
+        bool editable = mode == CurveDragMode::Keys || mode == CurveDragMode::Incoming || mode == CurveDragMode::Outgoing;
+        gCurveDrag = {mode, gIn.mx, gIn.my, gCurveKey, 0, 0, low, high, editable ? keys : CurveTrack{}, gCurveSelection};
     }
     if (gActive == id && gIn.down) {
-        if (dragPoint && gCurveKey >= 0 && gIn.dy) {
-            float& v = value(keys[gCurveKey]);
-            float maximum = jointTrack && gCurveChannel == 2 ? 100.f : 1e6f;
-            v = clampf(v - gIn.dy * (dragHigh - dragLow) / graph.h, gCurveChannel == 2 ? .01f : -1e6f, maximum);
-            commitKeys();
-        } else if (!dragPoint) {
-            int frame = (int)std::lround(last * clampf((gIn.mx - graph.x) / (float)graph.w, 0, 1));
-            scrub(frame);
+        auto& drag = gCurveDrag;
+        if (drag.mode == CurveDragMode::Scrub) {
+            scrub((int)std::lround(frameAt(gIn.mx)));
+        } else if (drag.mode != CurveDragMode::Selection) {
+            int dx = gIn.mx - drag.x, dy = gIn.my - drag.y;
+            if (dx != drag.lastDx || dy != drag.lastDy) {
+                drag.lastDx = dx;
+                drag.lastDy = dy;
+                auto edited = drag.source;
+                float amount = -dy * (drag.high - drag.low) / graph.h;
+                if (drag.mode == CurveDragMode::Keys) {
+                    int frames = (int)std::lround(dx * span / graph.w);
+                    if (!shiftKeys(edited, drag.selected, frames, amount)) gCurveMessage = "The move would collide with another key or leave the timeline.";
+                    else if (commit(std::move(edited))) {
+                        updateSelection(drag.selected, drag.key, frames);
+                        scrub(gCurveKey);
+                    }
+                } else {
+                    size_t i = (size_t)(find(edited, drag.key) - edited.begin());
+                    bool incoming = drag.mode == CurveDragMode::Incoming;
+                    auto& key = edited[i];
+                    auto& neighbor = edited[incoming ? i - 1 : i + 1];
+                    auto original = incoming ? bezierHandles(neighbor, key)[1] : bezierHandles(key, neighbor)[0];
+                    const auto& opposite = incoming ? neighbor.out : neighbor.in;
+                    float timing = dx * span / (graph.w * std::abs(neighbor.frame - key.frame));
+                    CurveHandle& handle = incoming ? key.in : key.out;
+                    handle.fraction = clampf(original.fraction + (incoming ? -timing : timing), 0, 1 - opposite.fraction);
+                    handle.offset = clampf(original.offset + amount, -2e6f, 2e6f);
+                    commit(std::move(edited));
+                }
+            }
         }
     }
+    if (gActive == id && gIn.released) gCurveDrag.source.clear();
+
     fill(area, rgb(25, 29, 36));
     for (int i = 0; i <= 4; ++i) {
-        int gy = graph.y + i * graph.h / 4;
-        int gx = graph.x + i * graph.w / 4;
+        int gy = graph.y + i * graph.h / 4, gx = graph.x + i * graph.w / 4;
         line(graph.x, gy, graph.x + graph.w, gy, rgb(58, 67, 83));
         line(gx, graph.y, gx, graph.y + graph.h, rgb(58, 67, 83));
         char tick[32];
         std::snprintf(tick, sizeof tick, "%.3g", lerpf(high, low, i * .25f));
         textIn({area.x, gy - 8, 60, 16}, tick, TXT_DIM, gSmall, TextRight | TextMiddle);
-        std::snprintf(tick, sizeof tick, "%d", (int)std::lround(last * i * .25f));
+        std::snprintf(tick, sizeof tick, "%d", (int)std::lround(first + span * i * .25f));
         textIn({gx - 24, graph.y + graph.h + 4, 48, 16}, tick, TXT_DIM, gSmall);
     }
-    int playhead = posX((float)gScene.frame);
-    line(playhead, graph.y, playhead, graph.y + graph.h, rgb(235, 147, 92));
-    for (int i = 1; i <= graph.w; ++i)
-        line(graph.x + i - 1, posY(samples[i - 1]), graph.x + i, posY(samples[i]), rgb(111, 205, 236));
-    for (size_t i = 0; i < keys.size(); ++i) {
-        if (keys[i].frame > last) break;
-        int gx = posX((float)keys[i].frame), gy = posY(value(keys[i]));
-        fill({gx - 3, gy - 3, 7, 7}, (int)i == gCurveKey ? rgb(255, 200, 80) : rgb(180, 223, 242));
+    if (visible((float)gScene.frame)) {
+        int playhead = posX((float)gScene.frame);
+        line(playhead, graph.y, playhead, graph.y + graph.h, rgb(235, 147, 92));
     }
+    int previous = posY(sample(first));
+    for (int i = 1; i <= graph.w; ++i) {
+        int now = posY(sample(first + span * i / graph.w));
+        line(graph.x + i - 1, previous, graph.x + i, now, rgb(111, 205, 236));
+        previous = now;
+    }
+    setClip(graph);
+    auto active = find(keys, gCurveKey);
+    bool hasActive = active != keys.end() && active->frame == gCurveKey;
+    if (hasActive && visible((float)active->frame)) {
+        int gx = posX((float)active->frame), gy = posY(active->value);
+        for (const auto& handle : handlesFor(gCurveKey)) {
+            int hx = posX(handle.frame), hy = posY(handle.value);
+            line(gx, gy, hx, hy, rgb(227, 181, 90));
+            circle(hx, hy, 4, rgb(249, 198, 96));
+        }
+    }
+    for (auto at = find(keys, (int)std::ceil(first)); at != keys.end() && visible((float)at->frame); ++at) {
+        int gx = posX((float)at->frame), gy = posY(at->value);
+        fill({gx - 3, gy - 3, 7, 7}, at->frame == gCurveKey ? rgb(255, 200, 80) :
+             gCurveSelection.count(at->frame) ? rgb(244, 161, 102) : rgb(180, 223, 242));
+    }
+    clearClip();
     bevel(area, true);
-    y = area.y + area.h + 10;
-    if (gCurveKey >= 0 && gCurveKey < (int)keys.size()) {
-        Key& key = keys[gCurveKey];
-        int frame = key.frame;
-        bool retime = dragI({x, y, 140, 24}, "Key Frame", frame, .25f, 0, last);
-        bool change = dragF({x + 146, y, 153, 24}, "Key Value", value(key), (high - low) / 250,
-                            gCurveChannel == 2 ? .01f : -1e6f, jointTrack && gCurveChannel == 2 ? 100.f : 1e6f, "%.3f");
-        std::string ease = std::string("Ease ") + easeName(key.ease);
-        if (button({x + 305, y, 118, 24}, ease.c_str())) {
-            key.ease = (Ease)(((int)key.ease + 1) % (int)Ease::COUNT);
-            change = true;
+
+    y = area.y + area.h + 11;
+    if (hasActive) {
+        CurveKey anchor = *active;
+        int frame = anchor.frame;
+        float value = anchor.value;
+        bool moved = dragI({x, y, 118, 24}, "Key Frame", frame, .25f, 0, last);
+        bool adjusted = dragF({x + 124, y, 126, 24}, "Key Value", value, (high - low) / 250,
+                              minimum, maximum, "%.3f");
+        bool ease = button({x + 256, y, 126, 24}, (std::string("Ease ") + curveEaseName(anchor.ease)).c_str());
+        bool autoHandles = button({x + 388, y, 108, 24}, "Auto Handles");
+        bool copy = button({x + 502, y, 138, 24}, "Copy to Playhead");
+        bool remove = button({x + 646, y, 106, 24}, "Remove Keys");
+        if (moved || adjusted) {
+            auto edited = keys;
+            int delta = moved ? frame - anchor.frame : 0;
+            auto selected = gCurveSelection;
+            if (shiftKeys(edited, selected, delta, adjusted ? value - anchor.value : 0) && commit(std::move(edited))) {
+                updateSelection(selected, anchor.frame, delta);
+                if (delta) scrub(gCurveKey);
+            } else gCurveMessage = "The move would collide with another key or leave the timeline.";
+        } else if (ease || autoHandles || remove || copy) {
+            auto edited = keys;
+            if (ease) {
+                CurveEase mode = (CurveEase)(((int)anchor.ease + 1) % (int)CurveEase::COUNT);
+                for (auto& key : edited) if (gCurveSelection.count(key.frame)) key.ease = mode;
+                commit(std::move(edited));
+            } else if (autoHandles) {
+                for (size_t i = 0; i < edited.size(); ++i) {
+                    auto& key = edited[i];
+                    if (!gCurveSelection.count(key.frame)) continue;
+                    const auto& prev = keys[i ? i - 1 : i];
+                    const auto& next = keys[std::min(i + 1, keys.size() - 1)];
+                    float slope = prev.frame < next.frame ? (next.value - prev.value) / (next.frame - prev.frame) : 0;
+                    if (i && i + 1 < keys.size() && (key.value - prev.value) * (next.value - key.value) <= 0) slope = 0;
+                    key.in = {1.f / 3, clampf(-slope * (key.frame - prev.frame) / 3, -2e6f, 2e6f)};
+                    key.out = {1.f / 3, clampf(slope * (next.frame - key.frame) / 3, -2e6f, 2e6f)};
+                    key.ease = CurveEase::Bezier;
+                }
+                commit(std::move(edited));
+            } else if (remove) {
+                edited.erase(std::remove_if(edited.begin(), edited.end(), [&](const auto& key) {
+                    return gCurveSelection.count(key.frame) != 0;
+                }), edited.end());
+                if (commit(std::move(edited))) clearSelection();
+            } else {
+                int delta = gScene.frame - *gCurveSelection.begin();
+                bool valid = delta != 0;
+                for (auto key : keys) {
+                    if (!gCurveSelection.count(key.frame)) continue;
+                    key.frame += delta;
+                    auto at = find(keys, key.frame);
+                    if (key.frame < 0 || key.frame > last || (at != keys.end() && at->frame == key.frame)) {
+                        valid = false;
+                        break;
+                    }
+                    putKey(edited, key);
+                }
+                auto selected = gCurveSelection;
+                if (valid && commit(std::move(edited))) updateSelection(selected, anchor.frame, delta);
+                else if (!valid) gCurveMessage = "The copy needs free frames starting at the playhead.";
+            }
         }
-        bool copyKey = button({x + 429, y, 118, 24}, "Copy to Playhead");
-        bool removeKey = button({x + 553, y, 105, 24}, "Remove Key");
-        if (copyKey && gScene.frame != key.frame) {
-            Key copy = key;
-            copy.frame = gScene.frame;
-            if (jointTrack && keys.size() >= MAX_JOINT_KEYS &&
-                std::none_of(keys.begin(), keys.end(), [&](const Key& other) { return other.frame == copy.frame; })) return;
-            putKey(keys, copy);
-            choose(copy.frame);
-            change = true;
-        } else if (removeKey) {
-            keys.erase(keys.begin() + gCurveKey);
-            gCurveKey = -1;
-            change = true;
-        } else if (retime && std::none_of(keys.begin(), keys.end(), [frame](const Key& k) { return k.frame == frame; })) {
-            Key moved = key;
-            moved.frame = frame;
-            keys.erase(keys.begin() + gCurveKey);
-            putKey(keys, moved);
-            choose(frame);
-            scrub(frame);
-            change = true;
-        }
-        if (change) commitKeys();
     }
-    note({x, y + 34, area.w, 24}, "Drag a key up or down to change its value. Drag the graph background to scrub.");
+    std::string instruction = gCurveSelection.size() > 1 ? std::to_string(gCurveSelection.size()) + " keys selected. " : "";
+    instruction += "Drag keys to move them. Shift-click to select more. Drag empty space to scrub.";
+    note({x, y + 34, width, 26}, gCurveMessage.empty() ? instruction.c_str() : gCurveMessage.c_str());
     labFooter(p);
 }
 
@@ -5787,6 +6142,11 @@ void handleKey(int wp) {
         if (gLab == LabMesh && gMeshKnife) {
             gMeshKnife = false;
             gMeshCutPoints.clear();
+            gMeshMessage.clear();
+            return;
+        }
+        if (gLab == LabMesh && gMeshSymmetryPanel) {
+            gMeshSymmetryPanel = false;
             gMeshMessage.clear();
             return;
         }

@@ -405,8 +405,24 @@ bool bakeRigidBodies(Scene& scene, const std::vector<int>& selection, const Rigi
         }
     }
     int end = start + settings.time.frames;
-    for (const auto& body : bodies) {
+    std::vector<std::shared_ptr<const TransformCurves>> curved(bodies.size());
+    for (size_t i = 0; i < bodies.size(); ++i) {
+        const auto& body = bodies[i];
+        const auto& object = scene.objs[body.index];
+        if (!object.curves) continue;
+        curved[i] = bakeTransformCurves(*object.curves, body.keys, {0, object.pos, object.rot, object.scl}, true, false);
+        if (!curved[i]) {
+            error = "The bake would exceed the independent transform curve limits.";
+            return false;
+        }
+    }
+    for (size_t i = 0; i < bodies.size(); ++i) {
+        const auto& body = bodies[i];
         auto& object = scene.objs[body.index];
+        if (curved[i]) {
+            object.curves = std::move(curved[i]);
+            continue;
+        }
         const auto& keys = object.keys;
         auto at = [&](int frame) {
             return std::lower_bound(keys.begin(), keys.end(), frame, [](const Key& key, int f) { return key.frame < f; });

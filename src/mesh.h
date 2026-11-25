@@ -56,6 +56,10 @@ struct PolygonCutPoint {
     float fraction = .5f;
 };
 bool cutPolygonPath(PolygonMesh& mesh, const std::vector<PolygonCutPoint>& points);
+bool bevelPolygonEdges(PolygonMesh& mesh, const std::vector<std::pair<uint32_t, uint32_t>>& edges,
+                       float width, int segments);
+bool symmetrizePolygons(PolygonMesh& mesh, int axis, float plane, bool positiveSource, float tolerance);
+std::vector<uint32_t> matchPolygonSymmetry(const PolygonMesh& mesh, int axis, float plane, float tolerance);
 void projectPolygonUV(PolygonMesh& mesh, int axis);
 
 bool loadOBJ(const std::string& path, Mesh& m, std::string& err);

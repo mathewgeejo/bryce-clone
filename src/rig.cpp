@@ -104,7 +104,7 @@ RigFrame sampleRigFrame(const Rig& rig, int frame) {
     RigFrame result;
     result.joints.reserve(rig.joints.size());
     result.controls.reserve(rig.ik.size());
-    for (const auto& joint : rig.joints) result.joints.push_back(sampleTransformTrack(joint.keys, (float)frame, joint.pose));
+    for (const auto& joint : rig.joints) result.joints.push_back(joint.sampleTransform((float)frame));
     for (const auto& chain : rig.ik) result.controls.push_back(sampleIK(chain, (float)frame));
     if (rig.clips.empty()) return result;
     std::array<int, MAX_RIG_JOINTS> controlIndex{};
@@ -217,6 +217,7 @@ bool validRig(const Rig& rig, size_t vertices) {
         if (joint.parent < -1 || joint.parent >= (int)i || joint.name.empty() || joint.name.size() > 120 ||
             !finiteV(joint.head) || !finiteV(joint.tail) || length(joint.tail - joint.head) < .0001f ||
             !validKey(joint.pose) || joint.keys.size() > MAX_JOINT_KEYS) return false;
+        if (joint.curves && (!joint.keys.empty() || !validTransformCurves(*joint.curves, true))) return false;
         int last = -1;
         for (const auto& key : joint.keys) {
             if (!validKey(key) || key.frame <= last) return false;
@@ -416,8 +417,16 @@ bool bakeRigClips(Rig& rig, int frames) {
         keys.insert(keys.end(), first, original.end());
         return keys.size() <= MAX_JOINT_KEYS;
     };
-    for (size_t i = 0; i < edited.joints.size(); ++i)
-        if (joints[i] && !appendFuture(edited.joints[i].keys, rig.joints[i].keys)) return false;
+    for (size_t i = 0; i < edited.joints.size(); ++i) {
+        if (!joints[i]) continue;
+        auto& joint = edited.joints[i];
+        const auto& original = rig.joints[i];
+        if (original.curves) {
+            joint.curves = bakeTransformCurves(*original.curves, joint.keys, original.pose, false, true);
+            if (!joint.curves) return false;
+            joint.keys.clear();
+        } else if (!appendFuture(joint.keys, original.keys)) return false;
+    }
     for (size_t i = 0; i < edited.ik.size(); ++i)
         if (controls[edited.ik[i].end] && !appendFuture(edited.ik[i].keys, rig.ik[i].keys)) return false;
     edited.clips.clear();

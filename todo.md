@@ -3,7 +3,7 @@
 ## Production modeling and animation
 
 - [ ] Reusable component selections and large mesh editing.
-- [ ] Expanded topology operations including bevel, symmetry, and cleanup. Convex face inset, quad loop cuts, vertex welding, planar boundary filling, equal-count boundary bridging, and edge-to-edge knife paths are implemented.
+- [ ] Expand mesh cleanup and bevel support for open boundaries, custom profiles, and width clamping. Closed-manifold bevels, mesh symmetrize, and mirrored component transforms are implemented.
 - [ ] Extend the bridge to boundaries with different edge counts and add drag-based knife cuts with optional cut-through.
 - [ ] Modifier evaluation, richer UV editing, multiple material assignments, and interchange of these attributes.
 - [x] Skeleton creation, joint posing, skin binding, weight editing, and deformation through playback, save, and render.

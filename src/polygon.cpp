@@ -15,6 +15,7 @@ using Triangle = std::array<size_t, 3>;
 
 Edge edgeKey(uint32_t a, uint32_t b) { return std::minmax(a, b); }
 bool finite(V3 p) { return std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z); }
+float& coordinate(V3& p, int axis) { return axis == 0 ? p.x : axis == 1 ? p.y : p.z; }
 
 V3 faceNormal(const PolygonMesh& mesh, const Face& face) {
     V3 origin = mesh.positions[face.front().vertex], normal;
@@ -205,6 +206,21 @@ bool splitFaceAlongChord(const PolygonMesh& mesh, const Face& face, uint32_t a, 
         std::swap(first, last);
     }
     return true;
+}
+
+int sampleFaceUV(PolygonMesh& mesh, const Face& face, const std::vector<Triangle>& triangles, V3 normal, V3 point) {
+    for (const auto& t : triangles) {
+        V3 a = mesh.positions[face[t[0]].vertex], b = mesh.positions[face[t[1]].vertex];
+        V3 c = mesh.positions[face[t[2]].vertex];
+        float area = dot(normal, cross(b - a, c - a));
+        if (!(area > 0)) continue;
+        float u = dot(normal, cross(point - a, c - a)) / area;
+        float v = dot(normal, cross(b - a, point - a)) / area;
+        if (u < -1e-5f || v < -1e-5f || u + v > 1.00001f) continue;
+        if (face[t[0]].uv < 0 || face[t[1]].uv < 0 || face[t[2]].uv < 0) return -1;
+        return addUV(mesh, mesh.uv[face[t[0]].uv] * (1 - u - v) + mesh.uv[face[t[1]].uv] * u + mesh.uv[face[t[2]].uv] * v);
+    }
+    return -1;
 }
 }  // namespace
 
@@ -400,18 +416,7 @@ bool insetPolygonFace(PolygonMesh& mesh, size_t index, float distance) {
     for (size_t i = 0; i < cap.size(); ++i) {
         cap[i] = {(uint32_t)mesh.positions.size()};
         mesh.positions.push_back(inset[i]);
-        for (const auto& t : triangles) {
-            V3 a = mesh.positions[face[t[0]].vertex], b = mesh.positions[face[t[1]].vertex];
-            V3 c = mesh.positions[face[t[2]].vertex], p = inset[i];
-            float area = dot(normal, cross(b - a, c - a));
-            float u = dot(normal, cross(p - a, c - a)) / area;
-            float v = dot(normal, cross(b - a, p - a)) / area;
-            if (u < -1e-5f || v < -1e-5f || u + v > 1.00001f) continue;
-            if (face[t[0]].uv >= 0 && face[t[1]].uv >= 0 && face[t[2]].uv >= 0)
-                cap[i].uv = addUV(mesh, mesh.uv[face[t[0]].uv] * (1 - u - v) +
-                                         mesh.uv[face[t[1]].uv] * u + mesh.uv[face[t[2]].uv] * v);
-            break;
-        }
+        cap[i].uv = sampleFaceUV(mesh, face, triangles, normal, inset[i]);
     }
     mesh.faces[index] = cap;
     for (size_t i = 0; i < face.size(); ++i) {
@@ -794,6 +799,334 @@ bool cutPolygonPath(PolygonMesh& mesh, const std::vector<PolygonCutPoint>& point
         for (size_t part : parts) if (edited.faces[part].size() > MAX_POLYGON_CORNERS) return false;
     mesh = std::move(edited);
     return true;
+}
+
+bool bevelPolygonEdges(PolygonMesh& mesh, const std::vector<Edge>& selection, float width, int segments) {
+    if (selection.empty() || !std::isfinite(width) || width <= 0 || segments < 1 || segments > 16 ||
+        selection.size() > 1000000 / (size_t)segments) return false;
+    auto edges = gatherEdges(mesh);
+    std::set<Edge> selected;
+    std::set<uint32_t> endpoints;
+    for (auto [a, b] : selection) {
+        Edge edge = edgeKey(a, b);
+        if (!edges.count(edge) || !selected.insert(edge).second) return false;
+        endpoints.insert(a);
+        endpoints.insert(b);
+    }
+    std::set<size_t> affected;
+    for (const auto& [edge, uses] : edges) {
+        if (!endpoints.count(edge.first) && !endpoints.count(edge.second)) continue;
+        if (uses.size() != 2 || mesh.faces[uses[0].face][uses[0].corner].vertex ==
+                                mesh.faces[uses[1].face][uses[1].corner].vertex) return false;
+        affected.insert(uses[0].face);
+        affected.insert(uses[1].face);
+    }
+
+    struct Trim { float t = 0; uint32_t vertex = UINT32_MAX; };
+    std::map<Edge, Trim> trims; // Directed edge from the corner being trimmed.
+    std::map<std::pair<size_t, size_t>, uint32_t> rails;
+    std::map<size_t, V3> faceNormals;
+    PolygonMesh edited = mesh;
+    std::vector<uint32_t> source(mesh.positions.size());
+    std::iota(source.begin(), source.end(), 0);
+    auto addVertex = [&](uint32_t vertex, V3 p) {
+        uint32_t index = (uint32_t)edited.positions.size();
+        edited.positions.push_back(p);
+        source.push_back(vertex);
+        return index;
+    };
+    auto selectedAt = [&](uint32_t vertex, uint32_t neighbor) { return selected.count(edgeKey(vertex, neighbor)) != 0; };
+    for (size_t index : affected) {
+        const auto& face = mesh.faces[index];
+        V3 normal = normalize(faceNormal(mesh, face));
+        faceNormals[index] = normal;
+        for (size_t i = 0; i < face.size(); ++i) {
+            uint32_t v = face[i].vertex, prev = face[(i + face.size() - 1) % face.size()].vertex;
+            uint32_t next = face[(i + 1) % face.size()].vertex;
+            bool before = selectedAt(v, prev), after = selectedAt(v, next);
+            if (!before && !after) continue;
+            V3 p = mesh.positions[v], incoming = p - mesh.positions[prev], outgoing = mesh.positions[next] - p;
+            V3 left = normalize(cross(normal, incoming)), right = normalize(cross(normal, outgoing));
+            if (before && after) {
+                float scale = 1 + dot(left, right);
+                if (scale <= 1e-5f) return false;
+                rails[{index, i}] = addVertex(v, p + (left + right) * (width / scale));
+                continue;
+            }
+            float run = before ? dot(left, outgoing) : dot(right, -incoming);
+            if (!(run > width)) return false;
+            auto& trim = trims[{v, before ? next : prev}];
+            trim.t = std::max(trim.t, width / run);
+        }
+    }
+    for (auto& [edge, trim] : trims) {
+        auto [a, b] = edge;
+        auto opposite = trims.find({b, a});
+        if (opposite != trims.end() && trim.t + opposite->second.t > .99999f) return false;
+        trim.vertex = addVertex(a, lerp(mesh.positions[a], mesh.positions[b], trim.t));
+    }
+
+    SplitAttributes uvs, normals;
+    std::vector<Triangle> triangles, originalTriangles;
+    for (size_t index : affected) {
+        const auto& face = mesh.faces[index];
+        V3 normal = faceNormals.at(index);
+        Face moved;
+        originalTriangles.clear();
+        auto trimCorner = [&](const MeshCorner& a, const MeshCorner& b, const Trim& trim) {
+            MeshCorner corner = splitCorner(edited, uvs, a, b, trim.vertex, trim.t);
+            corner.normal = splitAttribute(edited.normals, normals, a, b, a.normal, b.normal, trim.vertex, trim.t);
+            return corner;
+        };
+        for (size_t i = 0; i < face.size(); ++i) {
+            const auto& a = face[i];
+            const auto& before = face[(i + face.size() - 1) % face.size()];
+            const auto& after = face[(i + 1) % face.size()];
+            auto miter = rails.find({index, i});
+            if (miter != rails.end()) {
+                if (originalTriangles.empty() && !triangulate(mesh, face, normal, originalTriangles)) return false;
+                V3 point = edited.positions[miter->second];
+                moved.push_back({miter->second, sampleFaceUV(edited, face, originalTriangles, normal, point), a.normal});
+                continue;
+            }
+            auto trimBefore = trims.find({a.vertex, before.vertex}), trimAfter = trims.find({a.vertex, after.vertex});
+            bool bevelBefore = selectedAt(a.vertex, before.vertex), bevelAfter = selectedAt(a.vertex, after.vertex);
+            if (trimBefore != trims.end()) moved.push_back(trimCorner(a, before, trimBefore->second));
+            if (!bevelBefore && !bevelAfter && (trimBefore == trims.end() || trimAfter == trims.end())) moved.push_back(a);
+            if (trimAfter != trims.end()) moved.push_back(trimCorner(a, after, trimAfter->second));
+            if (bevelBefore || bevelAfter) rails[{index, i}] = moved.back().vertex;
+        }
+        if (moved.size() < 3 || moved.size() > MAX_POLYGON_CORNERS) return false;
+        V3 newNormal = faceNormal(edited, moved);
+        if (dot(normal, newNormal) <= 0 ||
+            !triangulate(edited, moved, newNormal, triangles)) return false;
+        edited.faces[index] = std::move(moved);
+    }
+
+    std::map<Edge, std::vector<uint32_t>> sharedProfiles;
+    for (Edge edge : selected) {
+        const auto& uses = edges.at(edge);
+        auto [firstFace, i] = uses[0];
+        auto [lastFace, j] = uses[1];
+        size_t next = (i + 1) % mesh.faces[firstFace].size(), other = (j + 1) % mesh.faces[lastFace].size();
+        uint32_t a = mesh.faces[firstFace][i].vertex, b = mesh.faces[firstFace][next].vertex;
+        uint32_t a0 = rails.at({firstFace, i}), b0 = rails.at({firstFace, next});
+        uint32_t a1 = rails.at({lastFace, other}), b1 = rails.at({lastFace, j});
+        V3 along = mesh.positions[b] - mesh.positions[a];
+        if (dot(edited.positions[b0] - edited.positions[a0], along) <= 0 ||
+            dot(edited.positions[b1] - edited.positions[a1], along) <= 0) return false;
+        auto rounded = [&](uint32_t original, uint32_t left, uint32_t right, int segment) {
+            // Adjacent strips can meet along the same rounded junction profile.
+            // Reuse its vertices in either direction to keep the strips connected.
+            auto profile = sharedProfiles.try_emplace(edgeKey(left, right), (size_t)segments - 1, UINT32_MAX).first;
+            size_t slot = (size_t)(left < right ? segment - 1 : segments - segment - 1);
+            uint32_t& index = profile->second[slot];
+            if (index != UINT32_MAX) return index;
+            float t = (float)segment / segments;
+            V3 center = mesh.positions[original], p = edited.positions[left], q = edited.positions[right];
+            float cosine = clampf(dot(normalize(p - center), normalize(q - center)), -1, 1);
+            float weight = std::max(.05f, std::sqrt((1 - cosine) * .5f));
+            float l = (1 - t) * (1 - t), m = 2 * weight * t * (1 - t), r = t * t;
+            index = addVertex(original, (p * l + center * m + q * r) / (l + m + r));
+            return index;
+        };
+        MeshCorner prevA{a0, addUV(edited, {0, 0, 0})}, prevB{b0, addUV(edited, {1, 0, 0})};
+        for (int segment = 1; segment <= segments; ++segment) {
+            float t = (float)segment / segments;
+            MeshCorner nextA{segment == segments ? a1 : rounded(a, a0, a1, segment), addUV(edited, {0, t, 0})};
+            MeshCorner nextB{segment == segments ? b1 : rounded(b, b0, b1, segment), addUV(edited, {1, t, 0})};
+            Face strip{prevB, prevA, nextA, nextB};
+            if (!triangulate(edited, strip, faceNormal(edited, strip), triangles)) return false;
+            edited.faces.push_back(std::move(strip));
+            prevA = nextA;
+            prevB = nextB;
+        }
+    }
+
+    // After the bevel strips are in place, the remaining local rims surround
+    // the junctions between the strips and the resized source faces.
+    auto bevelEdges = gatherEdges(edited);
+    std::vector<Edge> junctionEdges;
+    for (const auto& [edge, uses] : bevelEdges) {
+        if (source[edge.first] == source[edge.second] && uses.size() == 1) junctionEdges.push_back(edge);
+    }
+    auto junctions = boundaryPaths(edited, bevelEdges, junctionEdges);
+    if (!junctionEdges.empty() && junctions.empty()) return false;
+    for (const auto& ring : junctions) {
+        if (!ring.closed || ring.points.size() < 3 || ring.points.size() > MAX_POLYGON_CORNERS) return false;
+        Face face;
+        for (uint32_t vertex : ring.points) face.push_back({vertex});
+        V3 normal = faceNormal(edited, face);
+        if (!triangulate(edited, face, normal, triangles)) return false;
+        int axis = 0;
+        for (int i = 1; i < 3; ++i) if (std::fabs(normal[i]) > std::fabs(normal[axis])) axis = i;
+        int x = (axis + 1) % 3, y = (axis + 2) % 3;
+        V3 lo = edited.positions[face.front().vertex], hi = lo;
+        for (const auto& corner : face) {
+            V3 p = edited.positions[corner.vertex];
+            lo = {std::min(lo.x, p.x), std::min(lo.y, p.y), std::min(lo.z, p.z)};
+            hi = {std::max(hi.x, p.x), std::max(hi.y, p.y), std::max(hi.z, p.z)};
+        }
+        for (auto& corner : face) {
+            V3 p = edited.positions[corner.vertex];
+            corner.uv = addUV(edited, {(p[x] - lo[x]) / std::max(1e-6f, hi[x] - lo[x]),
+                                      (p[y] - lo[y]) / std::max(1e-6f, hi[y] - lo[y]), 0});
+        }
+        edited.faces.push_back(std::move(face));
+    }
+    compactPolygonPositions(edited);
+    mesh = std::move(edited);
+    return true;
+}
+
+bool symmetrizePolygons(PolygonMesh& mesh, int axis, float plane, bool positiveSource, float tolerance) {
+    if (axis < 0 || axis > 2 || !std::isfinite(plane) || !std::isfinite(tolerance) || tolerance < 0) return false;
+    PolygonMesh edited;
+    edited.positions = mesh.positions;
+    edited.uv = mesh.uv;
+    edited.normals = mesh.normals;
+    std::vector<int> sides;
+    for (V3& point : edited.positions) {
+        float distance = point[axis] - plane;
+        if (std::fabs(distance) <= tolerance) {
+            coordinate(point, axis) = plane;
+            sides.push_back(0);
+        } else sides.push_back((distance > 0) == positiveSource ? 1 : -1);
+    }
+    std::map<Edge, uint32_t> intersections;
+    SplitAttributes uvs, normals;
+    auto intersectPlane = [&](const MeshCorner& a, const MeshCorner& b) {
+        Edge edge = edgeKey(a.vertex, b.vertex);
+        auto [entry, added] = intersections.emplace(edge, (uint32_t)edited.positions.size());
+        V3 from = edited.positions[a.vertex], to = edited.positions[b.vertex];
+        float t = (plane - from[axis]) / (to[axis] - from[axis]);
+        if (added) {
+            V3 p = lerp(from, to, t);
+            coordinate(p, axis) = plane;
+            edited.positions.push_back(p);
+        }
+        auto corner = splitCorner(edited, uvs, a, b, entry->second, t);
+        corner.normal = splitAttribute(edited.normals, normals, a, b, a.normal, b.normal, entry->second, t);
+        return corner;
+    };
+    auto clip = [&](const Face& face) {
+        Face clipped;
+        for (size_t i = 0; i < face.size(); ++i) {
+            const auto& a = face[i];
+            const auto& b = face[(i + 1) % face.size()];
+            int sideA = sides[a.vertex], sideB = sides[b.vertex];
+            if (sideA >= 0) clipped.push_back(a);
+            if (sideA * sideB < 0) clipped.push_back(intersectPlane(a, b));
+        }
+        return clipped;
+    };
+    std::vector<Triangle> triangles;
+    auto add = [&](Face face) {
+        if (face.size() < 3) return true;
+        if (face.size() > MAX_POLYGON_CORNERS) return false;
+        if (!triangulate(edited, face, faceNormal(edited, face), triangles)) return false;
+        edited.faces.push_back(std::move(face));
+        return true;
+    };
+    for (const auto& face : mesh.faces) {
+        bool retained = false, discarded = false;
+        for (const auto& corner : face) {
+            retained |= sides[corner.vertex] == 1;
+            discarded |= sides[corner.vertex] == -1;
+        }
+        if (!retained) continue;
+        if (!discarded) {
+            if (!add(face)) return false;
+            continue;
+        }
+        if (add(clip(face))) continue;
+        // A plane can split a concave face into separate islands. Clip its triangles
+        // individually in that case, sharing any intersections on original edges.
+        std::vector<Triangle> parts;
+        if (!triangulate(mesh, face, faceNormal(mesh, face), parts)) return false;
+        for (const auto& t : parts) {
+            bool hasSource = std::any_of(t.begin(), t.end(), [&](size_t i) { return sides[face[i].vertex] == 1; });
+            if (hasSource && !add(clip({face[t[0]], face[t[1]], face[t[2]]}))) return false;
+        }
+    }
+    if (edited.faces.empty()) return false;
+    std::vector<uint32_t> mirrored(edited.positions.size(), UINT32_MAX);
+    std::vector<int> mirrorNormals(edited.normals.size(), -1);
+    size_t count = edited.faces.size();
+    for (size_t i = 0; i < count; ++i) {
+        Face copy = edited.faces[i];
+        for (auto& corner : copy) {
+            auto& index = mirrored[corner.vertex];
+            V3 position = edited.positions[corner.vertex];
+            if (position[axis] != plane && index == UINT32_MAX) {
+                index = (uint32_t)edited.positions.size();
+                coordinate(position, axis) = plane + (plane - position[axis]);
+                if (!finite(position)) return false;
+                edited.positions.push_back(position);
+            }
+            if (index != UINT32_MAX) corner.vertex = index;
+            if (corner.normal >= 0) {
+                auto& normal = mirrorNormals[corner.normal];
+                if (normal == -1) {
+                    V3 value = edited.normals[corner.normal];
+                    coordinate(value, axis) *= -1;
+                    normal = (int)edited.normals.size();
+                    edited.normals.push_back(value);
+                }
+                corner.normal = normal;
+            }
+        }
+        std::reverse(copy.begin(), copy.end());
+        if (!add(std::move(copy))) return false;
+    }
+    compactPolygonPositions(edited);
+    mesh = std::move(edited);
+    return true;
+}
+
+std::vector<uint32_t> matchPolygonSymmetry(const PolygonMesh& mesh, int axis, float plane, float tolerance) {
+    std::vector<uint32_t> partners(mesh.positions.size(), UINT32_MAX);
+    if (axis < 0 || axis > 2 || !std::isfinite(plane) || !std::isfinite(tolerance) || tolerance < 0) return partners;
+    using Cell = std::array<double, 3>;
+    double size = std::max((double)tolerance, 1e-12);
+    auto cellAt = [&](V3 p) -> Cell {
+        return {std::floor(p.x / size), std::floor(p.y / size), std::floor(p.z / size)};
+    };
+    std::map<Cell, std::vector<uint32_t>> cells;
+    for (uint32_t i = 0; i < mesh.positions.size(); ++i) {
+        V3 p = mesh.positions[i];
+        if (!finite(p)) continue;
+        if (std::fabs(p[axis] - plane) <= tolerance) partners[i] = i;
+        else cells[cellAt(p)].push_back(i);
+    }
+    for (uint32_t i = 0; i < mesh.positions.size(); ++i) {
+        V3 target = mesh.positions[i];
+        if (partners[i] == i || !finite(target)) continue;
+        bool positive = target[axis] > plane;
+        coordinate(target, axis) = plane + (plane - target[axis]);
+        if (!finite(target)) continue;
+        auto cell = cellAt(target);
+        float best = tolerance;
+        bool ambiguous = false;
+        for (int x = -1; x <= 1; ++x) for (int y = -1; y <= 1; ++y) for (int z = -1; z <= 1; ++z) {
+            Cell nearby{cell[0] + x, cell[1] + y, cell[2] + z};
+            auto at = cells.find(nearby);
+            if (at == cells.end()) continue;
+            for (uint32_t j : at->second) {
+                V3 p = mesh.positions[j];
+                if ((p[axis] > plane) == positive) continue;
+                float distance = length(p - target);
+                if (distance > best) continue;
+                if (distance == best && partners[i] != UINT32_MAX) ambiguous |= partners[i] != j;
+                else { best = distance; partners[i] = j; ambiguous = false; }
+            }
+        }
+        if (ambiguous) partners[i] = UINT32_MAX;
+    }
+    auto matches = partners;
+    for (uint32_t i = 0; i < partners.size(); ++i)
+        if (partners[i] != UINT32_MAX && partners[partners[i]] != i) matches[i] = UINT32_MAX;
+    return matches;
 }
 
 void projectPolygonUV(PolygonMesh& mesh, int axis) {
