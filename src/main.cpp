@@ -64,7 +64,7 @@ float gPreviewScale = 0.45f;
 std::string gHoverTip, gLastTip;
 uint64_t gTipSince = 0;
 Renderer gMainR, gNanoR, gLabR, gViewR;
-enum Lab { LabNone, LabMat, LabSky, LabTerrain, LabTree, LabRender, LabTools, LabExamples, LabObject, LabAttributes, LabDxf, LabMotion, LabAssets, LabCameras, LabCommands, LabScatter, LabTransform, LabSimulation, LabMesh, LabCurves, LabRig } gLab = LabNone;
+enum Lab { LabNone, LabMat, LabSky, LabTerrain, LabTree, LabRender, LabTools, LabExamples, LabObject, LabAttributes, LabDxf, LabMotion, LabAssets, LabCameras, LabCommands, LabScatter, LabTransform, LabSimulation, LabMesh, LabCurves, LabRig, LabActions } gLab = LabNone;
 enum class MeshPick { Vertex, Edge, Face };
 MeshPick gMeshPick = MeshPick::Face;
 std::set<size_t> gMeshSelection;
@@ -73,12 +73,23 @@ bool gCurveJointTrack = false;
 int gCurveJoint = 0;
 int gMeshTransform = 0;
 float gMeshDistance = .25f;
+float gMeshInset = .25f, gMeshLoopFraction = .5f;
+float gMeshWeldDistance = .001f;
+bool gMeshPreserveUV = true;
+int gMeshBridgeSegments = 1, gMeshBridgeTwist = 0;
+bool gMeshKnife = false;
+std::vector<PolygonCutPoint> gMeshCutPoints;
 V3 gMeshOffset;
 std::string gMeshMessage;
 int gRigMode = 0, gRigJoint = 0, gRigView = 0;
+int gRigPlace = 0;
 float gRigWeight = 1.f;
 std::set<uint32_t> gRigVertices;
 std::string gRigMessage;
+int gAction = 0, gActionClip = 0, gActionFirst = 0, gActionLast = 0;
+std::shared_ptr<const Rig> gActionClipboard;
+int gCopiedAction = 0;
+std::string gActionMessage;
 Scene gLabBackup;
 bool gLabChanged = false, gNanoDirty = true, gLabDirty = false, gMainWasBusy = false;
 uint64_t gLastChange = 0, gRenderStart = 0;
@@ -530,6 +541,18 @@ void commitRename() {
             object.rig->joints[gRigJoint].name != gEditBuf) {
             auto rig = std::make_shared<Rig>(*object.rig);
             rig->joints[gRigJoint].name = gEditBuf;
+            object.rig = std::move(rig);
+            sceneChanged();
+        }
+    }
+    if (gEditObj == -5 && gLab == LabActions && validSel() && !gEditBuf.empty()) {
+        auto& object = gScene.objs[gSel];
+        if (object.rig && gAction >= 0 && gAction < (int)object.rig->actions.size() &&
+            object.rig->actions[gAction]->name != gEditBuf) {
+            auto rig = std::make_shared<Rig>(*object.rig);
+            auto action = std::make_shared<RigAction>(*rig->actions[gAction]);
+            action->name = gEditBuf;
+            rig->actions[gAction] = std::move(action);
             object.rig = std::move(rig);
             sceneChanged();
         }
@@ -1303,9 +1326,16 @@ std::vector<int> keyFrames(bool sky) {
             const auto& object = gScene.objs[i];
             for (const auto& key : object.keys) r.push_back(key.frame);
             const auto& source = object.instanceSource >= 0 ? gScene.objs[object.instanceSource] : object;
-            if (source.rig)
+            if (source.rig) {
                 for (const auto& joint : source.rig->joints)
                     for (const auto& key : joint.keys) r.push_back(key.frame);
+                for (const auto& chain : source.rig->ik)
+                    for (const auto& key : chain.keys) r.push_back(key.frame);
+                for (const auto& clip : source.rig->clips) {
+                    r.push_back(clip.start);
+                    r.push_back(clip.start + rigClipFrames(*source.rig->actions[clip.action], clip) - 1);
+                }
+            }
         }
     std::sort(r.begin(), r.end());
     r.erase(std::unique(r.begin(), r.end()), r.end());
@@ -1419,8 +1449,9 @@ Lab objectEditor(const Object& o) {
 
 void openLab(Lab l) {
     if (l == LabNone) return;
-    if (l == LabMesh || l == LabCurves || l == LabRig) {
+    if (l == LabMesh || l == LabCurves || l == LabRig || l == LabActions) {
         if (!validSel() || gScene.objs[gSel].locked) { gStatus = "Select an unlocked object first."; return; }
+        if (l == LabActions && !gScene.objs[gSel].rig) { gStatus = "Select a rigged object to edit actions."; return; }
         gPlaying = false;
     }
     if (l == LabMat || l == LabTerrain || l == LabObject || l == LabAttributes) {
@@ -1440,6 +1471,8 @@ void openLab(Lab l) {
     if (l == LabAssets) refreshAssets();
     if (l == LabMesh) {
         gMeshSelection.clear();
+        gMeshKnife = false;
+        gMeshCutPoints.clear();
         gMeshOffset = gMeshTransform == 2 ? V3(1) : V3{};
         gMeshMessage.clear();
     }
@@ -1451,8 +1484,15 @@ void openLab(Lab l) {
     if (l == LabRig) {
         gRigJoint = 0;
         gRigMode = 0;
+        gRigPlace = 0;
         gRigVertices.clear();
         gRigMessage.clear();
+    }
+    if (l == LabActions) {
+        gAction = gActionClip = 0;
+        gActionFirst = gScene.frame;
+        gActionLast = std::min(gScene.frames - 1, gActionFirst + 59);
+        gActionMessage.clear();
     }
     if (l == LabSimulation) {
         gPlaying = false;
@@ -1487,6 +1527,7 @@ void closeLab(bool cancel) {
             else if (gLab == LabMesh) name = "Edit mesh";
             else if (gLab == LabCurves) name = "Edit curves";
             else if (gLab == LabRig) name = "Edit rig";
+            else if (gLab == LabActions) name = "Edit character actions";
             else if (gLab == LabDxf) name = "Import DXF";
             else if (gLab == LabAssets) name = "Insert library asset";
             else if (gLab == LabSimulation) name = gLiquidSimulation ? "Bake liquid" : "Bake rigid bodies";
@@ -2498,7 +2539,8 @@ void drawTimeline() {
     auto fx = [&](int f) { return tr.x + 4 + (int)((tr.w - 8) * (f / (float)std::max(1, last))); };
     for (int f = 0; f <= last; f += std::max(1, gScene.fps)) line(fx(f), tr.y + 16, fx(f), tr.y + 22, rgb(110, 110, 120));
     for (int f : keyFrames(true)) fill({fx(f) - 2, tr.y + 2, 5, 6}, rgb(80, 200, 230));
-    for (int f : keyFrames(false)) fill({fx(f) - 3, tr.y + 8, 7, 8}, rgb(250, 210, 60));
+    for (int f : keyFrames(false))
+        if (f <= last) fill({fx(f) - 3, tr.y + 8, 7, 8}, rgb(250, 210, 60));
     fill({fx(gScene.frame) - 1, tr.y + 1, 3, tr.h - 2}, rgb(230, 60, 50));
     if (gActive == id && gIn.down) {
         int f = (int)std::lround((gIn.mx - tr.x - 4) / (float)std::max(1, tr.w - 8) * last);
@@ -2825,7 +2867,9 @@ bool convertMeshForEditing(Object& object) {
         if (other.instanceSource == gSel || (other.parent == gSel && other.terrainAnchor)) return false;
     }
     if (object.type == ObjType::Cube && !object.csg) {
-        object.mesh = std::make_shared<Mesh>(makeEditableBox());
+        auto mesh = std::make_shared<Mesh>();
+        if (!buildPolygonMesh(makePolygonBox(), *mesh)) return false;
+        object.mesh = std::move(mesh);
         object.type = ObjType::Mesh;
         object.instanceSource = -1;
         object.flatMesh = true;
@@ -2868,11 +2912,14 @@ void drawMeshLab() {
             } else gMeshMessage = "Use a standalone solid or mesh without procedural links.";
         }
         note({view.x, view.y + 40, view.w, 62}, gMeshMessage.empty() ?
-             "Converting a solid replaces its procedural shape with editable triangles." : gMeshMessage.c_str());
+             "Conversion replaces the procedural solid with editable mesh geometry." : gMeshMessage.c_str());
         labFooter(panelRect);
         return;
     }
     const Mesh& mesh = *object.mesh;
+    const auto* polygon = mesh.polygons.get();
+    const auto& positions = mesh.skinVertices();
+    size_t faceCount = polygon ? polygon->faces.size() : (size_t)mesh.triCount();
     if (mesh.triCount() > 100000) {
         note({view.x, view.y, view.w, 50}, "Component editing supports meshes of up to 100,000 triangles.");
         labFooter(panelRect);
@@ -2883,6 +2930,9 @@ void drawMeshLab() {
         if (button({view.x + 92 * i, view.y - 33, 88, 25}, modeNames[i], i == (int)gMeshPick)) {
             gMeshPick = (MeshPick)i;
             gMeshSelection.clear();
+            gMeshKnife = false;
+            gMeshCutPoints.clear();
+            gMeshMessage.clear();
         }
     }
     const char* viewNames[] = {"3D", "Front", "Top", "Side"};
@@ -2895,8 +2945,8 @@ void drawMeshLab() {
     V3 center = (mesh.bmin + mesh.bmax) * .5f;
     float factor = .82f * view.h / std::max(length(mesh.bmax - mesh.bmin), .001f);
     std::vector<V3> points;
-    points.reserve(mesh.v.size());
-    for (V3 v : mesh.v) {
+    points.reserve(positions.size());
+    for (V3 v : positions) {
         V3 p = direction * (v - center);
         points.push_back({view.x + view.w * .5f + p.x * factor, view.y + view.h * .5f - p.y * factor, p.z});
     }
@@ -2906,9 +2956,15 @@ void drawMeshLab() {
     if (previousMesh.lock() != object.mesh) {
         edges.clear();
         edges.reserve(mesh.tri.size());
-        for (size_t i = 0; i < mesh.tri.size(); i += 3)
-            for (size_t j = 0; j < 3; ++j)
-                edges.push_back(std::minmax(mesh.tri[i + j], mesh.tri[i + (j + 1) % 3]));
+        if (polygon) {
+            for (const auto& face : polygon->faces)
+                for (size_t i = 0; i < face.size(); ++i)
+                    edges.push_back(std::minmax(face[i].vertex, face[(i + 1) % face.size()].vertex));
+        } else {
+            for (size_t i = 0; i < mesh.tri.size(); i += 3)
+                for (size_t j = 0; j < 3; ++j)
+                    edges.push_back(std::minmax(mesh.tri[i + j], mesh.tri[i + (j + 1) % 3]));
+        }
         std::sort(edges.begin(), edges.end());
         edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
         previousMesh = object.mesh;
@@ -2917,15 +2973,17 @@ void drawMeshLab() {
     press(view, id);
     if (clicked(view, id)) {
         float bestDist = 81.f, bestDepth = -1e30f;
+        float edgeFraction = .5f;
         size_t hit = SIZE_MAX;
         V3 cursor{(float)gIn.mx, (float)gIn.my, 0};
-        auto pointPick = [&](V3 p, size_t index) {
+        auto pointPick = [&](V3 p, size_t index, float fraction = .5f) {
             V3 delta{p.x - cursor.x, p.y - cursor.y, 0};
             float distance = dot(delta, delta);
             if (distance < bestDist || (distance == bestDist && p.z > bestDepth)) {
                 bestDist = distance;
                 bestDepth = p.z;
                 hit = index;
+                edgeFraction = fraction;
             }
         };
         if (gMeshPick == MeshPick::Vertex) {
@@ -2935,22 +2993,41 @@ void drawMeshLab() {
                 V3 a = points[edges[i].first], b = points[edges[i].second];
                 V3 delta{b.x - a.x, b.y - a.y, 0};
                 float t = clampf(dot(cursor - a, delta) / std::max(.001f, dot(delta, delta)), 0, 1);
-                pointPick(lerp(a, b, t), i);
+                pointPick(lerp(a, b, t), i, t);
             }
         } else {
             for (size_t i = 0; i < mesh.tri.size(); i += 3) {
-                V3 a = points[mesh.tri[i]], b = points[mesh.tri[i + 1]], c = points[mesh.tri[i + 2]];
+                V3 a = points[mesh.skinVertex(mesh.tri[i])], b = points[mesh.skinVertex(mesh.tri[i + 1])];
+                V3 c = points[mesh.skinVertex(mesh.tri[i + 2])];
                 float area = cross(b - a, c - a).z;
                 if (std::fabs(area) < .001f) continue;
                 float u = cross(cursor - a, c - a).z / area;
                 float v = cross(b - a, cursor - a).z / area;
                 if (u < 0 || v < 0 || u + v > 1) continue;
                 float depth = a.z + u * (b.z - a.z) + v * (c.z - a.z);
-                if (depth > bestDepth) { bestDepth = depth; hit = i / 3; }
+                if (depth > bestDepth) { bestDepth = depth; hit = polygon ? mesh.triangleFaces[i / 3] : i / 3; }
             }
         }
-        if (!gIn.shift) gMeshSelection.clear();
-        if (hit != SIZE_MAX && !gMeshSelection.erase(hit)) gMeshSelection.insert(hit);
+        if (gMeshKnife) {
+            if (hit == SIZE_MAX) gMeshMessage = "Click near a visible edge to place the next point.";
+            else if (gMeshCutPoints.size() >= MAX_POLYGON_CORNERS) gMeshMessage = "Apply this cut before adding more points.";
+            else {
+                auto [a, b] = edges[hit];
+                V3 delta = points[b] - points[a];
+                float screenLength = std::sqrt(delta.x * delta.x + delta.y * delta.y);
+                float t = edgeFraction;
+                if (gIn.shift) t = .5f;
+                else if (screenLength * std::min(t, 1 - t) <= 5) {
+                    a = b = t < .5f ? a : b;
+                    t = 0;
+                }
+                gMeshCutPoints.push_back({{a, b}, t});
+                gMeshMessage.clear();
+            }
+        } else {
+            if (!gIn.shift) gMeshSelection.clear();
+            if (hit != SIZE_MAX && !gMeshSelection.erase(hit)) gMeshSelection.insert(hit);
+        }
     }
     auto edgeLine = [&](uint32_t a, uint32_t b, Color color) {
         line((int)points[a].x, (int)points[a].y, (int)points[b].x, (int)points[b].y, color);
@@ -2958,12 +3035,27 @@ void drawMeshLab() {
     fill(view, rgb(25, 29, 36));
     setClip(view);
     for (size_t i = 0; i < edges.size(); ++i)
-        edgeLine(edges[i].first, edges[i].second, gMeshPick == MeshPick::Edge && gMeshSelection.count(i) ?
+        edgeLine(edges[i].first, edges[i].second, !gMeshKnife && gMeshPick == MeshPick::Edge && gMeshSelection.count(i) ?
                  rgb(255, 194, 83) : rgb(132, 153, 177));
+    V3 previousPoint;
+    for (size_t i = 0; i < gMeshCutPoints.size(); ++i) {
+        const auto& cut = gMeshCutPoints[i];
+        V3 point = lerp(points[cut.edge.first], points[cut.edge.second], cut.fraction);
+        Color color = rgb(255, 194, 83);
+        if (i) line((int)previousPoint.x, (int)previousPoint.y, (int)point.x, (int)point.y, color);
+        circle((int)point.x, (int)point.y, 4, color);
+        previousPoint = point;
+    }
     if (gMeshPick == MeshPick::Face) {
         for (size_t i : gMeshSelection) {
-            const auto* face = &mesh.tri[3 * i];
-            for (int j = 0; j < 3; ++j) edgeLine(face[j], face[(j + 1) % 3], rgb(255, 194, 83));
+            if (polygon) {
+                const auto& face = polygon->faces[i];
+                for (size_t j = 0; j < face.size(); ++j)
+                    edgeLine(face[j].vertex, face[(j + 1) % face.size()].vertex, rgb(255, 194, 83));
+            } else {
+                const auto* face = &mesh.tri[3 * i];
+                for (int j = 0; j < 3; ++j) edgeLine(face[j], face[(j + 1) % 3], rgb(255, 194, 83));
+            }
         }
     }
     if (gMeshPick == MeshPick::Vertex) {
@@ -2972,14 +3064,17 @@ void drawMeshLab() {
     }
     clearClip();
     bevel(view, true);
-    std::string count = std::to_string(mesh.v.size()) + " vertices / " + std::to_string(mesh.triCount()) + " triangles";
+    std::string count = std::to_string(positions.size()) + " vertices / " + std::to_string(faceCount) +
+                        (polygon ? " faces" : " triangles");
     label(x, y, count.c_str(), width);
     y += 26;
-    size_t limit = gMeshPick == MeshPick::Vertex ? mesh.v.size() :
-                   gMeshPick == MeshPick::Edge ? edges.size() : (size_t)mesh.triCount();
-    if (button({x, y, 108, 24}, "Select All"))
-        for (size_t i = 0; i < limit; ++i) gMeshSelection.insert(i);
-    if (button({x + 114, y, 108, 24}, "Clear")) gMeshSelection.clear();
+    size_t limit = gMeshPick == MeshPick::Vertex ? positions.size() :
+                   gMeshPick == MeshPick::Edge ? edges.size() : faceCount;
+    if (!gMeshKnife) {
+        if (button({x, y, 108, 24}, "Select All"))
+            for (size_t i = 0; i < limit; ++i) gMeshSelection.insert(i);
+        if (button({x + 114, y, 108, 24}, "Clear")) gMeshSelection.clear();
+    }
     y += 32;
     auto commit = [&](Mesh edited, const char* message, bool resetSelection = false) {
         object.mesh = std::make_shared<Mesh>(std::move(edited));
@@ -2988,6 +3083,45 @@ void drawMeshLab() {
         gMeshMessage = message;
         sceneChanged();
     };
+    auto commitPolygons = [&](PolygonMesh replacement, const char* message, bool resetSelection = false) {
+        Mesh edited;
+        if (!buildPolygonMesh(std::move(replacement), edited) || edited.triCount() > 100000) {
+            gMeshMessage = "The edit would create an invalid face or exceed the mesh editor limit.";
+            return false;
+        }
+        commit(std::move(edited), message, resetSelection);
+        return true;
+    };
+    if (gMeshKnife) {
+        std::string count = std::to_string(gMeshCutPoints.size()) + " knife points";
+        label(x, y - 30, count.c_str(), width);
+        bool apply = button({x, y, 108, 24}, "Apply Knife");
+        if (button({x + 114, y, 108, 24}, "Remove Point") && !gMeshCutPoints.empty()) {
+            gMeshCutPoints.pop_back();
+            gMeshMessage.clear();
+        }
+        if (button({x, y + 29, width, 24}, "Exit Knife")) {
+            gMeshKnife = false;
+            gMeshCutPoints.clear();
+            gMeshMessage.clear();
+            return;
+        }
+        if (apply) {
+            PolygonMesh edited = *polygon;
+            if (cutPolygonPath(edited, gMeshCutPoints)) {
+                if (commitPolygons(std::move(edited), "Cut the mesh along the knife path.", true)) {
+                    gMeshKnife = false;
+                    gMeshCutPoints.clear();
+                }
+                return;
+            }
+            gMeshMessage = "Place two or more points. Each segment must cross the interior of a face.";
+        }
+        note({view.x, view.y + view.h + 8, view.w, 30}, gMeshMessage.empty() ?
+             "Click each edge the knife crosses. Shift-click snaps to an edge midpoint." : gMeshMessage.c_str());
+        labFooter(panelRect);
+        return;
+    }
     const char* transforms[] = {"Move", "Rotate", "Scale"};
     for (int i = 0; i < 3; ++i) {
         if (button({x + 76 * i, y, 70, 24}, transforms[i], gMeshTransform == i)) {
@@ -3005,27 +3139,38 @@ void drawMeshLab() {
     }
     y += 28;
     if (button({x, y, width, 24}, "Apply Transform") && !gMeshSelection.empty() && length(gMeshOffset - neutral) > 0) {
-        Mesh edited = mesh;
         std::set<uint32_t> vertices;
         for (size_t i : gMeshSelection) {
             if (gMeshPick == MeshPick::Vertex) vertices.insert((uint32_t)i);
             else if (gMeshPick == MeshPick::Edge) { vertices.insert(edges[i].first); vertices.insert(edges[i].second); }
+            else if (polygon) for (const auto& corner : polygon->faces[i]) vertices.insert(corner.vertex);
             else vertices.insert(mesh.tri.begin() + i * 3, mesh.tri.begin() + i * 3 + 3);
         }
         V3 pivot;
-        for (uint32_t i : vertices) pivot += mesh.v[i];
+        for (uint32_t i : vertices) pivot += positions[i];
         pivot = pivot / (float)vertices.size();
         M3 rotation = rotY(rad(gMeshOffset.y)) * rotX(rad(gMeshOffset.x)) * rotZ(rad(gMeshOffset.z));
-        for (uint32_t i : vertices) {
-            V3 relative = mesh.v[i] - pivot;
-            if (gMeshTransform == 0) edited.v[i] += gMeshOffset;
-            else if (gMeshTransform == 1) edited.v[i] = pivot + rotation * relative;
-            else edited.v[i] = pivot + relative * gMeshOffset;
+        auto transform = [&](std::vector<V3>& edited) {
+            for (uint32_t i : vertices) {
+                V3 relative = positions[i] - pivot;
+                if (gMeshTransform == 0) edited[i] += gMeshOffset;
+                else if (gMeshTransform == 1) edited[i] = pivot + rotation * relative;
+                else edited[i] = pivot + relative * gMeshOffset;
+            }
+        };
+        if (polygon) {
+            PolygonMesh edited = *polygon;
+            transform(edited.positions);
+            clearPolygonNormals(edited);
+            if (!commitPolygons(std::move(edited), "Transformed the selected components.")) return;
+        } else {
+            Mesh edited = mesh;
+            transform(edited.v);
+            edited.n.clear();
+            edited.build();
+            commit(std::move(edited), "Transformed the selected components.");
         }
-        edited.n.clear();
-        edited.build();
         gMeshOffset = neutral;
-        commit(std::move(edited), "Transformed the selected components.");
         return;
     }
     y += 31;
@@ -3036,7 +3181,35 @@ void drawMeshLab() {
         y += 28;
         bool remove = button({x, y, 108, 24}, "Delete Faces");
         bool flip = button({x + 114, y, 108, 24}, "Flip Faces");
-        if ((extrude || remove || flip) && !gMeshSelection.empty()) {
+        bool inset = false;
+        if (polygon) {
+            y += 28;
+            dragF({x, y, 108, 24}, "Inset Distance", gMeshInset, .01f, .0001f, 1000, "%.3f");
+            inset = button({x + 114, y, 108, 24}, "Inset Face");
+        }
+        if (polygon && (extrude || remove || flip || inset)) {
+            if (gMeshSelection.empty()) {
+                gMeshMessage = "Select a face first.";
+            } else {
+                PolygonMesh edited = *polygon;
+                std::vector<size_t> faces(gMeshSelection.begin(), gMeshSelection.end());
+                if (extrude && extrudePolygonFaces(edited, faces, gMeshDistance))
+                    commitPolygons(std::move(edited), "Extruded the selected face region.");
+                else if (remove && deletePolygonFaces(edited, faces))
+                    commitPolygons(std::move(edited), "Deleted selected faces.", true);
+                else if (flip) {
+                    for (size_t face : faces) std::reverse(edited.faces[face].begin(), edited.faces[face].end());
+                    clearPolygonNormals(edited);
+                    commitPolygons(std::move(edited), "Reversed selected face winding.");
+                } else if (inset && faces.size() == 1 && insetPolygonFace(edited, faces.front(), gMeshInset))
+                    commitPolygons(std::move(edited), "Inset the selected face.");
+                else gMeshMessage = inset ? "Select one convex, planar face and set a smaller inset distance." :
+                                    remove ? "Keep at least one face in the mesh." :
+                                    "Use a region with a consistent winding and a nonzero distance.";
+            }
+            return;
+        }
+        if (!polygon && (extrude || remove || flip) && !gMeshSelection.empty()) {
             Mesh edited = mesh;
             std::vector<size_t> faces(gMeshSelection.begin(), gMeshSelection.end());
             if (extrude && extrudeMeshFaces(edited, faces, gMeshDistance) && edited.triCount() <= 100000) {
@@ -3058,10 +3231,107 @@ void drawMeshLab() {
                            "Keep at least one face in the mesh.";
         }
         y += 30;
+    } else if (gMeshPick == MeshPick::Vertex && !bound) {
+        dragF({x, y, width, 24}, "Weld Distance", gMeshWeldDistance, .0005f, .000001f, 1000, "%.6f");
+        y += 28;
+        if (!polygon) {
+            toggle({x, y, width, 24}, "Preserve UV Seams", gMeshPreserveUV);
+            y += 28;
+        }
+        if (button({x, y, width, 24}, "Weld by Distance")) {
+            std::vector<uint32_t> vertices;
+            vertices.reserve(gMeshSelection.size());
+            for (size_t index : gMeshSelection) vertices.push_back((uint32_t)index);
+            if (polygon) {
+                PolygonMesh edited = *polygon;
+                if (weldPolygonVertices(edited, vertices, gMeshWeldDistance)) {
+                    commitPolygons(std::move(edited), "Welded geometry and retained face-corner UVs.", true);
+                    return;
+                }
+            } else {
+                Mesh edited = mesh;
+                if (weldMeshVertices(edited, vertices, gMeshWeldDistance, gMeshPreserveUV)) {
+                    commit(std::move(edited), "Welded nearby selected vertices.", true);
+                    return;
+                }
+            }
+            gMeshMessage = polygon ? "Select nearby vertices or adjust the weld distance." :
+                           "Select nearby vertices with compatible UVs, or adjust the weld distance.";
+        }
+        y += 30;
+    } else if (gMeshPick == MeshPick::Edge && !bound) {
+        auto selectedEdges = [&] {
+            std::vector<Edge> boundary;
+            for (size_t i : gMeshSelection) boundary.push_back(edges[i]);
+            return boundary;
+        };
+        if (button({x, y, polygon ? 108 : width, 24}, "Fill Boundary")) {
+            auto boundary = selectedEdges();
+            if (polygon) {
+                PolygonMesh edited = *polygon;
+                if (fillPolygonBoundary(edited, boundary)) {
+                    commitPolygons(std::move(edited), "Filled the selected boundary loop.", true);
+                    return;
+                }
+            } else {
+                Mesh edited = mesh;
+                if (fillMeshBoundary(edited, boundary) && edited.triCount() <= 100000) {
+                    commit(std::move(edited), "Filled the selected boundary loop.", true);
+                    return;
+                }
+            }
+            gMeshMessage = "Select one closed, planar loop of boundary edges.";
+        }
+        if (polygon && button({x + 114, y, 108, 24}, "Select Boundary")) {
+            auto boundary = expandPolygonBoundary(*polygon, selectedEdges());
+            if (boundary.empty()) gMeshMessage = "Select one or more edges on a boundary.";
+            else {
+                gMeshSelection.clear();
+                for (Edge edge : boundary)
+                    gMeshSelection.insert((size_t)(std::lower_bound(edges.begin(), edges.end(), edge) - edges.begin()));
+                gMeshMessage = "Selected the boundaries connected to those edges.";
+            }
+        }
+        y += 30;
+        if (polygon) {
+            dragF({x, y, 108, 24}, "Cut Position", gMeshLoopFraction, .005f, .01f, .99f, "%.2f");
+            if (button({x + 114, y, 108, 24}, "Loop Cut")) {
+                PolygonMesh edited = *polygon;
+                if (gMeshSelection.size() == 1 && cutQuadLoop(edited, edges[*gMeshSelection.begin()], gMeshLoopFraction))
+                    commitPolygons(std::move(edited), "Cut a loop through adjoining quads.", true);
+                else gMeshMessage = "Select one edge on a quad strip without branches or crossings.";
+                return;
+            }
+            y += 28;
+            dragI({x, y, 108, 24}, "Bridge Segments", gMeshBridgeSegments, .12f, 1, 32);
+            dragI({x + 114, y, 108, 24}, "Bridge Twist", gMeshBridgeTwist, .12f, -2048, 2048);
+            y += 28;
+            if (button({x, y, 108, 24}, "Bridge Edges")) {
+                PolygonMesh edited = *polygon;
+                if (bridgePolygonBoundaries(edited, selectedEdges(), gMeshBridgeSegments, gMeshBridgeTwist))
+                    commitPolygons(std::move(edited), "Bridged the selected boundaries with quads.", true);
+                else gMeshMessage = "Select two separate loops or chains of equal length with compatible winding.";
+                return;
+            }
+            if (button({x + 114, y, 108, 24}, "Knife Path")) {
+                gMeshKnife = true;
+                gMeshCutPoints.clear();
+                gMeshMessage.clear();
+                return;
+            }
+            y += 30;
+        }
     }
     if (bound) {
         note({x, y, width, 31}, "Unbind skin in the Rig Editor to change topology.");
     } else if (button({x, y, width, 24}, "Subdivide Mesh")) {
+        if (polygon) {
+            PolygonMesh edited = *polygon;
+            if (mesh.triCount() <= 25000 && subdividePolygons(edited))
+                commitPolygons(std::move(edited), "Subdivided the mesh into quads.", true);
+            else gMeshMessage = "Subdivision needs convex faces and room below the editor limit.";
+            return;
+        }
         Mesh edited = mesh;
         if (mesh.triCount() <= 25000 && subdivideMesh(edited)) {
             commit(std::move(edited), "Split every triangle into four.", true);
@@ -3073,11 +3343,21 @@ void drawMeshLab() {
     label(x, y, "Planar UV Projection", width);
     for (int axis = 0; axis < 3; ++axis) {
         if (button({x + 76 * axis, y + 20, 70, 24}, axes[axis])) {
+            if (polygon) {
+                PolygonMesh edited = *polygon;
+                projectPolygonUV(edited, axis);
+                commitPolygons(std::move(edited), "Projected planar UV coordinates.");
+                return;
+            }
             Mesh edited = mesh;
             projectMeshUV(edited, axis);
             commit(std::move(edited), "Projected planar UV coordinates.");
             return;
         }
+    }
+    if (!polygon && !bound && button({x, y + 49, width, 24}, "Enable Polygon Tools")) {
+        commitPolygons(polygonsFromTriangles(mesh), "Enabled polygon editing for this mesh.", true);
+        return;
     }
     note({view.x, view.y + view.h + 8, view.w, 30}, gMeshMessage.empty() ?
          "Click to select. Shift-click toggles components in the selection." : gMeshMessage.c_str());
@@ -3109,22 +3389,27 @@ void drawRigLab() {
         labFooter(p);
         return;
     }
-    if (mesh.v.empty() || mesh.v.size() > MAX_SKIN_VERTICES) {
+    const auto& skinPositions = mesh.skinVertices();
+    if (skinPositions.empty() || skinPositions.size() > MAX_SKIN_VERTICES) {
         note({view.x, y, view.w, 35}, "Rigging supports nonempty meshes of up to one million vertices.");
         labFooter(p);
         return;
     }
     auto commit = [&](Rig edited, const char* message) {
-        if (!validRig(edited, mesh.v.size())) { gRigMessage = "Use a nonzero joint length and valid pose values."; return false; }
+        if (!validRig(edited, skinPositions.size())) {
+            gRigMessage = "Check joint lengths and parents. IK chains need two distinct joints and cannot share a driven joint.";
+            return false;
+        }
         object.rig = std::make_shared<Rig>(std::move(edited));
         gRigMessage = message;
         sceneChanged();
         return true;
     };
-    const char* modes[] = {"Skeleton", "Pose", "Weights"};
-    for (int i = 0; i < 3; ++i) {
-        if (button({view.x + i * 89, view.y - 33, 83, 26}, modes[i], i == gRigMode)) {
+    const char* modes[] = {"Skeleton", "Pose", "Weights", "IK"};
+    for (int i = 0; i < 4; ++i) {
+        if (button({view.x + i * 67, view.y - 33, 63, 26}, modes[i], i == gRigMode, gSmall)) {
             gRigMode = i;
+            gRigPlace = 0;
             gRigMessage.clear();
         }
     }
@@ -3135,9 +3420,32 @@ void drawRigLab() {
     if (rig) gRigJoint = std::clamp(gRigJoint, 0, (int)rig->joints.size() - 1);
     else gRigMode = 0;
     bool weights = rig && !rig->weights.empty();
-    const Mesh& shown = gRigMode == 1 ? *object.visibleMesh() : mesh;
+    bool showPose = gRigMode == 1 || gRigMode == 3;
+    const Mesh& shown = showPose ? *object.visibleMesh() : mesh;
     std::vector<PosedJoint> pose;
-    if (rig && gRigMode == 1) pose = poseRig(*rig, gScene.frame);
+    if (rig && showPose) pose = poseRig(*rig, gScene.frame);
+    auto chainIndex = [&](int joint) {
+        if (!rig) return -1;
+        for (size_t i = 0; i < rig->ik.size(); ++i)
+            if (rig->ik[i].end == joint) return (int)i;
+        return -1;
+    };
+    auto saveGoal = [&](int index, const IKKey& key, bool keyed) {
+        const auto& keys = rig->ik[index].keys;
+        bool writeKey = keyed || !keys.empty();
+        if (writeKey && keys.size() >= MAX_JOINT_KEYS &&
+            std::none_of(keys.begin(), keys.end(), [&](const IKKey& point) { return point.frame == key.frame; })) {
+            gRigMessage = "Remove an IK key before adding another.";
+            return;
+        }
+        Rig edited = *rig;
+        if (writeKey) putKey(edited.ik[index].keys, key);
+        else edited.ik[index].settings = key;
+        commit(std::move(edited), writeKey ? "Updated the IK control key." : "Updated the IK controls.");
+    };
+    int shownChain = gRigMode == 3 ? chainIndex(gRigJoint) : -1;
+    IKKey shownGoal;
+    if (shownChain >= 0) shownGoal = sampleIK(rig->ik[shownChain], (float)gScene.frame);
     auto head = [&](int i) { return !pose.empty() ? pose[i].head : rig->joints[i].head; };
     auto tail = [&](int i) { return !pose.empty() ? pose[i].tail : rig->joints[i].tail; };
     V3 low = shown.bmin, high = shown.bmax;
@@ -3147,6 +3455,10 @@ void drawRigLab() {
     };
     if (rig) {
         for (int i = 0; i < (int)rig->joints.size(); ++i) { include(head(i)); include(tail(i)); }
+    }
+    if (shownChain >= 0) {
+        include(shownGoal.target);
+        include(shownGoal.pole);
     }
     M3 direction;
     if (gRigView == 0) direction = rotX(rad(-25.f)) * rotY(rad(35.f));
@@ -3162,6 +3474,16 @@ void drawRigLab() {
     press(view, id);
     if (rig && clicked(view, id)) {
         V3 cursor((float)gIn.mx, (float)gIn.my, 0);
+        if (shownChain >= 0 && gRigPlace) {
+            V3& control = gRigPlace == 1 ? shownGoal.target : shownGoal.pole;
+            float depth = (direction * (control - center)).z;
+            V3 viewPoint((cursor.x - (view.x + view.w * .5f)) / factor,
+                         ((view.y + view.h * .5f) - cursor.y) / factor, depth);
+            control = center + direction.transpose() * viewPoint;
+            gRigPlace = 0;
+            saveGoal(shownChain, shownGoal, false);
+            return;
+        }
         float best = 100, depth = -1e30f;
         size_t selected = SIZE_MAX;
         auto test = [&](V3 p, size_t i) {
@@ -3169,13 +3491,15 @@ void drawRigLab() {
             if (d < best || (d == best && p.z > depth)) { best = d; depth = p.z; selected = i; }
         };
         if (gRigMode == 2 && weights) {
-            for (size_t i = 0; i < mesh.v.size(); ++i) test(project(mesh.v[i]), i);
+            for (size_t i = 0; i < skinPositions.size(); ++i) test(project(skinPositions[i]), i);
             if (!gIn.shift) gRigVertices.clear();
             if (selected != SIZE_MAX) {
-                V3 position = mesh.v[selected];
+                V3 position = skinPositions[selected];
                 bool add = !gRigVertices.count((uint32_t)selected);
-                for (uint32_t i = 0; i < mesh.v.size(); ++i) {
-                    if (dot(mesh.v[i] - position, mesh.v[i] - position) > 1e-12f) continue;
+                uint32_t first = mesh.polygons ? (uint32_t)selected : 0;
+                uint32_t end = mesh.polygons ? first + 1 : (uint32_t)skinPositions.size();
+                for (uint32_t i = first; i < end; ++i) {
+                    if (dot(skinPositions[i] - position, skinPositions[i] - position) > 1e-12f) continue;
                     if (add) gRigVertices.insert(i);
                     else gRigVertices.erase(i);
                 }
@@ -3209,18 +3533,29 @@ void drawRigLab() {
         }
     }
     if (gRigMode == 2 && weights) {
-        size_t sample = std::max<size_t>(1, mesh.v.size() / 6000);
-        for (size_t i = 0; i < mesh.v.size(); ++i) {
+        size_t sample = std::max<size_t>(1, skinPositions.size() / 6000);
+        for (size_t i = 0; i < skinPositions.size(); ++i) {
             bool selected = gRigVertices.count((uint32_t)i) != 0;
             if (!selected && i % sample != 0) continue;
             float weight = 0;
             for (size_t j = 0; j < 4; ++j)
                 if (rig->weights[i].joint[j] == gRigJoint) weight += rig->weights[i].weight[j];
-            V3 point = project(mesh.v[i]);
+            V3 point = project(skinPositions[i]);
             Color color = selected ? rgb(255, 240, 157) : rgb((unsigned)lerpf(70, 239, weight),
                           (unsigned)lerpf(132, 77, weight), (unsigned)lerpf(232, 57, weight));
             circle((int)point.x, (int)point.y, selected ? 4 : 2, color);
         }
+    }
+    if (shownChain >= 0) {
+        auto marker = [&](V3 point, Color color, const char* name) {
+            V3 p = project(point);
+            circle((int)p.x, (int)p.y, 6, color);
+            textIn({(int)p.x + 9, (int)p.y - 8, 60, 16}, name, color, gSmall, TextLeft | TextMiddle);
+        };
+        stroke(project(tail(rig->ik[shownChain].end)), project(shownGoal.target), rgb(244, 157, 109));
+        stroke(project(head(rig->ik[shownChain].end)), project(shownGoal.pole), rgb(141, 222, 137));
+        marker(shownGoal.target, rgb(244, 157, 109), "Target");
+        marker(shownGoal.pole, rgb(141, 222, 137), "Pole");
     }
     clearClip();
     bevel(view, true);
@@ -3248,8 +3583,10 @@ void drawRigLab() {
         y += 31;
     }
     if (rig) {
+        int previousJoint = gRigJoint;
         if (button({x, y, 26, 24}, "<")) gRigJoint = std::max(0, gRigJoint - 1);
         if (button({x + width - 26, y, 26, 24}, ">")) gRigJoint = std::min((int)rig->joints.size() - 1, gRigJoint + 1);
+        if (previousJoint != gRigJoint) gRigPlace = 0;
         const Joint& joint = rig->joints[gRigJoint];
         std::string name = gEditObj == -4 ? gEditBuf + "|" : joint.name;
         if (button({x + 31, y, width - 62, 24}, name.c_str(), gEditObj == -4)) { gEditObj = -4; gEditBuf = joint.name; }
@@ -3301,6 +3638,11 @@ void drawRigLab() {
                 edited.joints.erase(edited.joints.begin() + gRigJoint);
                 for (auto& remaining : edited.joints)
                     if (remaining.parent > gRigJoint) --remaining.parent;
+                edited.ik.erase(std::remove_if(edited.ik.begin(), edited.ik.end(),
+                    [&](const RigIK& chain) { return chain.end == gRigJoint; }), edited.ik.end());
+                for (auto& chain : edited.ik)
+                    if (chain.end > gRigJoint) --chain.end;
+                remapRigActionTracks(edited, gRigJoint, -1);
                 if (commit(std::move(edited), "Deleted a leaf joint. Unweighted vertices retain their rest positions."))
                     gRigJoint = std::min(gRigJoint, (int)object.rig->joints.size() - 1);
                 return;
@@ -3347,6 +3689,62 @@ void drawRigLab() {
                 commit(std::move(edited), remove ? "Deleted the pose key." : "Updated the joint pose.");
                 return;
             }
+        } else if (gRigMode == 3) {
+            int index = chainIndex(gRigJoint);
+            if (index < 0) {
+                if (joint.parent >= 0 && button({x, y, width, 28}, "Add Two-Joint IK")) {
+                    Rig edited = *rig;
+                    RigIK chain;
+                    chain.end = gRigJoint;
+                    chain.settings.target = tail(gRigJoint);
+                    chain.settings.pole = head(gRigJoint);
+                    edited.ik.push_back(std::move(chain));
+                    commit(std::move(edited), "Added IK. Move the target and pole to pose the chain.");
+                    return;
+                }
+                note({x, y + 39, width, 68}, "Select the lower joint of an arm or leg to add IK.");
+            } else {
+                int frame = gScene.frame;
+                if (sliderI({x, y, width, 24}, "Frame", frame, 0, gScene.frames - 1)) {
+                    gScene.applyFrame(frame);
+                    gViewPreviewDirty = gNanoDirty = true;
+                }
+                y += 30;
+                IKKey goal = sampleIK(rig->ik[index], (float)frame);
+                bool changed = vecRow("Target in Mesh Space", goal.target, .025f, -100000, 100000);
+                changed |= vecRow("Pole in Mesh Space", goal.pole, .025f, -100000, 100000);
+                changed |= slider({x, y, width, 24}, "IK Influence", goal.influence, 0, 1);
+                y += 30;
+                if (button({x, y, 108, 24}, "Place Target", gRigPlace == 1)) gRigPlace = gRigPlace == 1 ? 0 : 1;
+                if (button({x + 114, y, width - 114, 24}, "Place Pole", gRigPlace == 2)) gRigPlace = gRigPlace == 2 ? 0 : 2;
+                y += 30;
+                bool key = button({x, y, 108, 24}, "Set IK Key");
+                bool removeKey = button({x + 114, y, width - 114, 24}, "Delete IK Key");
+                y += 30;
+                bool remove = button({x, y, 108, 24}, "Remove IK");
+                if (button({x + 114, y, width - 114, 24}, (std::string("Ease ") + easeName(goal.ease)).c_str())) {
+                    goal.ease = (Ease)(((int)goal.ease + 1) % (int)Ease::COUNT);
+                    changed = true;
+                }
+                if (remove || removeKey) {
+                    Rig edited = *rig;
+                    if (remove) {
+                        edited.ik.erase(edited.ik.begin() + index);
+                        remapRigActionTracks(edited, -1, gRigJoint);
+                    }
+                    else if (!eraseKey(edited.ik[index].keys, frame)) {
+                        gRigMessage = "There is no IK key on this frame.";
+                        return;
+                    }
+                    gRigPlace = 0;
+                    commit(std::move(edited), remove ? "Removed the IK chain." : "Deleted the IK key.");
+                    return;
+                }
+                if (changed || key) {
+                    saveGoal(index, goal, key);
+                    return;
+                }
+            }
         } else if (weights) {
             std::string count = std::to_string(gRigVertices.size()) + " vertices selected";
             label(x, y, count.c_str(), width);
@@ -3370,10 +3768,13 @@ void drawRigLab() {
             note({x, y, width, 54}, "Bind skin in the Skeleton tab to edit weights.");
         }
     }
-    note({view.x, view.y + view.h + 8, view.w, 44}, gRigMessage.empty() ?
+    const char* instructions = gRigPlace ? "Click in the preview to place the control at its current depth." :
+         gRigMessage.empty() ?
          (gRigMode == 2 ? "Select vertices in the rest mesh. Shift-click toggles selection." :
           gRigMode == 1 ? "Click a joint to pose it. Edits on animated joints set a key at the current frame." :
-          "Add a root and child joints, adjust their rest positions, and bind the skin.") : gRigMessage.c_str());
+          gRigMode == 3 ? "The target moves the tip. The pole determines the bend. Influence blends with the pose keys." :
+          "Add a root and child joints, adjust their rest positions, and bind the skin.") : gRigMessage.c_str();
+    note({view.x, view.y + view.h + 8, view.w, 44}, instructions);
     labFooter(p);
 }
 
@@ -3558,6 +3959,173 @@ void drawCurveLab() {
     labFooter(p);
 }
 
+void drawActionLab() {
+    auto& object = gScene.objs[gSel];
+    const Rig& rig = *object.rig;
+    R p = panel(824, 554, "Action Editor  -  " + object.name);
+    int x = p.x + 20, y = p.y + 46, width = p.w - 40;
+    auto commit = [&](Rig edited, const char* message) {
+        if (!validRigMotion(edited)) { gActionMessage = "The action or clip exceeds the timeline or key limits."; return false; }
+        for (const auto& clip : edited.clips)
+            gScene.frames = std::max(gScene.frames, clip.start + rigClipFrames(*edited.actions[clip.action], clip));
+        object.rig = std::make_shared<Rig>(std::move(edited));
+        sceneChanged();
+        gActionMessage = message;
+        return true;
+    };
+    int frame = gScene.frame;
+    if (sliderI({x, y, width, 24}, "Playhead", frame, 0, gScene.frames - 1)) {
+        gScene.applyFrame(frame);
+        gNanoDirty = gViewPreviewDirty = true;
+        gShowRender = false;
+    }
+    y += 38;
+    dragI({x, y, 112, 24}, "First Frame", gActionFirst, .25f, 0, gScene.frames - 1);
+    if (button({x + 118, y, 112, 24}, "Set First Here")) gActionFirst = frame;
+    dragI({x + 248, y, 112, 24}, "Last Frame", gActionLast, .25f, 0, gScene.frames - 1);
+    if (button({x + 366, y, 112, 24}, "Set Last Here")) gActionLast = frame;
+    if (button({x + width - 156, y, 156, 24}, "Capture Action", true)) {
+        int number = (int)rig.actions.size() + 1;
+        std::string name;
+        do {
+            name = "Action " + std::to_string(number++);
+        } while (std::any_of(rig.actions.begin(), rig.actions.end(), [&](const auto& action) { return action->name == name; }));
+        auto action = captureRigAction(rig, gActionFirst, gActionLast, name);
+        if (action) {
+            Rig edited = rig;
+            edited.actions.push_back(std::move(action));
+            if (commit(std::move(edited), "Captured the visible animation as an action."))
+                gAction = (int)object.rig->actions.size() - 1;
+        } else gActionMessage = "Use an ordered frame range of up to 1,200 frames and check the action library limit.";
+        return;
+    }
+    y += 35;
+    if (!rig.actions.empty()) {
+        gAction = std::clamp(gAction, 0, (int)rig.actions.size() - 1);
+        if (button({x, y, 28, 24}, "<")) gAction = std::max(0, gAction - 1);
+        if (button({x + 265, y, 28, 24}, ">")) gAction = std::min((int)rig.actions.size() - 1, gAction + 1);
+        const auto& action = *rig.actions[gAction];
+        std::string name = gEditObj == -5 ? gEditBuf + "|" :
+                           action.name + "  /  " + std::to_string(action.frames) + " frames";
+        if (button({x + 33, y, 227, 24}, name.c_str(), gEditObj == -5)) { gEditObj = -5; gEditBuf = action.name; }
+        if (button({x + 306, y, 153, 24}, "Place at Playhead")) {
+            Rig edited = rig;
+            edited.clips.push_back({gAction, frame});
+            if (commit(std::move(edited), "Placed a clip at the playhead.")) gActionClip = (int)object.rig->clips.size() - 1;
+            return;
+        }
+        if (button({x + 465, y, 105, 24}, "Copy Action")) {
+            gActionClipboard = object.rig;
+            gCopiedAction = gAction;
+            gActionMessage = "Copied the action. Paste it onto a rig with matching joints.";
+        }
+        if (button({x + width - 114, y, 114, 24}, "Delete Action")) {
+            Rig edited = rig;
+            removeRigAction(edited, gAction);
+            commit(std::move(edited), "Deleted the action and its timeline clips.");
+            return;
+        }
+    } else {
+        label(x, y + 3, "Capture a range or paste a copied action.", 430);
+    }
+    if (gActionClipboard && button({x + 576, y, 88, 24}, "Paste Action")) {
+        auto action = transferRigAction(*gActionClipboard, gCopiedAction, rig);
+        if (action) {
+            Rig edited = rig;
+            edited.actions.push_back(std::move(action));
+            if (commit(std::move(edited), "Transferred the action to this rig."))
+                gAction = (int)object.rig->actions.size() - 1;
+        } else gActionMessage = "Paste requires unique matching joint names, parents, and IK chains.";
+        return;
+    }
+    y += 42;
+    label(x, y - 4, "Timeline Clips");
+    if (!rig.clips.empty()) {
+        gActionClip = std::clamp(gActionClip, 0, (int)rig.clips.size() - 1);
+        if (button({x + width - 65, y - 10, 30, 22}, "<")) gActionClip = std::max(0, gActionClip - 1);
+        if (button({x + width - 30, y - 10, 30, 22}, ">")) gActionClip = std::min((int)rig.clips.size() - 1, gActionClip + 1);
+    }
+    y += 24;
+    R lanes{x, y, width, 109};
+    fill(lanes, rgb(26, 30, 38));
+    auto pixel = [&](int time) {
+        return lanes.x + 154 + (int)std::lround((lanes.w - 164) * clampf(time / (float)std::max(1, gScene.frames - 1), 0, 1));
+    };
+    for (int i = 0; i <= 4; ++i) {
+        int gx = pixel((gScene.frames - 1) * i / 4);
+        line(gx, lanes.y, gx, lanes.y + lanes.h, rgb(57, 67, 81));
+    }
+    if (rig.clips.empty()) {
+        note({x + 12, y + 12, width - 24, 38}, "Place an action at the playhead to create a clip.");
+    } else {
+        int top = std::clamp(gActionClip - 1, 0, std::max(0, (int)rig.clips.size() - 4));
+        for (int i = top; i < (int)rig.clips.size() && i < top + 4; ++i) {
+            const auto& clip = rig.clips[i];
+            const auto& action = *rig.actions[clip.action];
+            int row = lanes.y + 4 + (i - top) * 25;
+            std::string name = std::to_string(i + 1) + ". " + action.name;
+            if (button({x + 4, row, 143, 22}, name.c_str(), i == gActionClip, gSmall)) gActionClip = i;
+            int start = pixel(clip.start), end = pixel(clip.start + rigClipFrames(action, clip) - 1);
+            if (button({start, row, std::max(5, end - start + 1), 22}, "", i == gActionClip)) gActionClip = i;
+        }
+        int playhead = pixel(frame);
+        line(playhead, lanes.y, playhead, lanes.y + lanes.h, rgb(243, 156, 101));
+    }
+    y += lanes.h + 12;
+    if (!rig.clips.empty()) {
+        RigClip clip = rig.clips[gActionClip];
+        const auto& action = *rig.actions[clip.action];
+        bool changed = dragI({x, y, 105, 24}, "Start", clip.start, .5f, 0, 99999);
+        if (button({x + 111, y, 99, 24}, "Start Here")) { clip.start = frame; changed = true; }
+        changed |= dragI({x + 219, y, 110, 24}, "Repeats", clip.repeats, .2f, 1, 64);
+        changed |= slider({x + 337, y, 212, 24}, "Speed", clip.speed, .125f, 8, "%.2fx", true);
+        changed |= slider({x + 557, y, 227, 24}, "Influence", clip.influence, 0, 1);
+        y += 32;
+        int length = rigClipFrames(action, clip);
+        if (changed) {
+            clip.fadeIn = std::min(clip.fadeIn, length - 1);
+            clip.fadeOut = std::min(clip.fadeOut, length - 1);
+        }
+        changed |= dragI({x, y, 106, 24}, "Fade In", clip.fadeIn, .4f, 0, length - 1);
+        changed |= dragI({x + 113, y, 106, 24}, "Fade Out", clip.fadeOut, .4f, 0, length - 1);
+        std::string range = "Frames " + std::to_string(clip.start) + " to " + std::to_string(clip.start + length - 1);
+        textIn({x + 232, y, 275, 24}, range.c_str(), TXT, gSmall, TextLeft | TextMiddle);
+        if (button({x + width - 256, y, 123, 24}, "Apply & Play")) {
+            closeLab(false);
+            gScene.applyFrame(clip.start);
+            gShowRender = false;
+            startPlayback(clip.start + length - 1);
+            return;
+        }
+        if (button({x + width - 122, y, 122, 24}, "Delete Clip")) {
+            Rig edited = rig;
+            edited.clips.erase(edited.clips.begin() + gActionClip);
+            commit(std::move(edited), "Removed this placement from the timeline.");
+            return;
+        }
+        y += 30;
+        int move = 0;
+        if (button({x, y, 124, 24}, "Lower Priority") && gActionClip > 0) move = -1;
+        if (button({x + 131, y, 124, 24}, "Raise Priority") && gActionClip + 1 < (int)rig.clips.size()) move = 1;
+        if (changed || move) {
+            Rig edited = rig;
+            edited.clips[gActionClip] = clip;
+            if (move) std::swap(edited.clips[gActionClip], edited.clips[gActionClip + move]);
+            if (commit(std::move(edited), "Updated the timeline clip.")) gActionClip += move;
+            return;
+        }
+        textIn({x + 268, y, 325, 24}, "Higher priority clips blend over lower ones.", TXT_DIM, gSmall, TextLeft | TextMiddle);
+        if (button({x + width - 147, y, 147, 24}, "Bake Clips to Keys")) {
+            Rig edited = rig;
+            if (bakeRigClips(edited, gScene.frames)) commit(std::move(edited), "Baked the clip stack to joint and IK keys.");
+            else gActionMessage = "Baking requires the complete clip stack to fit within 1,200 timeline frames.";
+            return;
+        }
+    }
+    note({x, p.y + p.h - 77, width, 32}, gActionMessage.c_str());
+    labFooter(p);
+}
+
 void drawCommandsLab() {
     R p = panel(770, 588, "Commands");
     struct Command { const char* label; const char* key; std::function<void()> run; };
@@ -3581,6 +4149,7 @@ void drawCommandsLab() {
         {"Mesh Editor", "Edit mesh components", [] { openLab(LabMesh); }},
         {"Curve Editor", "Edit object transform curves", [] { openLab(LabCurves); }},
         {"Rig Editor", "Bind and animate a mesh", [] { openLab(LabRig); }},
+        {"Action Editor", "Capture and arrange rig animation", [] { openLab(LabActions); }},
     };
     for (int i = 0; i < (int)std::size(commands); ++i) {
         int x = p.x + 18 + (i % 2) * 369, y = p.y + 50 + (i / 2) * 36;
@@ -4959,6 +5528,7 @@ void drawUI() {
         case LabMesh: drawMeshLab(); break;
         case LabCurves: drawCurveLab(); break;
         case LabRig: drawRigLab(); break;
+        case LabActions: drawActionLab(); break;
         default: break;
         }
     }
@@ -5214,6 +5784,12 @@ void handleKey(int wp) {
     }
     if (wp == KeyCode::Escape) {
         if (gLab == LabSimulation && gSimulationBake.valid()) return;
+        if (gLab == LabMesh && gMeshKnife) {
+            gMeshKnife = false;
+            gMeshCutPoints.clear();
+            gMeshMessage.clear();
+            return;
+        }
         if (gLab != LabNone) { closeLab(true); endInteraction(); }
         else if (gScatter) { gScatter = false; gDrag = DragNone; gStatus = "Scatter brush closed."; }
         else if (gMainR.busy() || gAnimRender || !gQueue.empty()) actRender();

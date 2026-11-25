@@ -9,6 +9,7 @@ find_package(Threads REQUIRED)
 add_library(canyon_core STATIC
     src/image.cpp
     src/mesh.cpp
+    src/polygon.cpp
     src/presets.cpp
     src/render.cpp
     src/rig.cpp

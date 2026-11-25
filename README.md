@@ -68,13 +68,17 @@ Close the studio before rebuilding so the linker can replace `Brycescape.exe`. T
 
 ## Edit meshes and animation curves
 
-Select an object and open **F1 → Mesh Editor**. An imported mesh opens directly. Use **Convert Selection to Mesh** to turn a supported procedural solid into editable triangles. Cubes convert to an eight-vertex box.
+Select an object and open **F1 → Mesh Editor**. Imported OBJ faces retain their original boundaries, including quads and n-gons. Use **Convert Selection to Mesh** to turn a supported procedural solid into an editable mesh. Cubes convert to six quads with eight shared vertices. On older triangle meshes, use **Enable Polygon Tools** to work with each existing triangle as a polygon.
 
 - Choose **Vertices**, **Edges**, or **Faces**, then click in the wire view. Shift-click toggles components. The 3D, Front, Top, and Side views help reach overlapping components.
 - Set local X, Y, and Z values and apply **Move**, **Rotate**, or **Scale**. Rotation and scale use the selection center.
-- In face mode, extrude a face region, delete faces, or reverse their winding. **Subdivide Mesh** splits each triangle into four with shared edge midpoints. Planar UV projection replaces the current UV coordinates along the chosen axis.
+- In **Faces**, extrude a region, delete faces, or reverse their winding. For **Inset Face**, select one convex, planar face and set the inward offset. **Subdivide Mesh** splits convex polygon faces into quads with shared edge midpoints. On legacy triangle meshes it splits each triangle into four.
+- In **Edges**, select one edge and use **Loop Cut** to split the adjoining quad strip at **Cut Position**. The cut can end at a boundary or a non-quad.
+- Use **Select Boundary** to grow selected edges along their boundaries. **Fill Boundary** caps one closed planar loop. **Bridge Edges** joins two open chains or two closed loops with the same edge count. **Bridge Segments** controls the number of quad rows, and **Bridge Twist** shifts the vertex pairing on closed loops.
+- Open **Knife Path** and click each edge the cut crosses. Click near a vertex to snap to it or hold **Shift** to snap to the edge midpoint. Each segment crosses a face. **Apply Knife** commits the whole path, and **Esc** exits Knife mode and discards the pending path.
+- In **Vertices**, **Weld by Distance** merges nearby selected positions and retains independent face-corner UVs. Legacy meshes can use **Preserve UV Seams** to keep their separate seam vertices. Planar UV projection replaces the current UV coordinates along the chosen axis.
 
-The editor works with indexed triangles and supports up to 100,000 triangles per mesh. Existing UV seams retain their separate vertex indices. Reproject UVs when newly extruded sides need texture coordinates. **OK** commits one undoable edit and **Cancel** discards the session.
+The editor supports up to 100,000 render triangles per mesh. A polygon can have up to 2,048 corners. Polygon positions stay connected through UV seams. Geometry edits can regenerate normals, and OBJ export keeps polygon boundaries where the posed faces have a valid triangulation. **OK** commits one undoable edit and **Cancel** discards the session.
 
 Open **F1 → Curve Editor** with an object selected to inspect Location, Rotation, and Scale along each axis. Drag the graph background to scrub. Click a key to select it, drag vertically to change its value, or use the controls to retime, copy, remove, and change interpolation. Each transform key shares its frame and interpolation across all nine components. The graph samples the same curves used for playback.
 
@@ -82,11 +86,21 @@ Open **F1 → Curve Editor** with an object selected to inspect Location, Rotati
 
 Select a mesh and open **F1 → Rig Editor**. In **Skeleton**, add a root and child joints, select them in the preview, and adjust their rest positions. Click the joint name to rename it. **Bind Skin** assigns weights from joint distances.
 
-Use **Weights** to assign an influence to selected rest vertices. Shift-click toggles vertices, including coincident copies along a UV seam. Each vertex supports four influences. The editor adjusts the other weights when you assign one.
+Use **Weights** to assign an influence to selected rest vertices. Shift-click toggles vertices. Polygon UV seams share the same vertex weight. On legacy meshes, selection includes coincident copies along a seam. Each vertex supports four influences. The editor adjusts the other weights when you assign one.
 
 In **Pose**, select a joint, set a frame, and adjust its local translation, rotation, or scale. **Set Pose Key** makes the pose part of the animation. Editing an animated joint at another frame sets a key there. The **Curve Editor** can switch between the object and its joint tracks. Click the joint name to cycle tracks and Shift-click to cycle backward.
 
-Rigged scenes save in `.c3d` version 7. Rendering and geometry export use the current pose. Linked instances share the source pose until you make them unique. Unbind before changing the mesh's topology.
+For inverse kinematics, open **IK**, select the lower joint of a limb, and click **Add Two-Joint IK**. The target positions the tip and the pole sets the elbow or knee bend. Edit their coordinates or use **Place Target** and **Place Pole** to place the control in the preview at its current depth. **IK Influence** blends the solve with the joint pose. Use **Set IK Key** to animate the target, pole, and influence. The controls use mesh space and the solver keeps the limb within its reach.
+
+Scenes with polygon meshes save in `.c3d` version 10. Other rigged scenes use version 7, version 8 with IK, or version 9 with actions. Rendering and geometry export use the current pose. Linked instances share the source pose until you make them unique. Unbind before changing the mesh's topology.
+
+### Reuse character animation
+
+Select a rigged object and open **F1 → Action Editor**. Set the first and last frames and click **Capture Action**. This records the joint and IK motion visible in that range. Click the action name to rename it.
+
+Move the playhead and use **Place at Playhead** to add a clip. Repeat or retime the clip with **Repeats** and **Speed**. Use **Influence**, **Fade In**, and **Fade Out** to blend it over the underlying pose and other clips. **Raise Priority** moves a clip above lower-priority clips. **Apply & Play** commits the changes and previews the selected clip.
+
+Use **Copy Action** and **Paste Action** to transfer it to another rig with unique, matching joint names, parents, and IK chains. Transfer scales local translations and relocates IK controls to the destination proportions. Object-level transforms stay in their own tracks. **Bake Clips to Keys** converts the evaluated clip stack into editable joint and IK keys on timelines up to 1,200 frames. The captured actions stay in the library.
 
 ## Simulate physics and liquid
 

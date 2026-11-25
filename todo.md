@@ -2,12 +2,13 @@
 
 ## Production modeling and animation
 
-- [ ] Editable polygon topology with independent UV corners, reusable selections, and large mesh editing.
-- [ ] Expanded topology operations including inset, bevel, weld, loop cuts, bridge, fill, knife, symmetry, and cleanup.
+- [ ] Reusable component selections and large mesh editing.
+- [ ] Expanded topology operations including bevel, symmetry, and cleanup. Convex face inset, quad loop cuts, vertex welding, planar boundary filling, equal-count boundary bridging, and edge-to-edge knife paths are implemented.
+- [ ] Extend the bridge to boundaries with different edge counts and add drag-based knife cuts with optional cut-through.
 - [ ] Modifier evaluation, richer UV editing, multiple material assignments, and interchange of these attributes.
 - [x] Skeleton creation, joint posing, skin binding, weight editing, and deformation through playback, save, and render.
 - [ ] Rig editing depth including weight painting and mirroring, bone tools, joint-local orientation controls, and larger deformation benchmarks.
-- [ ] Character animation with IK, constraints, reusable actions, retargeting, and clips.
+- [ ] Character animation with additional constraints and retargeting between different skeleton conventions. Two-joint IK, action capture, timeline clip blending and baking, and same-hierarchy action transfer are implemented.
 - [ ] Independent animation channels, curve handles, graph navigation, multi-key operations, and curve validation.
 
 The scores reflect impact on landscape work, from **10** for major workflow gaps to **1** for specialized features. Completed changes are recorded in [CHANGELOG.md](CHANGELOG.md). The comparison uses the Daz feature overview, help topics and Bryce 7 Artist Guide. Side-by-side verification with an installed Bryce 7.1 Pro remains open.
@@ -22,7 +23,7 @@ The scores reflect impact on landscape work, from **10** for major workflow gaps
 
 - [ ] **Lighting and atmosphere fidelity.** Compare True Ambience, fill and dome behavior, cloud layers and atmospheric perspective with Bryce reference scenes. Evaluate HDR sampling noise, cloud depth and volumetric shadows. Brycescape now runs up to four diffuse bounces. [Daz Bryce overview](https://www.daz3d.com/bryce-overview)
 - [ ] **Large-scene performance.** Extend the benchmarks to large imported meshes, volume-heavy scenes and long desktop editing sessions. Verify cache invalidation under repeated edits. Windows checks already cover localized 4097-point terrain brush edits, a 640×400 render with 2,062 objects, memory use, and cancellation.
-- [ ] **Animation tools.** Compare Advanced Motion Lab curve editing and its appearance channels against Brycescape. Add a curve editor and review remaining animated filters. Key retiming, terrain heightfield morphing and shape-key persistence are implemented. [Daz Bryce help topics](https://bugs.daz3d.com/hc/en-us/sections/201707363-Bryce)
+- [ ] **Animation tools.** Compare Advanced Motion Lab curve editing and its appearance channels against Brycescape and review remaining animated filters. Transform and joint curve editing, key retiming, terrain heightfield morphing and shape-key persistence are implemented. [Daz Bryce help topics](https://bugs.daz3d.com/hc/en-us/sections/201707363-Bryce)
 - [ ] **Terrain workflow depth.** Compare Bryce's custom brushes, clipping, masks and filters. Verify long interactive sessions at 4097 points and smooth shading at tile seams. Seamless border blending and linked terrain grids are implemented. [Daz terrain examples](https://www.daz3d.com/bryce-7-pro-tileable-high-resolution-terrains-and-matched-materials)
 - [ ] **Instancing and vegetation depth.** Compare painting and Tree Lab controls with Bryce. Test larger populations and varied terrain under active editing. Mixed-species painting, erasing and slope updates after sculpting are implemented for new instances. [Bryce instancing tutorial](https://www.daz3d.com/forums/discussion/3381/how-to-use-the-instancing-lab-in-bryce-7-1-pro-a-complete-tutorial)
 - [ ] **Library depth.** Expand the original standalone sky, terrain and vegetation presets and their previews. Sundial Basin now demonstrates HDR lighting, animated water, a camera orbit and layered materials.

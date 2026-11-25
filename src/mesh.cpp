@@ -2,6 +2,7 @@
 #include "mesh.h"
 
 #include <array>
+#include <charconv>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -9,7 +10,10 @@
 #include <fstream>
 #include <locale>
 #include <map>
+#include <numeric>
+#include <set>
 #include <sstream>
+#include <string_view>
 #include <utility>
 
 static void growBox(V3& lo, V3& hi, V3 p) {
@@ -171,6 +175,157 @@ bool deleteMeshFaces(Mesh& mesh, const std::vector<size_t>& faces) {
     return true;
 }
 
+bool weldMeshVertices(Mesh& mesh, const std::vector<uint32_t>& vertices, float distance, bool preserveUV) {
+    if (vertices.size() < 2 || !std::isfinite(distance) || distance < 1e-6f || distance > 1e5f) return false;
+    std::vector<uint32_t> ordered = vertices;
+    std::sort(ordered.begin(), ordered.end());
+    ordered.erase(std::unique(ordered.begin(), ordered.end()), ordered.end());
+    if (ordered.back() >= mesh.v.size()) return false;
+    using Cell = std::array<int64_t, 3>;
+    std::map<Cell, std::vector<uint32_t>> cells;
+    std::vector<uint32_t> owner(mesh.v.size());
+    std::iota(owner.begin(), owner.end(), 0u);
+    bool merged = false;
+    float distanceSquared = distance * distance;
+    for (uint32_t i : ordered) {
+        V3 p = mesh.v[i];
+        if (!(std::fabs(p.x) <= 1e9f && std::fabs(p.y) <= 1e9f && std::fabs(p.z) <= 1e9f)) return false;
+        Cell cell{};
+        for (int k = 0; k < 3; ++k) cell[k] = (int64_t)std::floor((double)p[k] / distance);
+        float best = distanceSquared;
+        for (int z = -1; z <= 1; ++z) for (int y = -1; y <= 1; ++y) for (int x = -1; x <= 1; ++x) {
+            auto found = cells.find({cell[0] + x, cell[1] + y, cell[2] + z});
+            if (found == cells.end()) continue;
+            for (uint32_t other : found->second) {
+                V3 delta = p - mesh.v[other];
+                float squared = dot(delta, delta);
+                if (squared > best || (squared == best && other >= owner[i])) continue;
+                if (preserveUV && !mesh.uv.empty() && length(mesh.uv[other] - mesh.uv[i]) > 1e-6f) continue;
+                best = squared;
+                owner[i] = other;
+            }
+        }
+        if (owner[i] == i) cells[cell].push_back(i);
+        else merged = true;
+    }
+    if (!merged) return false;
+    std::vector<uint32_t> triangles;
+    triangles.reserve(mesh.tri.size());
+    std::set<std::array<uint32_t, 3>> unchanged;
+    for (size_t i = 0; i < mesh.tri.size(); i += 3) {
+        std::array<uint32_t, 3> key{mesh.tri[i], mesh.tri[i + 1], mesh.tri[i + 2]};
+        if (std::any_of(key.begin(), key.end(), [&](uint32_t vertex) { return owner[vertex] != vertex; })) continue;
+        std::sort(key.begin(), key.end());
+        unchanged.insert(key);
+    }
+    std::set<std::array<uint32_t, 3>> unique;
+    for (size_t i = 0; i < mesh.tri.size(); i += 3) {
+        uint32_t a = owner[mesh.tri[i]], b = owner[mesh.tri[i + 1]], c = owner[mesh.tri[i + 2]];
+        if (a == b || b == c || c == a) continue;
+        std::array<uint32_t, 3> key{a, b, c};
+        std::sort(key.begin(), key.end());
+        bool same = a == mesh.tri[i] && b == mesh.tri[i + 1] && c == mesh.tri[i + 2];
+        if (same || (!unchanged.count(key) && unique.insert(key).second))
+            triangles.insert(triangles.end(), {a, b, c});
+    }
+    if (triangles.empty()) return false;
+    mesh.tri = std::move(triangles);
+    compactMesh(mesh);
+    rebuildEditedMesh(mesh);
+    return true;
+}
+
+bool fillMeshBoundary(Mesh& mesh, const std::vector<std::pair<uint32_t, uint32_t>>& edges) {
+    if (edges.size() < 3 || edges.size() > 2048 || (size_t)mesh.triCount() + edges.size() - 2 > 2000000) return false;
+    std::map<MeshEdge, uint32_t> boundary;
+    for (auto [a, b] : edges) {
+        if (a == b || a >= mesh.v.size() || b >= mesh.v.size() ||
+            !boundary.emplace(edgeKey(a, b), UINT32_MAX).second) return false;
+    }
+    for (size_t i = 0; i < mesh.tri.size(); i += 3) {
+        for (int j = 0; j < 3; ++j) {
+            uint32_t a = mesh.tri[i + j], b = mesh.tri[i + (j + 1) % 3];
+            auto found = boundary.find(edgeKey(a, b));
+            if (found == boundary.end()) continue;
+            if (found->second != UINT32_MAX) return false;
+            found->second = b;
+        }
+    }
+    std::map<uint32_t, uint32_t> next;
+    for (const auto& entry : boundary) {
+        uint32_t start = entry.second;
+        uint32_t end = start == entry.first.first ? entry.first.second : entry.first.first;
+        if (start == UINT32_MAX || !next.emplace(start, end).second) return false;
+    }
+    std::vector<uint32_t> ring;
+    uint32_t start = next.begin()->first, cursor = start;
+    do {
+        auto item = next.find(cursor);
+        if (item == next.end() || ring.size() >= edges.size()) return false;
+        ring.push_back(cursor);
+        cursor = item->second;
+    } while (cursor != start);
+    if (ring.size() != edges.size()) return false;
+    V3 origin = mesh.v[start], normal;
+    float span = 0;
+    for (size_t i = 0; i < ring.size(); ++i) {
+        V3 a = mesh.v[ring[i]] - origin, b = mesh.v[ring[(i + 1) % ring.size()]] - origin;
+        normal += cross(a, b);
+        span = std::max(span, length(a));
+    }
+    if (!(length(normal) > 1e-10f) || !(span > 1e-6f)) return false;
+    normal = normalize(normal);
+    int axis = 0;
+    for (int i = 1; i < 3; ++i)
+        if (std::fabs(normal[i]) > std::fabs(normal[axis])) axis = i;
+    int u = (axis + 1) % 3, v = (axis + 2) % 3;
+    float sign = normal[axis] < 0 ? -1.f : 1.f;
+    for (uint32_t i : ring)
+        if (std::fabs(dot(mesh.v[i] - origin, normal)) > span * 1e-4f) return false;
+    auto turn = [&](uint32_t a, uint32_t b, uint32_t c) {
+        V3 ab = mesh.v[b] - mesh.v[a], ac = mesh.v[c] - mesh.v[a];
+        return sign * (ab[u] * ac[v] - ab[v] * ac[u]);
+    };
+    for (size_t i = 0; i < ring.size(); ++i) {
+        size_t nextI = (i + 1) % ring.size();
+        for (size_t j = i + 1; j < ring.size(); ++j) {
+            size_t nextJ = (j + 1) % ring.size();
+            if (j == nextI || nextJ == i) continue;
+            uint32_t a = ring[i], b = ring[nextI], c = ring[j], d = ring[nextJ];
+            V3 loA = mesh.v[a], hiA = mesh.v[b], loB = mesh.v[c], hiB = mesh.v[d];
+            if (std::min(loA[u], hiA[u]) > std::max(loB[u], hiB[u]) ||
+                std::min(loB[u], hiB[u]) > std::max(loA[u], hiA[u]) ||
+                std::min(loA[v], hiA[v]) > std::max(loB[v], hiB[v]) ||
+                std::min(loB[v], hiB[v]) > std::max(loA[v], hiA[v])) continue;
+            if (turn(a, b, c) * turn(a, b, d) <= 0 && turn(c, d, a) * turn(c, d, b) <= 0) return false;
+        }
+    }
+    float epsilon = span * span * 1e-7f;
+    std::vector<uint32_t> cap;
+    while (ring.size() > 3) {
+        bool found = false;
+        for (size_t i = 0; i < ring.size(); ++i) {
+            uint32_t a = ring[(i + ring.size() - 1) % ring.size()], b = ring[i], c = ring[(i + 1) % ring.size()];
+            if (turn(a, b, c) <= epsilon) continue;
+            bool contains = std::any_of(ring.begin(), ring.end(), [&](uint32_t p) {
+                return p != a && p != b && p != c &&
+                       turn(a, b, p) >= -epsilon && turn(b, c, p) >= -epsilon && turn(c, a, p) >= -epsilon;
+            });
+            if (contains) continue;
+            cap.insert(cap.end(), {a, b, c});
+            ring.erase(ring.begin() + i);
+            found = true;
+            break;
+        }
+        if (!found) return false;
+    }
+    if (turn(ring[0], ring[1], ring[2]) <= epsilon) return false;
+    cap.insert(cap.end(), ring.begin(), ring.end());
+    mesh.tri.insert(mesh.tri.end(), cap.begin(), cap.end());
+    rebuildEditedMesh(mesh);
+    return true;
+}
+
 void projectMeshUV(Mesh& mesh, int axis) {
     if (axis < 0 || axis > 2) return;
     int u = (axis + 1) % 3, v = (axis + 2) % 3;
@@ -266,64 +421,90 @@ bool Mesh::intersect(V3 o, V3 d, float tmin, float tmax, float& tOut, V3& nOut, 
 }
 
 bool loadOBJ(const std::string& path, Mesh& m, std::string& err) {
-    FILE* f = fopen(path.c_str(), "rb");
+    std::ifstream f(path);
     if (!f) { err = "cannot open file"; return false; }
-    std::vector<V3> pos, nrm, uv;
-    std::map<std::array<int, 3>, uint32_t> remap;
-    Mesh out;
-    bool allNormals = true, allUVs = true;
-    char line[4096];
-    while (fgets(line, sizeof line, f)) {
-        if (line[0] == 'v' && line[1] == ' ') {
-            V3 p;
-            if (sscanf(line + 2, "%f %f %f", &p.x, &p.y, &p.z) == 3) pos.push_back(p);
-        } else if (line[0] == 'v' && line[1] == 'n') {
-            V3 p;
-            if (sscanf(line + 3, "%f %f %f", &p.x, &p.y, &p.z) == 3) nrm.push_back(normalize(p));
-        } else if (line[0] == 'v' && line[1] == 't') {
-            V3 p;
-            if (sscanf(line + 3, "%f %f", &p.x, &p.y) == 2) uv.push_back(p);
-        } else if (line[0] == 'f' && line[1] == ' ') {
-            std::vector<uint32_t> poly;
-            char* tok = strtok(line + 2, " \t\r\n");
-            while (tok && tok[0] != '#') {
-                int vi = 0, ti = 0, ni = 0;
-                if (sscanf(tok, "%d/%d/%d", &vi, &ti, &ni) < 2) sscanf(tok, "%d//%d", &vi, &ni);
-                if (vi < 0) vi = (int)pos.size() + vi + 1;
-                if (ni < 0) ni = (int)nrm.size() + ni + 1;
-                if (ti < 0) ti = (int)uv.size() + ti + 1;
-                if (vi < 1 || vi > (int)pos.size()) { fclose(f); err = "bad vertex index"; return false; }
-                if (ni < 1 || ni > (int)nrm.size()) { ni = 0; allNormals = false; }
-                if (ti < 1 || ti > (int)uv.size()) { ti = 0; allUVs = false; }
-                std::array<int, 3> key{vi, ni, ti};
-                auto it = remap.find(key);
-                if (it == remap.end()) {
-                    it = remap.emplace(key, (uint32_t)out.v.size()).first;
-                    out.v.push_back(pos[vi - 1]);
-                    out.n.push_back(ni ? nrm[ni - 1] : V3(0, 1, 0));
-                    out.uv.push_back(ti ? uv[ti - 1] : V3());
+    PolygonMesh polygons;
+    size_t lineNumber = 0;
+    auto invalid = [&](const char* message) {
+        err = "line " + std::to_string(lineNumber) + ": " + message;
+        return false;
+    };
+    auto parseIndex = [](std::string_view text, size_t count, int& index) {
+        if (!text.empty() && text.front() == '+') text.remove_prefix(1);
+        if (text.empty()) return false;
+        const char* end = text.data() + text.size();
+        auto result = std::from_chars(text.data(), end, index);
+        if (result.ec != std::errc() || result.ptr != end || index == 0) return false;
+        index = index < 0 ? (int)count + index : index - 1;
+        return index >= 0 && (size_t)index < count;
+    };
+    std::string line;
+    size_t triangleCount = 0;
+    while (std::getline(f, line)) {
+        ++lineNumber;
+        size_t comment = line.find('#');
+        if (comment != std::string::npos) line.resize(comment);
+        std::istringstream row(line);
+        row.imbue(std::locale::classic());
+        std::string tag;
+        if (!(row >> tag)) continue;
+        if (tag == "v" || tag == "vn" || tag == "vt") {
+            auto& data = tag == "v" ? polygons.positions : tag == "vt" ? polygons.uv : polygons.normals;
+            V3 value;
+            if (!(row >> value.x)) return invalid("invalid coordinate");
+            if (tag != "vt") {
+                if (!(row >> value.y >> value.z)) return invalid("invalid coordinate");
+            } else {
+                row >> std::ws;
+                if (!row.eof() && !(row >> value.y)) return invalid("invalid texture coordinate");
+                row >> std::ws;
+                if (!row.eof() && !(row >> value.z)) return invalid("invalid texture coordinate");
+            }
+            if (data.size() >= 20000000) return invalid("too many coordinates");
+            data.push_back(value);
+        } else if (tag == "f") {
+            std::vector<MeshCorner> face;
+            std::string token;
+            while (row >> token) {
+                if (face.size() >= MAX_POLYGON_CORNERS) return invalid("face has too many corners");
+                std::string_view corner(token);
+                size_t first = corner.find('/');
+                int vertex;
+                if (!parseIndex(corner.substr(0, first), polygons.positions.size(), vertex))
+                    return invalid("invalid vertex index");
+                MeshCorner ref{(uint32_t)vertex};
+                if (first != std::string_view::npos) {
+                    corner.remove_prefix(first + 1);
+                    size_t second = corner.find('/');
+                    auto texture = corner.substr(0, second);
+                    if ((texture.empty() && second == std::string_view::npos) ||
+                        (!texture.empty() && !parseIndex(texture, polygons.uv.size(), ref.uv)))
+                        return invalid("invalid texture index");
+                    if (second != std::string_view::npos &&
+                        !parseIndex(corner.substr(second + 1), polygons.normals.size(), ref.normal))
+                        return invalid("invalid normal index");
                 }
-                poly.push_back(it->second);
-                tok = strtok(nullptr, " \t\r\n");
+                face.push_back(ref);
             }
-            for (size_t i = 2; i < poly.size(); i++) {
-                out.tri.push_back(poly[0]);
-                out.tri.push_back(poly[i - 1]);
-                out.tri.push_back(poly[i]);
-            }
+            if (face.size() < 3) return invalid("face has fewer than three corners");
+            triangleCount += face.size() - 2;
+            if (triangleCount > 20000000) return invalid("too many faces");
+            polygons.faces.push_back(std::move(face));
         }
     }
-    fclose(f);
-    if (out.tri.empty()) { err = "no faces found"; return false; }
-    if (!allNormals) out.n.clear();
-    if (!allUVs) out.uv.clear();
+    if (f.bad()) { err = "could not read file"; return false; }
+    if (polygons.faces.empty()) { err = "no faces found"; return false; }
+    compactPolygonPositions(polygons);
     V3 lo(1e30f), hi(-1e30f);
-    for (V3 p : out.v) growBox(lo, hi, p);
+    for (V3 p : polygons.positions) growBox(lo, hi, p);
     V3 c = (lo + hi) * 0.5f;
     float s = 2.f / std::max(1e-6f, maxc(hi - lo));
-    for (V3& p : out.v) p = (p - c) * s;
-    out.build();
-    m = std::move(out);
+    for (V3& p : polygons.positions) p = (p - c) * s;
+    if (!buildPolygonMesh(std::move(polygons), m)) {
+        err = "invalid polygon geometry (check for crossing edges or zero-area faces)";
+        return false;
+    }
+    err.clear();
     return true;
 }
 
@@ -483,6 +664,31 @@ bool saveGeometry(const std::string& path, const std::vector<MeshLayer>& layers,
         for (char& c : label) if (!(c >= 'A' && c <= 'Z') && !(c >= 'a' && c <= 'z') &&
                                   !(c >= '0' && c <= '9') && c != '-') c = '_';
         if (label.empty()) label = "Object";
+        if (!dxf && mesh.polygons) {
+            const PolygonMesh& polygon = *mesh.polygons;
+            out << "o " << label << '\n';
+            for (V3 p : polygon.positions) out << "v " << p.x << ' ' << p.y << ' ' << p.z << '\n';
+            for (V3 p : polygon.uv) {
+                out << "vt " << p.x << ' ' << p.y;
+                if (p.z != 0) out << ' ' << p.z;
+                out << '\n';
+            }
+            for (V3 p : polygon.normals) out << "vn " << p.x << ' ' << p.y << ' ' << p.z << '\n';
+            for (const auto& face : polygon.faces) {
+                out << 'f';
+                for (const auto& corner : face) {
+                    out << ' ' << base + corner.vertex;
+                    if (corner.uv >= 0 || corner.normal >= 0) out << '/';
+                    if (corner.uv >= 0) out << uvBase + corner.uv;
+                    if (corner.normal >= 0) out << '/' << normalsBase + corner.normal;
+                }
+                out << '\n';
+            }
+            base += polygon.positions.size();
+            uvBase += polygon.uv.size();
+            normalsBase += polygon.normals.size();
+            continue;
+        }
         bool hasUV = mesh.v.size() == mesh.uv.size() && !mesh.uv.empty();
         bool hasNormals = mesh.v.size() == mesh.n.size() && !mesh.n.empty();
         if (!dxf) {

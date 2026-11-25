@@ -159,10 +159,30 @@ struct RigIK {
     IKKey settings;
     std::vector<IKKey> keys;
 };
+constexpr int MAX_RIG_ACTIONS = 64;
+constexpr int MAX_RIG_CLIPS = 256;
+constexpr int MAX_ACTION_FRAMES = 1200;
+constexpr size_t MAX_ACTION_SAMPLES = 1000000;
+struct JointActionTrack { int joint = -1; std::vector<Key> keys; };
+struct IKActionTrack { int end = -1; std::vector<IKKey> keys; };
+struct RigAction {
+    std::string name;
+    int frames = 0;
+    std::vector<JointActionTrack> joints;
+    std::vector<IKActionTrack> ik;
+};
+struct RigClip {
+    int action = -1;
+    int start = 0, repeats = 1;
+    float speed = 1, influence = 1;
+    int fadeIn = 0, fadeOut = 0;
+};
 struct Rig {
     std::vector<Joint> joints;
     std::vector<SkinWeights> weights;
     std::vector<RigIK> ik;
+    std::vector<std::shared_ptr<const RigAction>> actions;
+    std::vector<RigClip> clips;
 };
 struct PosedJoint {
     V3 head, tail;
@@ -170,7 +190,15 @@ struct PosedJoint {
     M3 inverseBind;
 };
 bool validRig(const Rig& rig, size_t vertices);
-IKKey sampleIK(const RigIK& ik, float frame);
+IKKey sampleIKTrack(const std::vector<IKKey>& keys, float frame, const IKKey& fallback);
+inline IKKey sampleIK(const RigIK& ik, float frame) { return sampleIKTrack(ik.keys, frame, ik.settings); }
+bool validRigMotion(const Rig& rig);
+int rigClipFrames(const RigAction& action, const RigClip& clip);
+std::shared_ptr<const RigAction> captureRigAction(const Rig& rig, int first, int last, const std::string& name);
+std::shared_ptr<const RigAction> transferRigAction(const Rig& source, int action, const Rig& destination);
+void removeRigAction(Rig& rig, int action);
+void remapRigActionTracks(Rig& rig, int removedJoint, int removedIK);
+bool bakeRigClips(Rig& rig, int frames);
 std::vector<PosedJoint> poseRig(const Rig& rig, int frame);
 bool bindRig(Rig& rig, const Mesh& mesh);
 bool setSkinWeight(SkinWeights& weights, int joint, float weight, size_t jointCount);

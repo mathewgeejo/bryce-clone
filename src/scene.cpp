@@ -7,6 +7,7 @@
 #include <limits>
 #include <map>
 #include <set>
+#include <tuple>
 
 #include "terrain.h"
 
@@ -241,7 +242,8 @@ void Scene::updateAll() {
             o.skinRig.reset();
             continue;
         }
-        bool animated = std::any_of(o.rig->joints.begin(), o.rig->joints.end(), [](const Joint& j) { return !j.keys.empty(); }) ||
+        bool animated = !o.rig->clips.empty() ||
+                        std::any_of(o.rig->joints.begin(), o.rig->joints.end(), [](const Joint& j) { return !j.keys.empty(); }) ||
                         std::any_of(o.rig->ik.begin(), o.rig->ik.end(), [](const RigIK& chain) { return !chain.keys.empty(); });
         int poseFrame = animated ? frame : 0;
         if (o.skinFrame != poseFrame || o.skinSource.lock() != o.mesh || o.skinRig.lock() != o.rig) {
@@ -716,21 +718,21 @@ Key Object::sampleTransform(float frame) const {
     return sampleTransformTrack(keys, frame, {0, pos, rot, scl});
 }
 
-IKKey sampleIK(const RigIK& ik, float frame) {
+IKKey sampleIKTrack(const std::vector<IKKey>& keys, float frame, const IKKey& fallback) {
     int first, next;
     float t;
-    if (!keySpan(ik.keys, frame, first, next, t)) {
-        IKKey goal = ik.settings;
+    if (!keySpan(keys, frame, first, next, t)) {
+        IKKey goal = fallback;
         goal.frame = (int)frame;
         return goal;
     }
-    const IKKey& a = ik.keys[first];
-    const IKKey& b = ik.keys[next];
+    const IKKey& a = keys[first];
+    const IKKey& b = keys[next];
     float blend = a.ease == Ease::Spline ?
-                  spline(ik.keys, first, next, t, [](const IKKey& key) { return key.influence; }) :
+                  spline(keys, first, next, t, [](const IKKey& key) { return key.influence; }) :
                   lerpf(a.influence, b.influence, easeTime(a.ease, t));
-    return {(int)frame, motion(ik.keys, first, next, t, [](const IKKey& key) { return key.target; }),
-            motion(ik.keys, first, next, t, [](const IKKey& key) { return key.pole; }),
+    return {(int)frame, motion(keys, first, next, t, [](const IKKey& key) { return key.target; }),
+            motion(keys, first, next, t, [](const IKKey& key) { return key.pole; }),
             clampf(blend, 0, 1), a.ease};
 }
 
@@ -2115,7 +2117,11 @@ bool Scene::writeFile(const std::string& path) const {
     if (!f) return false;
     bool hasRig = std::any_of(objs.begin(), objs.end(), [](const Object& o) { return bool(o.rig); });
     bool hasIK = std::any_of(objs.begin(), objs.end(), [](const Object& o) { return o.rig && !o.rig->ik.empty(); });
-    f << std::setprecision(9) << "CANYON3D " << (hasIK ? 8 : hasRig ? 7 : 6) << "\ncamera ";
+    bool hasActions = std::any_of(objs.begin(), objs.end(), [](const Object& o) { return o.rig && !o.rig->actions.empty(); });
+    bool hasPolygons = std::any_of(objs.begin(), objs.end(), [](const Object& o) {
+        return o.mesh && o.mesh->polygons && o.instanceSource < 0;
+    });
+    f << std::setprecision(9) << "CANYON3D " << (hasPolygons ? 10 : hasActions ? 9 : hasIK ? 8 : hasRig ? 7 : 6) << "\ncamera ";
     writeCam(f, cam);
     f << "\nsky ";
     writeSky(f, sky);
@@ -2244,18 +2250,33 @@ bool Scene::writeFile(const std::string& path) const {
             auto [at, added] = storedMeshes.emplace(o.mesh.get(), objectIndex);
             if (added) {
                 const Mesh& m = *o.mesh;
-                bool textured = m.uv.size() == m.v.size();
-                f << (textured ? "meshtextured " : "mesh ") << m.v.size() << ' ' << m.triCount() << "\n";
-                for (size_t i = 0; i < m.v.size(); i++) {
-                    wv(f, m.v[i]); wv(f, m.n[i]);
-                    if (textured) wv(f, m.uv[i]);
-                    f << "\n";
+                if (m.polygons) {
+                    const auto& p = *m.polygons;
+                    f << "polygonmesh " << p.positions.size() << ' ' << p.uv.size() << ' ' << p.normals.size() << ' '
+                      << p.faces.size() << '\n';
+                    for (const auto* buffer : {&p.positions, &p.uv, &p.normals})
+                        for (V3 value : *buffer) { wv(f, value); f << '\n'; }
+                    for (const auto& face : p.faces) {
+                        f << face.size();
+                        for (const auto& corner : face)
+                            f << ' ' << corner.vertex << ' ' << corner.uv << ' ' << corner.normal;
+                        f << '\n';
+                    }
+                } else {
+                    bool textured = m.uv.size() == m.v.size();
+                    f << (textured ? "meshtextured " : "mesh ") << m.v.size() << ' ' << m.triCount() << "\n";
+                    for (size_t i = 0; i < m.v.size(); i++) {
+                        wv(f, m.v[i]); wv(f, m.n[i]);
+                        if (textured) wv(f, m.uv[i]);
+                        f << "\n";
+                    }
+                    for (size_t i = 0; i < m.tri.size(); i++) f << m.tri[i] << ((i % 3 == 2) ? '\n' : ' ');
                 }
-                for (size_t i = 0; i < m.tri.size(); i++) f << m.tri[i] << ((i % 3 == 2) ? '\n' : ' ');
             } else f << "meshref " << at->second << '\n';
         }
         if (o.rig) {
-            if (o.instanceSource >= 0 || !o.mesh || !validRig(*o.rig, o.mesh->v.size())) return false;
+            if (o.type != ObjType::Mesh || o.treePart || o.instanceSource >= 0 ||
+                !o.mesh || !validRig(*o.rig, o.mesh->skinVertices().size())) return false;
             f << "rig " << o.rig->joints.size() << ' ' << o.rig->weights.size() << '\n';
             auto writePose = [&](const Key& key) {
                 wv(f, key.pos); wv(f, key.rot); wv(f, key.scl);
@@ -2277,12 +2298,12 @@ bool Scene::writeFile(const std::string& path) const {
                     f << vertex.joint[i] << ' ' << vertex.weight[i] << ' ';
                 f << '\n';
             }
+            auto writeGoal = [&](const IKKey& key) {
+                wv(f, key.target); wv(f, key.pole);
+                f << key.influence << ' ' << (int)key.ease << ' ';
+            };
             if (!o.rig->ik.empty()) {
                 f << "rigik " << o.rig->ik.size() << '\n';
-                auto writeGoal = [&](const IKKey& key) {
-                    wv(f, key.target); wv(f, key.pole);
-                    f << key.influence << ' ' << (int)key.ease << ' ';
-                };
                 for (const auto& chain : o.rig->ik) {
                     f << chain.end << ' ';
                     writeGoal(chain.settings);
@@ -2293,6 +2314,32 @@ bool Scene::writeFile(const std::string& path) const {
                         f << '\n';
                     }
                 }
+            }
+            if (!o.rig->actions.empty()) {
+                f << "rigactions " << o.rig->actions.size() << ' ' << o.rig->clips.size() << '\n';
+                for (const auto& action : o.rig->actions) {
+                    ws(f, action->name);
+                    f << action->frames << ' ' << action->joints.size() << ' ' << action->ik.size() << '\n';
+                    for (const auto& track : action->joints) {
+                        f << track.joint << ' ' << track.keys.size() << '\n';
+                        for (const auto& key : track.keys) {
+                            f << key.frame << ' ' << (int)key.ease << ' ';
+                            writePose(key);
+                            f << '\n';
+                        }
+                    }
+                    for (const auto& track : action->ik) {
+                        f << track.end << ' ' << track.keys.size() << '\n';
+                        for (const auto& key : track.keys) {
+                            f << key.frame << ' ';
+                            writeGoal(key);
+                            f << '\n';
+                        }
+                    }
+                }
+                for (const auto& clip : o.rig->clips)
+                    f << clip.action << ' ' << clip.start << ' ' << clip.repeats << ' ' << clip.speed << ' '
+                      << clip.influence << ' ' << clip.fadeIn << ' ' << clip.fadeOut << '\n';
             }
         }
     }
@@ -2305,7 +2352,7 @@ bool Scene::load(const std::string& path) {
     std::ifstream f(path);
     std::string tok;
     int ver = 0;
-    if (!(f >> tok >> ver) || tok != "CANYON3D" || ver < 1 || ver > 8) return false;
+    if (!(f >> tok >> ver) || tok != "CANYON3D" || ver < 1 || ver > 10) return false;
     Scene s;
     size_t embeddedPixels = 0;
     s.sky = skyPresets()[0];
@@ -2548,6 +2595,36 @@ bool Scene::load(const std::string& path) {
             for (float& v : hf->h) f >> v;
             hf->computeNormals();
             s.objs.back().hf = hf;
+        } else if (tok == "polygonmesh") {
+            if (ver < 10 || s.objs.empty()) return false;
+            Object& o = s.objs.back();
+            if (o.type != ObjType::Mesh || o.treePart || o.mesh || o.instanceSource >= 0) return false;
+            size_t positions, uv, normals, faces;
+            constexpr size_t limit = 20000000;
+            if (!(f >> positions >> uv >> normals >> faces) || !positions || !faces ||
+                std::max({positions, uv, normals, faces}) > limit) return false;
+            PolygonMesh polygons;
+            polygons.positions.resize(positions);
+            polygons.uv.resize(uv);
+            polygons.normals.resize(normals);
+            for (auto* buffer : {&polygons.positions, &polygons.uv, &polygons.normals})
+                for (V3& value : *buffer) { rv(f, value); if (!f) return false; }
+            size_t triangles = 0;
+            for (size_t i = 0; i < faces; ++i) {
+                size_t count;
+                if (!(f >> count) || count < 3 || count > MAX_POLYGON_CORNERS || triangles + count - 2 > limit)
+                    return false;
+                triangles += count - 2;
+                std::vector<MeshCorner> face(count);
+                for (auto& corner : face)
+                    if (!(f >> corner.vertex >> corner.uv >> corner.normal) || corner.vertex >= positions ||
+                        corner.uv < -1 || (corner.uv >= 0 && (size_t)corner.uv >= uv) ||
+                        corner.normal < -1 || (corner.normal >= 0 && (size_t)corner.normal >= normals)) return false;
+                polygons.faces.push_back(std::move(face));
+            }
+            auto mesh = std::make_shared<Mesh>();
+            if (!buildPolygonMesh(std::move(polygons), *mesh)) return false;
+            o.mesh = std::move(mesh);
         } else if (tok == "mesh" || (ver >= 5 && tok == "meshtextured")) {
             size_t nv = 0, nt = 0;
             f >> nv >> nt;
@@ -2573,7 +2650,8 @@ bool Scene::load(const std::string& path) {
             size_t count, vertices;
             if (o.rig || o.type != ObjType::Mesh || o.treePart || o.instanceSource >= 0 || !o.mesh ||
                 !(f >> count >> vertices) || count == 0 || count > MAX_RIG_JOINTS ||
-                o.mesh->v.size() > MAX_SKIN_VERTICES || (vertices && vertices != o.mesh->v.size())) return false;
+                o.mesh->skinVertices().size() > MAX_SKIN_VERTICES ||
+                (vertices && vertices != o.mesh->skinVertices().size())) return false;
             auto rig = std::make_shared<Rig>();
             rig->joints.resize(count);
             auto readPose = [&](Key& key) { rv(f, key.pos); rv(f, key.rot); rv(f, key.scl); };
@@ -2594,7 +2672,7 @@ bool Scene::load(const std::string& path) {
             for (auto& vertex : rig->weights)
                 for (size_t i = 0; i < vertex.weight.size(); ++i)
                     f >> vertex.joint[i] >> vertex.weight[i];
-            if (!f || !validRig(*rig, o.mesh->v.size())) return false;
+            if (!f || !validRig(*rig, o.mesh->skinVertices().size())) return false;
             o.rig = std::move(rig);
         } else if (tok == "rigik") {
             if (ver < 8 || s.objs.empty()) return false;
@@ -2614,7 +2692,55 @@ bool Scene::load(const std::string& path) {
                 for (auto& key : chain.keys)
                     if (!(f >> key.frame) || !readGoal(key)) return false;
             }
-            if (!validRig(*rig, o.mesh->v.size())) return false;
+            if (!validRig(*rig, o.mesh->skinVertices().size())) return false;
+            o.rig = std::move(rig);
+        } else if (tok == "rigactions") {
+            if (ver < 9 || s.objs.empty()) return false;
+            Object& o = s.objs.back();
+            size_t actions, clips;
+            if (!o.rig || !o.rig->actions.empty() ||
+                !(f >> actions >> clips) || actions == 0 || actions > MAX_RIG_ACTIONS || clips > MAX_RIG_CLIPS) return false;
+            auto rig = std::make_shared<Rig>(*o.rig);
+            size_t remaining = MAX_ACTION_SAMPLES;
+            for (size_t i = 0; i < actions; ++i) {
+                auto action = std::make_shared<RigAction>();
+                rs(f, action->name, ver);
+                size_t joints, controls;
+                if (!(f >> action->frames >> joints >> controls) || action->frames < 1 ||
+                    action->frames > MAX_ACTION_FRAMES || joints > rig->joints.size() || controls > rig->ik.size()) return false;
+                action->joints.resize(joints);
+                action->ik.resize(controls);
+                auto readCount = [&](size_t& count) {
+                    if (!(f >> count) || count == 0 || count > (size_t)action->frames || count > remaining) return false;
+                    remaining -= count;
+                    return true;
+                };
+                for (auto& track : action->joints) {
+                    size_t count;
+                    if (!(f >> track.joint) || !readCount(count)) return false;
+                    track.keys.resize(count);
+                    for (auto& key : track.keys) {
+                        if (!(f >> key.frame) || !readEase(f, key.ease)) return false;
+                        rv(f, key.pos); rv(f, key.rot); rv(f, key.scl);
+                    }
+                }
+                for (auto& track : action->ik) {
+                    size_t count;
+                    if (!(f >> track.end) || !readCount(count)) return false;
+                    track.keys.resize(count);
+                    for (auto& key : track.keys) {
+                        if (!(f >> key.frame)) return false;
+                        rv(f, key.target); rv(f, key.pole);
+                        if (!(f >> key.influence) || !readEase(f, key.ease)) return false;
+                    }
+                }
+                rig->actions.push_back(std::move(action));
+            }
+            rig->clips.resize(clips);
+            for (auto& clip : rig->clips)
+                if (!(f >> clip.action >> clip.start >> clip.repeats >> clip.speed >> clip.influence >>
+                      clip.fadeIn >> clip.fadeOut)) return false;
+            if (!validRigMotion(*rig)) return false;
             o.rig = std::move(rig);
         } else if (tok == "end") break;
         else return false;
@@ -2637,7 +2763,7 @@ bool Scene::load(const std::string& path) {
     for (Object& o : s.objs) {
         if (o.terrainAnchor && (o.parent < 0 || s.objs[o.parent].type != ObjType::Terrain)) return false;
         if (o.rig && (!o.mesh || o.type != ObjType::Mesh || o.treePart || o.instanceSource >= 0 ||
-                      !validRig(*o.rig, o.mesh->v.size()))) return false;
+                      !validRig(*o.rig, o.mesh->skinVertices().size()))) return false;
         if (o.instanceSource >= 0) {
             if (o.instanceSource >= (int)s.objs.size()) return false;
             const Object& src = s.objs[o.instanceSource];
@@ -2675,6 +2801,9 @@ void Scene::append(Scene other) {
         if (x.group > 0) x.group += g;
         if (x.parent >= 0) x.parent += first;
         if (x.instanceSource >= 0) x.instanceSource += first;
+        if (x.rig)
+            for (const auto& clip : x.rig->clips)
+                frames = std::max(frames, clip.start + rigClipFrames(*x.rig->actions[clip.action], clip));
         auto remapLight = [g](LightSettings& light) {
             if (light.targetGroup > 0)
                 light.targetGroup = (int)std::min<int64_t>((int64_t)light.targetGroup + g, (std::numeric_limits<int>::max)());
@@ -2785,7 +2914,27 @@ Mesh contourScene(const Scene& scene, V3 lo, V3 hi, int resolution) {
 Mesh meshSurface(const Object& o) {
     Mesh m;
     const Mesh* mesh = o.visibleMesh();
+    bool mirrored = dot(cross(o.fwd.col(0), o.fwd.col(1)), o.fwd.col(2)) < 0.f;
     if (o.type == ObjType::Mesh && mesh) {
+        if (o.mesh && o.mesh->polygons) {
+            PolygonMesh polygons = *o.mesh->polygons;
+            if (mesh != o.mesh.get()) {
+                // Recreate the same corner-to-render-vertex order used by buildPolygonMesh.
+                std::map<std::tuple<uint32_t, int, int>, int> vertices;
+                for (auto& face : polygons.faces) for (auto& corner : face) {
+                    auto key = std::make_tuple(corner.vertex, corner.uv, corner.normal);
+                    auto entry = vertices.emplace(key, (int)vertices.size()).first;
+                    corner.normal = entry->second;
+                    polygons.positions[corner.vertex] = mesh->v[entry->second];
+                }
+                polygons.normals = mesh->n;
+            }
+            for (V3& p : polygons.positions) p = o.worldPos + o.fwd * p;
+            for (V3& n : polygons.normals) n = normalize(o.nrm * n);
+            if (mirrored)
+                for (auto& face : polygons.faces) std::reverse(face.begin(), face.end());
+            if (buildPolygonMesh(std::move(polygons), m)) return m;
+        }
         m.v = mesh->v;
         m.tri = mesh->tri;
         m.uv = mesh->uv;
@@ -2823,7 +2972,7 @@ Mesh meshSurface(const Object& o) {
         m.tri = {0, 1, 2, 2, 1, 3};
     }
     for (V3& p : m.v) p = o.worldPos + o.fwd * p;
-    if (dot(cross(o.fwd.col(0), o.fwd.col(1)), o.fwd.col(2)) < 0.f)
+    if (mirrored)
         for (size_t i = 0; i + 2 < m.tri.size(); i += 3) std::swap(m.tri[i + 1], m.tri[i + 2]);
     return m;
 }

@@ -1,5 +1,31 @@
 # Implementation log
 
+## Boundary bridging and knife paths
+
+- Added boundary selection from edge seeds and quad bridging for equal-length open chains and closed loops. Closed loops align by distance with an adjustable twist. Bridges can add intermediate rows and create a UV strip.
+- Added multi-face knife paths with an on-mesh preview and vertex and midpoint snapping. Edge crossings split neighboring faces consistently and retain separate UV and normal data at seams.
+- Updated polygon triangulation to use the face plane, allowing twisted bridge quads that collapse in an axis-aligned projection.
+
+## Polygon mesh editing
+
+- Preserved quads, concave n-gons, and independently indexed face-corner UVs and normals in OBJ and version 10 scenes. The modeler and skinning use shared positions across UV seams. The renderer uses a triangulated mesh.
+- Added convex planar face inset and quad-strip loop cuts. Extended extrusion, subdivision, winding, welding, boundary fill, and UV projection to polygon meshes. Cubes convert to six editable quads.
+- Passed the Windows core suite, MCP integration checks, and Linux-target C++17 syntax checks. The core suite exercises concave triangulation, shared seam weights, posed OBJ export, version 10 saves, and loop cuts that terminate against a non-quad.
+- Verified the Windows desktop converted a cube, inset and extruded a face, and saved the resulting 14 quads.
+
+## Reusable rig actions and timeline clips
+
+- Added action capture from the evaluated joint and IK animation, a clip stack with speed, repeat, influence, fades and priority, and playback of a selected clip.
+- Added action transfer between rigs with matching joints and IK chains. Transfers scale translation and adapt mesh-space IK controls to the destination proportions.
+- Added clip baking into editable joint and IK keys, action persistence in version 9 scenes, and timeline markers for clip boundaries.
+- Passed the Windows core suite and Linux-target syntax checks. Verified capture, placement, repetition, and clip playback on the Windows desktop. Rendered six frames of repeated and blended clips from a reloaded scene.
+
+## Limb IK and mesh cleanup
+
+- Added two-joint inverse kinematics with editable target and pole positions, adjustable influence, control keys, and scene persistence.
+- Added vertex welding by distance with UV seam preservation and planar boundary filling for closed edge loops.
+- Passed the Windows core suite and Linux-target syntax checks. Verified target and pole placement with two keyed frames on Windows, and rendered distinct IK poses after reopening a scene.
+
 ## Skeletal rigging and skinning
 
 - Added a rig editor for creating and naming joints, changing their parent and rest positions, posing, setting keys, and binding and editing skin weights.

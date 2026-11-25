@@ -3,6 +3,8 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -57,6 +59,180 @@ static int fails = 0;
 #define CHECK(c) do { if (!(c)) { printf("  FAIL %s:%d %s\n", __FILE__, __LINE__, #c); fails++; } } while (0)
 
 int main() {
+    printf("reusable rig actions, clip blending, and retargeting\n");
+    {
+        Rig rig;
+        Joint root, child;
+        root.name = "Shoulder";
+        root.keys = {{10, {}, {}, V3(1), Ease::Linear}, {14, {4,0,0}, {}, V3(1), Ease::Linear}};
+        child.name = "Elbow";
+        child.parent = 0;
+        child.head = root.tail;
+        child.tail = {0,2,0};
+        rig.joints = {root, child};
+        RigIK chain;
+        chain.end = 1;
+        chain.settings = {0, {2,1,0}, {0,0,1}, 0, Ease::Linear};
+        rig.ik.push_back(chain);
+        auto mesh = std::make_shared<Mesh>(makeEditableBox());
+        CHECK(bindRig(rig, *mesh));
+        auto action = captureRigAction(rig, 10, 14, "Reach");
+        CHECK(action && action->frames == 5 && action->joints[0].keys.size() == 5 &&
+              action->joints[1].keys.size() == 1 && action->ik[0].keys.size() == 1);
+        if (action) {
+            rig.actions.push_back(action);
+            rig.joints[0].keys.clear();
+            rig.clips.push_back({0, 20, 2, 2.f});
+            CHECK(validRig(rig, mesh->v.size()) && rigClipFrames(*action, rig.clips[0]) == 5);
+            auto x = [&](int frame) { return poseRig(rig, frame)[0].head.x; };
+            CHECK(std::fabs(x(21) - 2) < .001f && std::fabs(x(22) - 4) < .001f &&
+                  std::fabs(x(23) - 1) < .001f && std::fabs(x(25)) < .001f);
+
+            auto overlay = std::make_shared<RigAction>();
+            overlay->name = "Offset";
+            overlay->frames = 3;
+            overlay->joints = {{0, {{0, {10,0,0}, {}, V3(1), Ease::Linear}}}};
+            rig.actions.push_back(overlay);
+            rig.clips.push_back({1, 22, 1, 1, .5f, 1, 1});
+            CHECK(std::fabs(x(22) - 4) < .001f && std::fabs(x(23) - 5.5f) < .001f &&
+                  std::fabs(x(24) - 3) < .001f);
+            auto repeated = captureRigAction(rig, 22, 24, "Rendered overlap");
+            CHECK(repeated && std::fabs(repeated->joints[0].keys[1].pos.x - 5.5f) < .001f);
+            Rig baked = rig;
+            CHECK(!bakeRigClips(baked, 24) && baked.clips.size() == 2);
+            CHECK(bakeRigClips(baked, 26) && baked.clips.empty() && baked.actions.size() == 2);
+            for (int frame = 0; frame < 26; ++frame)
+                CHECK(std::fabs(poseRig(baked, frame)[0].head.x - x(frame)) < .001f);
+
+            Rig target;
+            target.joints = rig.joints;
+            target.ik = rig.ik;
+            for (auto& joint : target.joints) {
+                joint.head = V3(4, 0, 0) + joint.head * 2;
+                joint.tail = V3(4, 0, 0) + joint.tail * 2;
+            }
+            auto resized = transferRigAction(rig, 0, target);
+            CHECK(resized && std::fabs(resized->joints[0].keys[2].pos.x - 4) < .001f &&
+                  length(resized->ik[0].keys[0].target - V3(8,2,0)) < .001f);
+            target.joints[1].name = target.joints[0].name;
+            CHECK(!transferRigAction(rig, 0, target));
+
+            Object actor = makeObject(ObjType::Mesh, 1);
+            actor.mesh = mesh;
+            actor.rig = std::make_shared<Rig>(rig);
+            Scene scene;
+            scene.frames = 26;
+            scene.objs.push_back(actor);
+            scene.applyFrame(23);
+            CHECK(scene.save("build/t/rig-actions.c3d"));
+            Scene reopened;
+            CHECK(reopened.load("build/t/rig-actions.c3d"));
+            if (!reopened.objs.empty() && reopened.objs[0].rig) {
+                CHECK(reopened.objs[0].rig->actions.size() == 2 && reopened.objs[0].rig->clips.size() == 2);
+                CHECK(length(reopened.objs[0].visibleMesh()->v[0] - scene.objs[0].visibleMesh()->v[0]) < .001f);
+                Scene appended;
+                appended.frames = 2;
+                appended.append(reopened);
+                CHECK(appended.frames >= 25);
+            }
+            rig.ik.clear();
+            remapRigActionTracks(rig, -1, 1);
+            CHECK(validRig(rig, mesh->v.size()) && rig.actions[0]->ik.empty());
+            removeRigAction(rig, 0);
+            CHECK(validRig(rig, mesh->v.size()) && rig.clips.size() == 1 && rig.clips[0].action == 0);
+        }
+    }
+    printf("animated limb IK and topology cleanup\n");
+    {
+        Rig rig;
+        Joint upper, lower, hand;
+        upper.name = "Upper";
+        lower.name = "Lower";
+        lower.parent = 0;
+        lower.head = {0,1,0};
+        lower.tail = {0,2,0};
+        hand.name = "Hand";
+        hand.parent = 1;
+        hand.head = lower.tail;
+        hand.tail = {0,2.5f,0};
+        rig.joints = {upper, lower, hand};
+        RigIK chain;
+        chain.end = 1;
+        chain.settings = {0, {1,1,0}, {0,0,1}, 1, Ease::Linear};
+        chain.keys = {{0, {1,1,0}, {0,0,1}, 0, Ease::Linear}, {10, {1,1,0}, {0,0,1}, 1, Ease::Linear},
+                      {20, {10,0,0}, {0,0,1}, 1, Ease::Linear}};
+        rig.ik.push_back(chain);
+        auto base = std::make_shared<Mesh>(makeEditableBox());
+        CHECK(bindRig(rig, *base) && validRig(rig, base->v.size()));
+        auto fk = poseRig(rig, 0);
+        auto half = poseRig(rig, 5);
+        auto solved = poseRig(rig, 10);
+        auto far = poseRig(rig, 20);
+        CHECK(length(fk[1].tail - V3(0,2,0)) < .001f);
+        CHECK(length(half[1].tail - chain.settings.target) < length(fk[1].tail - chain.settings.target));
+        CHECK(length(solved[1].tail - chain.settings.target) < .001f);
+        CHECK(solved[1].head.z > .5f && length(solved[2].head - solved[1].tail) < .001f);
+        CHECK(length(far[1].tail - V3(2,0,0)) < .001f);
+        Rig overlap = rig;
+        overlap.ik.push_back({2, chain.settings, {}});
+        CHECK(!validRig(overlap, base->v.size()));
+        Scene scene;
+        Object actor = makeObject(ObjType::Mesh, 1);
+        actor.mesh = base;
+        actor.rig = std::make_shared<Rig>(rig);
+        scene.objs.push_back(actor);
+        scene.applyFrame(0);
+        auto before = scene.objs[0].posedMesh;
+        scene.applyFrame(10);
+        CHECK(before && scene.objs[0].posedMesh && length(before->v[6] - scene.objs[0].posedMesh->v[6]) > .1f);
+        CHECK(scene.save("build/t/limb-ik.c3d"));
+        Scene reopened;
+        CHECK(reopened.load("build/t/limb-ik.c3d"));
+        if (!reopened.objs.empty() && reopened.objs[0].rig) {
+            reopened.applyFrame(20);
+            auto after = poseRig(*reopened.objs[0].rig, 20);
+            CHECK(after.size() == 3 && length(after[1].tail - V3(2,0,0)) < .001f);
+        }
+
+        Mesh hole = makeEditableBox();
+        CHECK(deleteMeshFaces(hole, {6, 7}));
+        std::vector<std::pair<uint32_t, uint32_t>> border;
+        for (size_t i = 0; i < hole.tri.size(); i += 3) {
+            for (int j = 0; j < 3; ++j) {
+                uint32_t a = hole.tri[i + j], b = hole.tri[i + (j + 1) % 3];
+                if (hole.v[a].y == 1 && hole.v[b].y == 1) border.emplace_back(a, b);
+            }
+        }
+        CHECK(border.size() == 4 && fillMeshBoundary(hole, border) && hole.triCount() == 12);
+        CHECK(!fillMeshBoundary(hole, border));
+        float t;
+        V3 n;
+        CHECK(hole.intersect({0,3,0}, {0,-1,0}, 0, 10, t, n, true) && std::fabs(t - 2) < .001f && n.y > 0);
+        Mesh concave;
+        concave.v = {{0,0,1}, {2,0,1}, {2,2,1}, {1,1,1}, {0,2,1}};
+        for (int i = 0; i < 5; ++i) {
+            V3 top = concave.v[i];
+            concave.v.push_back(top - V3(0,0,1));
+        }
+        border.clear();
+        for (uint32_t i = 0; i < 5; ++i) {
+            uint32_t next = (i + 1) % 5;
+            concave.tri.insert(concave.tri.end(), {i, i+5, next+5, i, next+5, next});
+            border.emplace_back(i, next);
+        }
+        CHECK(fillMeshBoundary(concave, border) && concave.triCount() == 13);
+        CHECK(concave.intersect({.5f,.5f,4}, {0,0,-1}, 0, 10, t, n, true) && n.z > 0);
+        CHECK(!concave.intersect({1,1.75f,4}, {0,0,-1}, 0, 10, t, n, true));
+        Mesh seam = makeEditableBox();
+        projectMeshUV(seam, 1);
+        V3 split = seam.v[0], uv = seam.uv[0];
+        seam.v.push_back(split + V3(.0001f,0,0));
+        seam.uv.push_back(uv + V3(.2f,0,0));
+        seam.tri[0] = 8;
+        CHECK(!weldMeshVertices(seam, {8, 0}, .001f, true) && seam.v.size() == 9);
+        CHECK(weldMeshVertices(seam, {8, 0}, .001f, false) && seam.v.size() == 8 &&
+              seam.triCount() == 12 && seam.uv.size() == seam.v.size());
+    }
     printf("rig bind pose, animation, linked meshes, and persistence\n");
     {
         auto base = std::make_shared<Mesh>(makeEditableBox());
@@ -447,6 +623,169 @@ int main() {
         CHECK(saveGeometry(exported, {{"UV triangle", mesh}}, false) && loadOBJ(exported, roundTrip, error) && roundTrip.uv.size() == 3);
         std::remove(source);
         std::remove(exported);
+    }
+    printf("polygon topology, editing, interchange and skinning\n");
+    {
+        const char* source = "build/t/polygon-source.obj";
+        const char* output = "build/t/polygon-export.obj";
+        const char* sceneFile = "build/t/polygon-roundtrip.c3d";
+        std::ofstream(source) <<
+            "v 0 0 0\nv 2 0 0\nv 2 1 0\nv 1 1 0\nv 1 2 0\nv 0 2 0\nv 1 0 1\n"
+            "vt 0 0\nvt 1 0\nvt 1 .5\nvt .5 .5\nvt .5 1\nvt 0 1\nvt .25 0\nvt .75 0\nvt .5 1\n"
+            "vn 0 0 1\nf 1/1/1 2/2/1 3/3/1 4/4/1 5/5/1 6/6/1\nf -6/8 -7/7 -1/9\n";
+        Mesh mesh, reopenedOBJ;
+        std::string error;
+        CHECK(loadOBJ(source, mesh, error) && mesh.polygons);
+        if (mesh.polygons) {
+            CHECK(mesh.polygons->faces.size() == 2 && mesh.polygons->faces[0].size() == 6 &&
+                  mesh.triCount() == 5 && mesh.triangleFaces[3] == 0 && mesh.triangleFaces[4] == 1);
+            CHECK(mesh.v.size() == 9 && mesh.skinVertices().size() == 7 &&
+                  mesh.polygons->faces[1][1].vertex == mesh.polygons->faces[0][0].vertex &&
+                  mesh.polygons->faces[1][1].uv != mesh.polygons->faces[0][0].uv);
+            V3 normal;
+            float distance = 0;
+            CHECK(mesh.intersect({-.75f, .75f, 1}, {0,0,-1}, .001f, 5, distance, normal));
+            CHECK(!mesh.intersect({.75f, .75f, 1}, {0,0,-1}, .001f, 5, distance, normal));
+            Rig rig;
+            rig.joints.push_back(Joint{});
+            rig.joints.back().name = "Root";
+            rig.joints.back().tail = {0, 1, 0};
+            rig.joints.back().pose.pos = {.25f, 0, 0};
+            CHECK(bindRig(rig, mesh) && rig.weights.size() == 7);
+            auto posed = deformRig(rig, mesh, 0);
+            CHECK(posed && length(posed->v[0] - mesh.v[0]) > .2f && length(posed->v[0] - posed->v[7]) < .001f);
+            Scene scene;
+            Object object = makeObject(ObjType::Mesh, 1);
+            object.mesh = std::make_shared<Mesh>(mesh);
+            object.rig = std::make_shared<Rig>(rig);
+            object.scl = {-1, 1, 1};
+            scene.objs.push_back(object);
+            scene.applyFrame(0);
+            CHECK(scene.save(sceneFile));
+            std::ifstream file(sceneFile);
+            std::string header;
+            std::getline(file, header);
+            CHECK(header == "CANYON3D 10");
+            file.close();
+            Scene reopened;
+            CHECK(reopened.load(sceneFile) && reopened.objs.size() == 1 && reopened.objs[0].mesh->polygons &&
+                  reopened.objs[0].rig && reopened.objs[0].rig->weights.size() == 7);
+            auto layers = meshSelection(reopened, {0}, 24);
+            CHECK(layers.size() == 1 && layers[0].mesh.polygons && layers[0].mesh.polygons->faces[0].size() == 6);
+            CHECK(saveGeometry(output, layers, false) && loadOBJ(output, reopenedOBJ, error) &&
+                  reopenedOBJ.polygons && reopenedOBJ.polygons->faces[0].size() == 6 && reopenedOBJ.v.size() == 9);
+        }
+        for (const char* file : {source, output, sceneFile}) std::remove(file);
+    }
+    {
+        Mesh mesh;
+        auto cube = makePolygonBox();
+        projectPolygonUV(cube, 2);
+        CHECK(!insetPolygonFace(cube, 0, 1.1f) && cube.faces.size() == 6);
+        CHECK(insetPolygonFace(cube, 0, .25f) && cube.faces.size() == 10 && cube.positions.size() == 12);
+        CHECK(length(cube.positions[8] - V3(-.75f, -.75f, -1)) < .001f);
+        CHECK(length(cube.uv[cube.faces[0][0].uv] - V3(.125f,.125f,0)) < .001f);
+        CHECK(buildPolygonMesh(cube, mesh) && mesh.triCount() == 20);
+        CHECK(extrudePolygonFaces(cube, {0}, .5f) && buildPolygonMesh(cube, mesh) && mesh.triCount() == 28);
+
+        auto loop = makePolygonBox();
+        CHECK(cutQuadLoop(loop, {0, 1}, .25f) && loop.positions.size() == 12 && loop.faces.size() == 10);
+        CHECK(buildPolygonMesh(loop, mesh) && mesh.triCount() == 20);
+        for (size_t i = 8; i < loop.positions.size(); ++i) CHECK(std::fabs(loop.positions[i].x + .5f) < .001f);
+        CHECK(subdividePolygons(loop) && buildPolygonMesh(loop, mesh) && mesh.triCount() == 80);
+
+        PolygonMesh strip;
+        strip.positions = {{0,0,0}, {1,0,0}, {1,1,0}, {0,1,0}, {.5f,2,0}};
+        strip.faces = {{{0},{1},{2},{3}}, {{3},{2},{4}}};
+        CHECK(cutQuadLoop(strip, {0, 1}, .5f) && strip.faces.size() == 3 && strip.faces[1].size() == 4);
+        CHECK(buildPolygonMesh(strip, mesh) && mesh.triCount() == 6);
+        CHECK(std::count_if(strip.faces[1].begin(), strip.faces[1].end(), [](auto corner) { return corner.vertex == 6; }) == 1);
+
+        auto hole = makePolygonBox();
+        CHECK(deletePolygonFaces(hole, {3}));
+        CHECK(fillPolygonBoundary(hole, {{3,7}, {7,6}, {6,2}, {2,3}}));
+        CHECK(buildPolygonMesh(hole, mesh) && mesh.triCount() == 12);
+        auto board = makePolygonBox();
+        projectPolygonUV(board, 0);
+        board.positions.push_back(board.positions[0]);
+        board.uv.push_back({.5f,.5f,0});
+        board.faces[0][0] = {8, 8};
+        CHECK(weldPolygonVertices(board, {0, 8}, .0001f) && board.positions.size() == 8);
+        CHECK(board.faces[0][0].vertex == 0 && board.faces[0][0].uv == 8 &&
+              buildPolygonMesh(board, mesh) && mesh.v.size() == 9);
+    }
+    printf("polygon boundary bridging and knife paths\n");
+    {
+        using Edge = std::pair<uint32_t, uint32_t>;
+        auto ends = makePolygonBox();
+        ends.faces.resize(2);
+        auto loops = expandPolygonBoundary(ends, {{0,1}, {4,5}});
+        CHECK(loops.size() == 8);
+        auto failed = ends;
+        CHECK(!bridgePolygonBoundaries(failed, {{0,1}, {4,5}, {5,6}}, 2, 0) && failed.faces.size() == 2);
+        Mesh mesh;
+        auto twist = ends;
+        CHECK(bridgePolygonBoundaries(twist, loops, 1, 1) && buildPolygonMesh(twist, mesh) && mesh.triCount() == 12);
+        if (twist.faces.size() > 2) CHECK(twist.faces[2][3].vertex == 5);
+        CHECK(bridgePolygonBoundaries(ends, loops, 3, 0) && ends.faces.size() == 14 && ends.positions.size() == 16);
+        CHECK(buildPolygonMesh(ends, mesh) && mesh.triCount() == 28);
+        std::map<Edge, std::pair<int, int>> edgeUses;
+        for (const auto& face : ends.faces) {
+            for (size_t i = 0; i < face.size(); ++i) {
+                auto a = face[i].vertex, b = face[(i + 1) % face.size()].vertex;
+                auto& use = edgeUses[std::minmax(a, b)];
+                ++use.first;
+                use.second += a < b ? 1 : -1;
+            }
+        }
+        for (const auto& item : edgeUses) CHECK(item.second.first == 2 && item.second.second == 0);
+        CHECK(ends.uv.size() == 20 && ends.uv[0].x == 0 && ends.uv[4].x == 1);
+
+        PolygonMesh separate;
+        separate.positions = {{0,0,0}, {1,0,0}, {0,1,0}, {2,0,0}, {3,0,0}, {2,1,0}};
+        separate.faces = {{{0},{1},{2}}, {{3},{4},{5}}};
+        CHECK(bridgePolygonBoundaries(separate, {{1,2}, {3,5}}, 2, 0) && buildPolygonMesh(separate, mesh) &&
+              separate.positions.size() == 8 && mesh.triCount() == 6);
+        auto single = makePolygonBox();
+        single.faces.resize(1);
+        CHECK(!bridgePolygonBoundaries(single, {{0,1}, {2,3}}, 1, 0) && single.faces.size() == 1);
+    }
+    {
+        PolygonMesh strip;
+        strip.positions = {{0,0,0}, {1,0,0}, {2,0,0}, {0,1,0}, {1,1,0}, {2,1,0}, {3,0,0}, {3,1,0}};
+        strip.faces = {{{0},{1},{4},{3}}, {{1},{2},{5},{4}}, {{2},{6},{7},{5}}};
+        projectPolygonUV(strip, 2);
+        strip.uv.insert(strip.uv.end(), {{0,0,0}, {0,1,0}});
+        strip.faces[1].front().uv = 8;
+        strip.faces[1].back().uv = 9;
+        strip.normals = {{0,0,1}, {0,.2f,1}};
+        for (size_t i = 0; i < strip.faces.size(); ++i)
+            for (auto& c : strip.faces[i]) c.normal = i == 0 ? 0 : 1;
+        CHECK(cutPolygonPath(strip, {{{0,3}, .4f}, {{4,1}, .6f}, {{2,5}, .4f}}));
+        CHECK(strip.positions.size() == 11 && strip.faces.size() == 5 && strip.faces[2].size() == 5);
+        Mesh cut;
+        CHECK(buildPolygonMesh(strip, cut) && cut.triCount() == 11);
+        std::set<int> seamUVs, seamNormals;
+        for (const auto& face : strip.faces)
+            for (const auto& c : face) if (c.vertex == 9) {
+                seamUVs.insert(c.uv);
+                seamNormals.insert(c.normal);
+            }
+        CHECK(seamUVs.size() == 2 && !seamUVs.count(-1) && seamNormals.size() == 2 && !seamNormals.count(-1));
+
+        auto single = makePolygonBox();
+        single.faces.resize(1);
+        auto diagonal = single;
+        CHECK(cutPolygonPath(diagonal, {{{0,0}, 0}, {{2,2}, 0}}) && diagonal.faces.size() == 2 &&
+              diagonal.positions.size() == 8 && buildPolygonMesh(diagonal, cut) && cut.triCount() == 2);
+        CHECK(cutPolygonPath(single, {{{0,1}, .25f}, {{3,2}, .5f}, {{0,1}, .75f}}) &&
+              single.positions.size() == 11 && single.faces.size() == 3 && buildPolygonMesh(single, cut));
+
+        PolygonMesh concave;
+        concave.positions = {{0,0,0}, {2,0,0}, {2,1,0}, {1,1,0}, {1,2,0}, {0,2,0}};
+        concave.faces = {{{0},{1},{2},{3},{4},{5}}};
+        CHECK(!cutPolygonPath(concave, {{{2,2}, 0}, {{4,4}, 0}}) &&
+              concave.positions.size() == 6 && concave.faces.size() == 1);
     }
     printf("DXF import/export and implicit geometry\n");
     {
