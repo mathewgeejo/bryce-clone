@@ -50,6 +50,16 @@ def main():
             assert not tiled["isError"], tiled
             corners = json.loads(tiled["content"][0]["text"])["objects"]
             assert len(corners) == 4 and corners[-1]["position"] == [20, 0, 30], corners
+            physics = [{"op": "timeline", "frames": 12, "fps": 24},
+                       {"op": "object", "name": "Drop", "kind": "Sphere", "position": [-5, 4, 0]},
+                       {"op": "object", "name": "Water volume", "kind": "Cube", "position": [4, 2, 0]},
+                       {"op": "rigid_bake", "names": ["Drop"], "frames": 12, "preset": "Rubber", "gravity_preset": "Moon"},
+                       {"op": "liquid_bake", "name": "Water volume", "frames": 12, "resolution": 2,
+                        "preset": "Syrup", "gravity_preset": "Attract", "start_frame": 5, "center": [1, 0, 0]}]
+            simulated = tool("compose", output="physics.c3d", operations=physics)
+            assert not simulated["isError"], simulated
+            objects = json.loads(simulated["content"][0]["text"])["objects"]
+            assert len(objects) == 10 and all(obj["type"] == "Metaball" for obj in objects[2:]), objects
             assert tool("compose", output="../outside.c3d", operations=recipe)["isError"]
             assert tool("compose", output="lake.c3d", operations=recipe)["isError"]
             assert tool("compose", output="bad.c3d", operations=[{"op": "object", "name": "Bad", "kind": "unknown"}])["isError"]

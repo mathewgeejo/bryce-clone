@@ -66,6 +66,30 @@ Close the studio before rebuilding so the linker can replace `Brycescape.exe`. T
 - Animate transforms and appearance tracks, switch between named cameras, and render stills, panoramas or numbered animation frames.
 - Save scene fragments in the thumbnail library. Package, embed or relink image assets through **Commands**.
 
+## Simulate physics and liquid
+
+Open **Edit → Simulation** or choose **Simulation** from the **F1** command palette. Select a source object or use **Add Liquid Source** or **Add Drop Body** to place a starter above the scene. Choose the presets, clip length, and detail, then click **Bake & Play**. The preview stops at the last baked frame. **Bake** leaves the timeline at the start of the clip. **Ctrl+Z** undoes the bake.
+
+- **Liquid** releases the selected object's bounding box as **Water**, **Oil**, **Syrup**, or **Lava**. Presets set the appearance, viscosity, and cohesion. **Fine** increases solver precision and uses up to 512 particles. Advanced settings include the particle grid, surface size, and source visibility.
+- **Rigid Bodies** uses **Balanced**, **Rubber**, **Steel**, **Ice**, and **Wood** presets for rebound, sliding, and damping. Bodies collide with one another and with passive solids and terrain. Spheres roll and spin. Other solids use fixed, world-aligned bounding boxes.
+- **Gravity** offers Earth, Moon, Mars, Jupiter, Zero G, Reverse, Attract, and Repel. Open **Advanced Settings** to enter a custom direction or adjust a radial field's center and falloff radius. Attract and Repel use the 3D cursor as the starting center when it is visible. [NASA planetary gravity reference](https://nssdc.gsfc.nasa.gov/planetary/factsheet/)
+
+The bake uses the visible pose and starts at the current timeline frame by default. Turning off **Start at Current Frame** writes the clip from frame 0. A later liquid clip leaves the source visible until the first baked frame if **Hide Volume Source** is on. Rigid-body bakes replace transform keys inside the clip and retain the keys outside it. Scrub the baked animation, save and reopen it, or render the clip by passing its first and last frames to `--render-frames`.
+
+Passive colliders stay at their starting poses during a bake. The solvers run independently. Each bake supports up to 240 frames and 12 seconds. Rigid Bodies handles up to 96 active objects. The liquid pressure solver uses positional density constraints. [Position Based Fluids](https://mmacklin.com/pbf_sig_preprint.pdf)
+
+The agent CLI and MCP compose tools accept these presets, start frames, and advanced settings. Add the named source objects to the recipe first. Explicit numeric settings override the matching preset defaults.
+
+```json
+[
+  {"op": "timeline", "frames": 60, "fps": 24},
+  {"op": "object", "name": "Ball", "kind": "Sphere", "position": [-4, 5, 0]},
+  {"op": "object", "name": "Pool release", "kind": "Cube", "position": [4, 3, 0]},
+  {"op": "rigid_bake", "names": ["Ball"], "frames": 60, "preset": "Rubber", "gravity_preset": "Moon"},
+  {"op": "liquid_bake", "name": "Pool release", "frames": 48, "start_frame": 12, "preset": "Syrup", "resolution": 6}
+]
+```
+
 ## Render from the command line
 
 ### Create and render scenes with an agent
@@ -133,14 +157,23 @@ Brycescape uses its own `.c3d` scene format and reads older versions. For geomet
 | `A` / `M` / `E` | Open attributes, materials, or the selected object's editor |
 | `F` | Frame the selection or the whole scene |
 | `F1` | Open the command palette |
+| `G` / `R` / `S` | Choose Move / Rotate / Scale, then drag in the viewport |
+| `X` / `Y` / `Z` | Toggle an axis constraint before or during a drag |
+| `Shift` / `Ctrl` during a drag | Precision adjustment / temporary grid snap when snapping is off |
+| `Shift+right-click` | Place the 3D cursor on the scene surface under the pointer |
+| `Ctrl+Shift+D` | Duplicate the selection across the chosen mirror plane |
 | `Ctrl+G` / `Ctrl+U` | Group / ungroup the selection |
 | `Ctrl+D` / `Delete` | Duplicate / delete the selection |
 | `Ctrl+Z` / `Ctrl+Y` | Undo / redo |
 | `Ctrl+K` / `Space` | Add a keyframe / play or pause the timeline |
 | `[` / `]` | Decrease / increase the terrain brush size |
-| `Esc` | Close the active lab or stop a render |
+| `Esc` | Cancel a transform, close the active lab, or stop a render |
 
 Select an object to reveal its viewport handles. Drag **Move**, **Rotate**, or **Scale** to transform it. Use **E** to shape stones and tori, edit imported meshes and picture cards, or tune lights and metaballs. To fuse metaballs, position them so their fields overlap, select both, and press **Ctrl+G**.
+
+Open **Edit → Transform** to set up precise placement. **Auto-lock Move Axis** follows the main direction of the drag. Move uses world axes. Rotate and Scale adjust each object's transform axes and use the chosen pivot to position the selection. **Grid** snaps translation by the grid step, rotation by the angle step, and scaling by 0.1 increments of the original scale. **Surface** places the bottom center of the selection bounds on the surface under the pointer. Release the mouse or press **Enter** to commit a drag.
+
+Use **Bounds Center** for a selection's geometric center, **Median** for the average of selected root origins, or pivot around the **Active Object**, **World Origin**, or **3D Cursor**. The palette can center the selection at the origin or cursor and move the cursor to the bounds center. To build a symmetric arrangement around the world origin, choose **World Origin**, select a mirror axis, and click **Mirror Duplicate**. In **Terrain Editor**, **Mirror Left to Right** and **Mirror Right to Left** copy one half of the heightfield onto the other.
 
 **Display** opens the viewport palette. Double-click a hierarchy row to rename it. Drag a row to reorder it, or Alt-drag it onto a parent. Terrain regions and strokes have separate undo and redo controls in the Terrain Editor.
 

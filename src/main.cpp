@@ -11,8 +11,10 @@
 #include <limits>
 #include <iomanip>
 #include <functional>
+#include <future>
 #include <iterator>
 #include <map>
+#include <memory>
 #include <set>
 #include <sstream>
 #include <string>
@@ -22,6 +24,7 @@
 #include "agent.h"
 #include "render.h"
 #include "scene.h"
+#include "simulation.h"
 #include "terrain.h"
 
 namespace {
@@ -61,7 +64,7 @@ float gPreviewScale = 0.45f;
 std::string gHoverTip, gLastTip;
 uint64_t gTipSince = 0;
 Renderer gMainR, gNanoR, gLabR, gViewR;
-enum Lab { LabNone, LabMat, LabSky, LabTerrain, LabTree, LabRender, LabTools, LabExamples, LabObject, LabAttributes, LabDxf, LabMotion, LabAssets, LabCameras, LabCommands, LabScatter, LabTransform } gLab = LabNone;
+enum Lab { LabNone, LabMat, LabSky, LabTerrain, LabTree, LabRender, LabTools, LabExamples, LabObject, LabAttributes, LabDxf, LabMotion, LabAssets, LabCameras, LabCommands, LabScatter, LabTransform, LabSimulation } gLab = LabNone;
 Scene gLabBackup;
 bool gLabChanged = false, gNanoDirty = true, gLabDirty = false, gMainWasBusy = false;
 uint64_t gLastChange = 0, gRenderStart = 0;
@@ -144,8 +147,23 @@ std::vector<AssetTile> gAssets;
 int gAssetPage = 0, gAssetSelection = -1;
 TreeParams gTreeP;
 bool gPlaying = false, gAutoKey = false, gAnimRender = false;
+bool gLiquidSimulation = false;
+bool gSimulationAdvanced = false, gSimulationStartHere = true;
+RigidSettings gRigidSettings;
+LiquidSettings gLiquidSettings;
+RigidPreset gRigidPreset = RigidPreset::Balanced;
+GravityPreset gSimulationGravity[2] = {GravityPreset::Earth, GravityPreset::Earth};
+std::string gSimulationError;
+struct SimulationBake {
+    Scene scene;
+    std::string error;
+    int particles = 0, firstParticle = -1, last = 0;
+    bool ok = false, play = false;
+};
+std::future<SimulationBake> gSimulationBake;
 int gAnimFrame = -1;
-uint64_t gPlayLast = 0;
+uint64_t gPlayStart = 0;
+int gPlayStartFrame = 0, gPlayEndFrame = -1;
 std::string gAnimBase, gAnimExtension;
 struct RenderJob { std::string scene, output; };
 std::vector<RenderJob> gQueue;
@@ -541,6 +559,11 @@ bool sceneBounds(bool selected, V3& lo, V3& hi) {
 
 V3 axisVector(int axis) { return {axis == 0 ? 1.f : 0.f, axis == 1 ? 1.f : 0.f, axis == 2 ? 1.f : 0.f}; }
 
+void expandBounds(V3 low, V3 high, V3& totalLow, V3& totalHigh) {
+    totalLow = {std::min(totalLow.x, low.x), std::min(totalLow.y, low.y), std::min(totalLow.z, low.z)};
+    totalHigh = {std::max(totalHigh.x, high.x), std::max(totalHigh.y, high.y), std::max(totalHigh.z, high.z)};
+}
+
 std::vector<int> transformRoots() {
     std::vector<int> roots;
     for (int i : gSelSet) {
@@ -559,8 +582,17 @@ V3 selectionPivot(Pivot mode, const std::vector<int>& roots) {
     if (mode == Pivot::Cursor) return gCursor;
     if (mode == Pivot::Active && validSel()) return gScene.objs[gSel].worldPos;
     if (mode == Pivot::Bounds) {
-        V3 low, high;
-        if (sceneBounds(true, low, high)) return (low + high) * .5f;
+        V3 low(1e30f), high(-1e30f);
+        for (int i = 0; i < (int)gScene.objs.size(); ++i) {
+            const auto& obj = gScene.objs[i];
+            if (obj.hidden) continue;
+            int ancestor = i;
+            while (ancestor >= 0 && std::find(roots.begin(), roots.end(), ancestor) == roots.end())
+                ancestor = gScene.objs[ancestor].parent;
+            V3 a, b;
+            if (ancestor >= 0 && worldBounds(obj, a, b)) expandBounds(a, b, low, high);
+        }
+        if (low.x <= high.x) return (low + high) * .5f;
     }
     V3 p;
     for (int i : roots) p += gScene.objs[i].worldPos;
@@ -578,7 +610,8 @@ enum class Placement { Grid, Origin, Cursor };
 void placeSelection(Placement target) {
     auto roots = transformRoots();
     if (roots.empty()) { gStatus = "Select an unlocked object to place."; return; }
-    V3 center = selectionPivot(target == Placement::Grid ? Pivot::Median : Pivot::Bounds, roots);
+    Pivot mode = gPivotMode == Pivot::World || gPivotMode == Pivot::Cursor ? Pivot::Median : gPivotMode;
+    V3 center = selectionPivot(target == Placement::Grid ? mode : Pivot::Bounds, roots);
     V3 destination;
     if (target == Placement::Grid) destination = snapPoint(center, gGridStep);
     else if (target == Placement::Cursor) destination = gCursor;
@@ -1197,8 +1230,25 @@ void actQueue() {
 
 void setFrame(int f) {
     gScene.applyFrame(std::min(std::max(f, 0), gScene.frames - 1));
+    if (gPlaying) {
+        gPlayStart = nowMs();
+        gPlayStartFrame = gScene.frame;
+        gPlayEndFrame = -1;
+    }
     gShowRender = false;
     sceneChanged();
+}
+
+void startPlayback(int end = -1) {
+    gPlaying = true;
+    gPlayStart = nowMs();
+    gPlayStartFrame = gScene.frame;
+    gPlayEndFrame = end;
+}
+
+void togglePlayback() {
+    if (gPlaying) gPlaying = false;
+    else startPlayback();
 }
 
 void addKey() {
@@ -1354,6 +1404,10 @@ void openLab(Lab l) {
     commitRename();
     if (l == LabMat) { gMatLayers = false; gLayerIndex = 0; }
     if (l == LabAssets) refreshAssets();
+    if (l == LabSimulation) {
+        gPlaying = false;
+        gSimulationError.clear();
+    }
     if (l == LabTerrain) {
         gRegionTool = gRegionMask = false;
         gTerrainUndo.clear();
@@ -1382,6 +1436,7 @@ void closeLab(bool cancel) {
             else if (gLab == LabMotion) name = "Edit motion";
             else if (gLab == LabDxf) name = "Import DXF";
             else if (gLab == LabAssets) name = "Insert library asset";
+            else if (gLab == LabSimulation) name = gLiquidSimulation ? "Bake liquid" : "Bake rigid bodies";
             pushUndo(std::move(gLabBackup), name);
         }
     }
@@ -1510,7 +1565,8 @@ void drawTop() {
         if (button({230, 64, 22, 24}, ">")) gQuickCat++;
         if (button({260, 64, 58, 24}, "Assets")) openLab(LabAssets);
         if (button({324, 64, 96, 24}, "Transform...")) openLab(LabTransform);
-        int qx = 426;
+        if (button({426, 64, 98, 24}, "Simulation...")) openLab(LabSimulation);
+        int qx = 530;
         for (auto& m : materialPresets()) {
             if (m.category != cats[gQuickCat]) continue;
             if (qx + 92 > gW - 10) break;
@@ -1872,18 +1928,18 @@ void beginObjectDrag() {
     }
     if (gTool != 0 || gSnapMode != Snap::Surface) return;
     gTransform.surfaces = std::make_unique<Scene>(gScene);
-    bool bounded = false;
+    V3 totalLow(1e30f), totalHigh(-1e30f);
     for (int i = 0; i < (int)gScene.objs.size(); ++i) {
         for (int parent = gScene.objs[i].parent; !moving[i] && parent >= 0; parent = gScene.objs[parent].parent)
             if (moving[parent]) moving[i] = true;
         if (!moving[i]) continue;
         gTransform.surfaces->objs[i].hidden = true;
         V3 low, high;
-        if (!gScene.objs[i].hidden && !isLight(gScene.objs[i].type) && worldBounds(gScene.objs[i], low, high)) {
-            gTransform.bottom.y = bounded ? std::min(gTransform.bottom.y, low.y) : low.y;
-            bounded = true;
-        }
+        if (!gScene.objs[i].hidden && !isLight(gScene.objs[i].type) && worldBounds(gScene.objs[i], low, high))
+            expandBounds(low, high, totalLow, totalHigh);
     }
+    if (totalLow.x <= totalHigh.x)
+        gTransform.bottom = {(totalLow.x + totalHigh.x) * .5f, totalLow.y, (totalLow.z + totalHigh.z) * .5f};
     gTransform.surfaces->updateAll();
 }
 
@@ -1961,6 +2017,26 @@ void dragObject() {
     if (changed) sceneChanged();
 }
 
+void finishObjectDrag(bool cancel) {
+    if (cancel) {
+        for (const auto& start : gTransform.objects) {
+            auto& obj = gScene.objs[start.index];
+            obj.pos = start.position;
+            obj.rot = start.rotation;
+            obj.scl = start.scale;
+        }
+        if (gChanged) sceneChanged();
+        gChanged = false;
+        gStatus = "Transform canceled.";
+    }
+    endInteraction();
+    gIn.down = false;
+    gActive = 0;
+    gDrag = DragNone;
+    gTransform = {};
+    capturePointer(gRDrag || gMDrag);
+}
+
 V3 lightAimTip(const Object& o) { return o.worldPos + o.lightAxis() * (o.type == ObjType::Spotlight ? 4.f : 5.f); }
 
 void dragLightAim() {
@@ -2010,6 +2086,9 @@ void drawViewport() {
         };
         if (!previewMode)
             for (int k = -10; k <= 10; k++) { seg(V3(k * 5.f, 0, -50), V3(k * 5.f, 0, 50)); seg(V3(-50, 0, k * 5.f), V3(50, 0, k * 5.f)); }
+        bool transforming = gIn.down && gDrag == DragObj && !gTransform.objects.empty();
+        int lockedAxis = gTransformAxis;
+        if (gTool == 0 && gAutoAxis && transforming && lockedAxis < 0) lockedAxis = gTransform.autoAxis;
         std::vector<V3> s;
         auto drawObj = [&](int i) {
             const Object& o = gScene.objs[i];
@@ -2113,8 +2192,8 @@ void drawViewport() {
                         R handle{left + i * (w + gap), y, w, 22};
                         if (hov(handle) && gIn.pressed && gActive == 0) {
                             gActive = VIEW_ID;
-                            gDrag = DragObj;
                             gTool = i;
+                            beginObjectDrag();
                         }
                         bool active = gActive == VIEW_ID && gDrag == DragObj && gTool == i;
                         vgrad(handle, hov(handle) || active ? rgb(103, 105, 137) : rgb(78, 80, 103), rgb(43, 45, 59));
@@ -2158,11 +2237,36 @@ void drawViewport() {
                 seg(c0, c0 + up * (o.scl.y * 0.25f + 0.5f));
             }
         }
+        auto marker = [&](V3 world, Color color, int size) {
+            V3 q = vb.toCam(world);
+            float depth = vb.ortho ? 1.f : q.z;
+            if (depth < .1f) return;
+            float x = cx + q.x * hh / (depth * vb.k), y = cy - q.y * hh / (depth * vb.k);
+            if (x < vp.x || x >= vp.x + vp.w || y < vp.y || y >= vp.y + vp.h) return;
+            circle((int)x, (int)y, size - 2, color);
+            line((int)x - size, (int)y, (int)x + size, (int)y, color);
+            line((int)x, (int)y - size, (int)x, (int)y + size, color);
+        };
+        if (validSel() && gTool != TOOL_SCULPT && (gTab == 1 || transforming)) {
+            V3 pivot = transforming ? gTransform.pivot : selectionPivot(gPivotMode, transformRoots());
+            if (lockedAxis >= 0 && gTool == 0) {
+                const Color colors[] = {rgb(255, 122, 116), rgb(120, 241, 150), rgb(119, 185, 255)};
+                pen = colors[lockedAxis];
+                V3 span = axisVector(lockedAxis) * (vb.k * (vb.ortho ? 1.f : std::max(.5f, vb.toCam(pivot).z)) * 2.f);
+                seg(pivot - span, pivot + span);
+            }
+            marker(pivot, rgb(254, 223, 116), 6);
+        }
+        if (gCursorVisible) marker(gCursor, rgb(142, 245, 255), 10);
         clearClip();
         const char* vn[4] = {"Camera View", "Top View", "Front View", "Side View"};
         const char* tn[4] = {"Move", "Rotate", "Resize", "Sculpt Terrain"};
         char buf[160];
-        snprintf(buf, sizeof buf, "%s   |   Tool: %s   |   Frame %d", vn[gView], tn[gTool], gScene.frame);
+        const char* snap = gSnapMode == Snap::Grid ? "   |   Grid snap" : gSnapMode == Snap::Surface ? "   |   Surface snap" : "";
+        char axisText[24] = {};
+        if (gTool != TOOL_SCULPT && lockedAxis >= 0) snprintf(axisText, sizeof axisText, "   |   Axis %c", "XYZ"[lockedAxis]);
+        else if (gTool == 0 && gAutoAxis) snprintf(axisText, sizeof axisText, "   |   Auto axis");
+        snprintf(buf, sizeof buf, "%s   |   Tool: %s   |   Frame %d%s%s", vn[gView], tn[gTool], gScene.frame, axisText, gTool == TOOL_SCULPT ? "" : snap);
         textIn({vp.x + 10, vp.y + 6, vp.w - 20, 18}, buf, rgb(240, 240, 245), gBold, TextLeft | TextMiddle);
     }
     if (gSafeFrame) {
@@ -2232,8 +2336,9 @@ void drawViewport() {
             else if (p >= 0 && gIn.shift) selectObj(p, true, gIn.alt);
             else if (p >= 0) gSel = p;
             else if (!gIn.shift) clearSel();
-            gDrag = p >= 0 && isSel(p) ? DragObj : DragCam;
             if (p >= 0) gStatus = "Selected " + gScene.objs[p].name + (gSelSet.size() > 1 ? " (+" + std::to_string(gSelSet.size() - 1) + " more)." : ".");
+            if (p >= 0 && isSel(p) && gTool != TOOL_SCULPT) beginObjectDrag();
+            else gDrag = DragCam;
         }
     }
     if (gActive == VIEW_ID && gIn.down && gDrag == DragScatter && overCanvas &&
@@ -2327,7 +2432,7 @@ void drawTimeline() {
     int y = tl.y + 5, x = 8, last = gScene.frames - 1;
     if (button({x, y, 28, 24}, "|<")) setFrame(0);
     if (button({x + 30, y, 28, 24}, "<")) jumpKey(-1);
-    if (button({x + 60, y, 50, 24}, gPlaying ? "Stop" : "Play", gPlaying)) { gPlaying = !gPlaying; gPlayLast = nowMs(); }
+    if (button({x + 60, y, 50, 24}, gPlaying ? "Stop" : "Play", gPlaying)) togglePlayback();
     if (button({x + 112, y, 28, 24}, ">")) jumpKey(1);
     if (button({x + 142, y, 28, 24}, ">|")) setFrame(last);
     if (button({x + 176, y, 62, 24}, "Motion")) openLab(LabMotion);
@@ -2679,6 +2784,8 @@ void drawCommandsLab() {
         {"Reload Scene Images", "Refresh files from disk", [] { gScene.reloadAssets(); sceneChanged(); }},
         {"Save with Embedded Images", "Keep images inside the scene file", actEmbed},
         {"Scatter Brush", "Paint linked objects", [] { openLab(LabScatter); }},
+        {"Transform", "Snap, center and mirror", [] { openLab(LabTransform); }},
+        {"Simulation", "Bake physics or liquid", [] { openLab(LabSimulation); }},
     };
     for (int i = 0; i < (int)std::size(commands); ++i) {
         int x = p.x + 18 + (i % 2) * 369, y = p.y + 50 + (i / 2) * 36;
@@ -2694,6 +2801,229 @@ void drawCommandsLab() {
     labFooter(p, true);
 }
 
+void drawTransformLab() {
+    R p = panel(550, 406, "Transform");
+    int x = p.x + 18, y = p.y + 46;
+    label(x, y, "Pivot");
+    const char* pivots[] = {"Median", "Bounds Center", "Active Object", "World Origin", "3D Cursor"};
+    for (int i = 0; i < 5; ++i)
+        if (button({x + i * 103, y + 21, 98, 24}, pivots[i], gPivotMode == (Pivot)i, gSmall)) {
+            gPivotMode = (Pivot)i;
+            if (gPivotMode == Pivot::Cursor) gCursorVisible = true;
+        }
+    y += 56;
+    label(x, y, "Axis Constraint");
+    const char* axes[] = {"Free", "X", "Y", "Z"};
+    for (int i = 0; i < 4; ++i)
+        if (button({x + i * 64, y + 21, 60, 24}, axes[i], gTransformAxis == i - 1)) gTransformAxis = i - 1;
+    toggle({x + 263, y + 21, 251, 24}, "Auto-lock Move Axis", gAutoAxis);
+    y += 56;
+    label(x, y, "Snapping");
+    const char* modes[] = {"Off", "Grid", "Surface"};
+    for (int i = 0; i < 3; ++i)
+        if (button({x + i * 64, y + 21, 60, 24}, modes[i], gSnapMode == (Snap)i)) gSnapMode = (Snap)i;
+    slider({x + 197, y + 21, 154, 24}, "Grid Step", gGridStep, .05f, 100.f, "%.2f", true);
+    slider({x + 357, y + 21, 157, 24}, "Angle Step", gAngleStep, 1.f, 90.f, "%.0f");
+    y += 56;
+    label(x, y, "Placement");
+    // Scene actions close the settings palette and use the viewport's undo history.
+    auto apply = [](void (*action)()) {
+        closeLab(false);
+        defer([action] { gNoPush = false; beginInteraction(); action(); endInteraction(); });
+    };
+    if (button({x, y + 21, 124, 24}, "Snap to Grid")) { apply([] { placeSelection(Placement::Grid); }); return; }
+    if (button({x + 130, y + 21, 124, 24}, "Center at Origin")) { apply([] { placeSelection(Placement::Origin); }); return; }
+    if (button({x + 260, y + 21, 124, 24}, "Center at Cursor")) { apply([] { placeSelection(Placement::Cursor); }); return; }
+    if (button({x + 390, y + 21, 124, 24}, "Cursor to Origin")) { gCursor = {}; gCursorVisible = true; }
+    y += 56;
+    label(x, y, "Mirror Across Pivot");
+    for (int axis = 0; axis < 3; ++axis)
+        if (button({x + axis * 44, y + 21, 40, 24}, axes[axis + 1], gMirrorAxis == axis)) gMirrorAxis = axis;
+    if (button({x + 140, y + 21, 154, 24}, "Mirror Duplicate")) { apply(mirrorSelection); return; }
+    if (button({x + 300, y + 21, 214, 24}, "Cursor to Selection Center") && validSel()) {
+        gCursor = selectionPivot(Pivot::Bounds, transformRoots());
+        gCursorVisible = true;
+    }
+    note({x, y + 53, 398, 28}, "G/R/S choose a tool. X/Y/Z lock an axis.\nShift+right-click places the cursor.");
+    labFooter(p, true);
+}
+
+void addSimulationSource(bool liquid) {
+    closeLab(false);
+    defer([liquid] {
+        gNoPush = false;
+        beginInteraction();
+        ObjType kind = liquid ? ObjType::Cube : ObjType::Sphere;
+        auto object = makeObject(kind, ++gCounter[(int)kind]);
+        const V3 target = gScene.viewCamera().target;
+        object.scl = liquid ? V3(1.5f) : V3(1.f);
+        Hit surface;
+        float top = target.y + 1000.f;
+        float height = intersectScene(gScene, {{target.x, top, target.z}, {0, -1, 0}}, 2000.f, surface) ?
+                       surface.p.y : target.y;
+        object.pos = {target.x, height + 5, target.z};
+        gStatus = liquid ? "Added a source above the scene." : "Added a body above the scene.";
+        addObject(std::move(object));
+        endInteraction();
+        openLab(LabSimulation);
+    });
+}
+
+void launchSimulation(bool play, int first) {
+    gSimulationError.clear();
+    auto rigid = gRigidSettings;
+    auto liquid = gLiquidSettings;
+    rigid.time.startFrame = liquid.time.startFrame = first;
+    try {
+        gSimulationBake = std::async(std::launch::async, [scene = gScene.snapshot(), rigid, liquid, play,
+                                    useLiquid = gLiquidSimulation, selection = gSelSet, source = gSel]() mutable {
+            SimulationBake result;
+            auto& time = useLiquid ? liquid.time : rigid.time;
+            result.last = time.startFrame + time.frames - 1;
+            result.play = play;
+            result.firstParticle = useLiquid ? (int)scene.objs.size() : -1;
+            if (useLiquid) {
+                result.particles = bakeLiquid(scene, source, liquid, result.error);
+                result.ok = result.particles > 0;
+            } else {
+                result.ok = bakeRigidBodies(scene, selection, rigid, result.error);
+            }
+            if (result.ok) result.scene = std::move(scene);
+            return result;
+        });
+    } catch (const std::exception&) {
+        gSimulationError = "Could not start the simulation bake.";
+    }
+}
+
+void drawSimulationLab() {
+    R p = panel(650, gSimulationAdvanced ? 596 : 416, "Simulation");
+    int x = p.x + 20, y = p.y + 44, w = p.w - 40, half = (w - 8) / 2;
+    if (gSimulationBake.valid()) {
+        label(x, y, gLiquidSimulation ? "Baking liquid motion..." : "Baking rigid-body motion...");
+        note({x, y + 26, w, 42}, "The result will appear on the timeline when the bake finishes.");
+        return;
+    }
+    if (button({x, y, half, 28}, "Rigid Bodies", !gLiquidSimulation)) {
+        gLiquidSimulation = false;
+        gSimulationError.clear();
+    }
+    if (button({x + half + 8, y, half, 28}, "Liquid", gLiquidSimulation)) {
+        gLiquidSimulation = true;
+        gSimulationError.clear();
+    }
+    y += 38;
+    std::string selection = gLiquidSimulation ? (validSel() ? "Volume source  " + gScene.objs[gSel].name : "Select a volume source or add one.") :
+                            (gSelSet.empty() ? "Select a solid or add one." : std::to_string(gSelSet.size()) + " selected for rigid-body motion.");
+    textIn({x, y, w - 147, 25}, selection.c_str(), TXT, gFont, TextLeft | TextMiddle);
+    if (button({x + w - 142, y, 142, 25}, gLiquidSimulation ? "Add Liquid Source" : "Add Drop Body")) {
+        addSimulationSource(gLiquidSimulation);
+        return;
+    }
+    y += 37;
+    label(x, y, gLiquidSimulation ? "Liquid Preset" : "Body Preset");
+    int count = gLiquidSimulation ? (int)LiquidPreset::COUNT : (int)RigidPreset::COUNT;
+    int width = w / count;
+    for (int i = 0; i < count; ++i) {
+        auto liquid = (LiquidPreset)i;
+        auto rigid = (RigidPreset)i;
+        if (button({x + i * width, y + 19, width - 5, 26},
+                   gLiquidSimulation ? liquidPresetName(liquid) : rigidPresetName(rigid),
+                   gLiquidSimulation ? liquid == gLiquidSettings.preset : rigid == gRigidPreset)) {
+            if (gLiquidSimulation) applyLiquidPreset(gLiquidSettings, liquid);
+            else { gRigidPreset = rigid; applyRigidPreset(gRigidSettings, rigid); }
+            gSimulationError.clear();
+        }
+    }
+    y += 55;
+    label(x, y, "Gravity Preset");
+    auto& time = gLiquidSimulation ? gLiquidSettings.time : gRigidSettings.time;
+    auto& gravity = gSimulationGravity[gLiquidSimulation ? 1 : 0];
+    width = w / (int)GravityPreset::COUNT;
+    for (int i = 0; i < (int)GravityPreset::COUNT; ++i) {
+        auto preset = (GravityPreset)i;
+        if (button({x + i * width, y + 19, width - 4, 26}, gravityPresetName(preset), gravity == preset, gSmall)) {
+            gravity = preset;
+            applyGravityPreset(time, preset);
+            if (time.gravityMode != GravityMode::Direction && gCursorVisible) time.center = gCursor;
+            gSimulationError.clear();
+        }
+    }
+    y += 56;
+    int first = gSimulationStartHere ? std::min(gScene.frame, 99998) : 0;
+    int frameLimit = std::min(simulationFrameLimit(gScene.fps), 100000 - first);
+    time.frames = std::clamp(time.frames, 2, frameLimit);
+    sliderI({x, y, half, 24}, "Clip Frames", time.frames, 2, frameLimit);
+    const char* detail[] = {"Draft", "Balanced", "Fine"};
+    width = half / 3;
+    for (int i = 0; i < 3; ++i) {
+        if (button({x + half + 8 + i * width, y, width - 4, 24}, detail[i], time.detail == i)) {
+            time.detail = i;
+            if (gLiquidSimulation) gLiquidSettings.resolution = i == 0 ? 3 : i == 1 ? 4 : 8;
+        }
+    }
+    y += 32;
+    toggle({x, y, half, 24}, "Start at Current Frame", gSimulationStartHere);
+    if (button({x + half + 8, y, half, 24}, gSimulationAdvanced ? "Hide Advanced" : "Advanced Settings", gSimulationAdvanced)) {
+        gSimulationAdvanced = !gSimulationAdvanced;
+        return;
+    }
+    y += 32;
+    if (gSimulationAdvanced) {
+        toggle({x, y, half, 24}, "Floor at Y = 0", time.floor);
+        if (gLiquidSimulation) toggle({x + half + 8, y, half, 24}, "Hide Volume Source", gLiquidSettings.hideSource);
+        y += 29;
+        int third = (w - 16) / 3;
+        auto vectorRow = [&](V3& value, const char* tx, const char* ty, const char* tz, float min, float max) {
+            dragF({x, y, third, 24}, tx, value.x, .1f, min, max, "%.2f");
+            dragF({x + third + 8, y, third, 24}, ty, value.y, .1f, min, max, "%.2f");
+            dragF({x + 2 * (third + 8), y, third, 24}, tz, value.z, .1f, min, max, "%.2f");
+            y += 29;
+        };
+        vectorRow(time.velocity, "Velocity X", "Velocity Y", "Velocity Z", -50, 50);
+        if (slider({x, y, half, 24}, "Gravity Strength", time.gravity, 0, 50)) gravity = GravityPreset::COUNT;
+        if (time.gravityMode != GravityMode::Direction)
+            slider({x + half + 8, y, half, 24}, "Field Radius", time.radius, .1f, 1000, "%.2f", true);
+        y += 29;
+        if (time.gravityMode == GravityMode::Direction) {
+            V3 old = time.direction;
+            vectorRow(time.direction, "Gravity X", "Gravity Y", "Gravity Z", -10, 10);
+            if (length(time.direction - old) > 1e-6f) gravity = GravityPreset::COUNT;
+        } else {
+            vectorRow(time.center, "Field Center X", "Field Center Y", "Field Center Z", -100000, 100000);
+        }
+        if (gLiquidSimulation) {
+            sliderI({x, y, half, 24}, "Particle Grid", gLiquidSettings.resolution, 2, SIM_MAX_PARTICLE_GRID);
+            slider({x + half + 8, y, half, 24}, "Viscosity", gLiquidSettings.viscosity, 0, 1);
+            y += 29;
+            slider({x, y, half, 24}, "Cohesion", gLiquidSettings.cohesion, 0, 1);
+            slider({x + half + 8, y, half, 24}, "Surface Size", gLiquidSettings.surface, .8f, 1.3f);
+        } else {
+            bool custom = slider({x, y, third, 24}, "Bounce", gRigidSettings.bounce, 0, 1);
+            custom |= slider({x + third + 8, y, third, 24}, "Friction", gRigidSettings.friction, 0, 1);
+            custom |= slider({x + 2 * (third + 8), y, third, 24}, "Damping", gRigidSettings.damping, 0, 5);
+            if (custom) gRigidPreset = RigidPreset::COUNT;
+        }
+        y += 33;
+    }
+    first = gSimulationStartHere ? std::min(gScene.frame, 99998) : 0;
+    time.frames = std::min(time.frames, 100000 - first);
+    char summary[96];
+    std::snprintf(summary, sizeof summary, "Frames %d to %d   /   %.2f seconds at %d fps",
+                  first, first + time.frames - 1, (time.frames - 1.f) / std::max(1, gScene.fps), gScene.fps);
+    note({x, y, w, 34}, gSimulationError.empty() ? summary : gSimulationError.c_str());
+    bool selected = gLiquidSimulation ? validSel() : !gSelSet.empty();
+    int footerX = p.x + p.w - 100, footerY = p.y + p.h - 40;
+    if (selected) {
+        bool play = button({footerX - 144, footerY, 134, 28}, "Bake & Play", true, gBold);
+        bool bake = button({footerX - 240, footerY, 88, 28}, "Bake");
+        if (play || bake) {
+            launchSimulation(play, first);
+            return;
+        }
+    }
+    labFooter(p, true);
+}
 void preview(R pv, const char* caption) {
     fill(pv, rgb(16, 16, 18));
     blitFit(gLabR, pv);
@@ -3325,6 +3655,13 @@ void drawTerrainLab() {
         hfMakeTileable(f, .15f);
         ch = true;
     }
+    bool mirrorRight = button({hm.x, ry + 84, 195, 24}, "Mirror Left to Right");
+    bool mirrorLeft = button({hm.x + 205, ry + 84, 195, 24}, "Mirror Right to Left");
+    if (mirrorRight || mirrorLeft) {
+        rememberTerrain(f);
+        hfMirrorX(f, mirrorRight);
+        ch = true;
+    }
     if (gTerrainBakeLayer >= (int)o.mat.layers.size()) gTerrainBakeLayer = -1;
     if (!o.mat.layers.empty()) {
         std::string source = gTerrainBakeLayer < 0 ? "Bake Source  Full Material" :
@@ -3822,6 +4159,8 @@ void drawUI() {
         case LabCameras: drawCamerasLab(); break;
         case LabCommands: drawCommandsLab(); break;
         case LabScatter: drawScatterLab(); break;
+        case LabTransform: drawTransformLab(); break;
+        case LabSimulation: drawSimulationLab(); break;
         default: break;
         }
     }
@@ -3848,6 +4187,26 @@ void doFrame() {
 
 void tick() {
     uint64_t now = nowMs();
+    if (gSimulationBake.valid() && gSimulationBake.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+        try {
+            auto result = gSimulationBake.get();
+            if (result.ok) {
+                gScene = std::move(result.scene);
+                if (result.particles > 0) selectObj(result.firstParticle, false);
+                gScatter = gShowRender = false;
+                gStatus = (result.particles > 0 ? "Baked liquid" : "Baked rigid bodies") +
+                          std::string(" for frames ") + std::to_string(gScene.frame) + " to " + std::to_string(result.last) + ".";
+                sceneChanged();
+                closeLab(false);
+                if (result.play) startPlayback(result.last);
+            } else {
+                gSimulationError = std::move(result.error);
+            }
+        } catch (const std::exception&) {
+            gSimulationError = "The simulation bake could not finish.";
+        }
+        doFrame();
+    }
     if (gDirty && !gModal && !gAnimRender && gQueue.empty() && gLab == LabNone && !gIn.down &&
         now - gAutosaveTime >= 60000 && now - gLastChange >= 1500) {
         gAutosaveTime = now;
@@ -3858,22 +4217,31 @@ void tick() {
         sculptStep();
         doFrame();
     }
-    if (gPlaying && now - gPlayLast >= 1000u / (uint64_t)std::max(1, gScene.fps)) {
-        gPlayLast = now;
-        gScene.applyFrame((gScene.frame + 1) % gScene.frames);
-        gShowRender = false;
-        gNanoDirty = true;
-        gLastChange = now - 1000;
-        doFrame();
+    if (gPlaying) {
+        uint64_t elapsed = std::max(now, gPlayStart) - gPlayStart;
+        uint64_t frame = (uint64_t)gPlayStartFrame + elapsed * (uint64_t)std::max(1, gScene.fps) / 1000;
+        if (gPlayEndFrame >= 0 && frame >= (uint64_t)gPlayEndFrame) {
+            gPlaying = false;
+            frame = (uint64_t)gPlayEndFrame;
+        }
+        int next = (int)(frame % (uint64_t)std::max(1, gScene.frames));
+        if (next != gScene.frame) {
+            gScene.applyFrame(next);
+            gShowRender = false;
+            gNanoDirty = gViewPreviewDirty = true;
+            gLastChange = now - 1000;
+            doFrame();
+        }
     }
-    if (gNanoDirty && now - gLastChange > 120) {
+    if (gNanoDirty && (!gPlaying || !gNanoR.busy()) && now - gLastChange > 120) {
         gNanoDirty = false;
         Scene preview = gScene;
         preview.render = {};
         gNanoR.start(preview, NANO_W, NANO_H, 0);
     }
     static int previewView = -1, previewWidth = 0, previewHeight = 0;
-    if (!gShowRender && (gViewMode == Solid || gViewMode == Textured) && now - gLastChange > 100 &&
+    if (!gShowRender && (!gPlaying || !gViewR.busy()) &&
+        (gViewMode == Solid || gViewMode == Textured) && now - gLastChange > 100 &&
         (gViewPreviewDirty || previewView != gView || previewWidth != gVP.w || previewHeight != gVP.h)) {
         gViewPreviewDirty = false;
         previewView = gView;
@@ -4034,7 +4402,20 @@ void buildIcons() {
 void handleKey(int wp) {
     Modifiers input = modifiers();
     bool ctrl = input.ctrl, shift = input.shift;
+    bool axisKey = !ctrl && !input.alt && wp >= 'X' && wp <= 'Z';
+    if (gDrag == DragObj && gIn.down) {
+        if (wp == KeyCode::Escape || wp == KeyCode::Enter) finishObjectDrag(wp == KeyCode::Escape);
+        else if (axisKey) {
+            int axis = wp - 'X';
+            gTransformAxis = gTransformAxis == axis ? -1 : axis;
+            gIn.shift = shift;
+            gIn.ctrl = ctrl;
+            dragObject();
+        }
+        return;
+    }
     if (wp == KeyCode::Escape) {
+        if (gLab == LabSimulation && gSimulationBake.valid()) return;
         if (gLab != LabNone) { closeLab(true); endInteraction(); }
         else if (gScatter) { gScatter = false; gDrag = DragNone; gStatus = "Scatter brush closed."; }
         else if (gMainR.busy() || gAnimRender || !gQueue.empty()) actRender();
@@ -4049,7 +4430,10 @@ void handleKey(int wp) {
     if (wp == KeyCode::Delete) actDelete();
     else if (ctrl && wp == 'Z') undoRedo(shift);
     else if (ctrl && wp == 'Y') undoRedo(true);
-    else if (ctrl && wp == 'D') actDuplicate();
+    else if (ctrl && wp == 'D') {
+        if (shift) mirrorSelection();
+        else actDuplicate();
+    }
     else if (ctrl && wp == 'G') actGroup();
     else if (ctrl && wp == 'U') actUngroup();
     else if (ctrl && wp == 'A') { gSelSet.clear(); for (int i = 0; i < (int)gScene.objs.size(); i++) gSelSet.push_back(i); gSel = gSelSet.empty() ? -1 : 0; }
@@ -4063,7 +4447,17 @@ void handleKey(int wp) {
     else if (!ctrl && wp == 'M' && validSel()) openLab(LabMat);
     else if (!ctrl && wp == 'E' && validSel()) openLab(objectEditor(gScene.objs[gSel]));
     else if (!ctrl && wp == 'F') frameView(validSel());
-    else if (wp == ' ') { gPlaying = !gPlaying; gPlayLast = nowMs(); }
+    else if (!ctrl && !input.alt && (wp == 'G' || wp == 'R' || wp == 'S')) {
+        gTool = wp == 'G' ? 0 : wp == 'R' ? 1 : 2;
+        gScatter = false;
+        gTab = 1;
+        gShowRender = false;
+    }
+    else if (axisKey && gTool != TOOL_SCULPT) {
+        int axis = wp - 'X';
+        gTransformAxis = gTransformAxis == axis ? -1 : axis;
+    }
+    else if (wp == ' ') togglePlayback();
     else if (wp == KeyCode::LeftBracket || wp == KeyCode::RightBracket) gBrushSize = clampf(gBrushSize * (wp == KeyCode::RightBracket ? 1.2f : 1 / 1.2f), 0.01f, 0.3f);
     else if (wp >= '1' && wp <= '4') { gView = (int)(wp - '1'); gShowRender = false; }
     endInteraction();
@@ -4245,7 +4639,24 @@ void pointerButton(Mouse button, bool down, int x, int y) {
     gIn.mx = x; gIn.my = y;
     if (button != Mouse::Left) {
         bool& dragging = button == Mouse::Right ? gRDrag : gMDrag;
-        if (down && (gLab != LabNone || !gVP.in(x, y))) return;
+        if (down && (gLab != LabNone || gIn.down || !gVP.in(x, y))) return;
+        if (down && button == Mouse::Right && modifiers().shift) {
+            Ray ray = viewportRay(curBasis(), x, y);
+            Hit hit;
+            if (intersectScene(gScene, ray, 1e30f, hit)) gCursor = hit.p;
+            else if (std::fabs(ray.d.y) > 1e-6f && -ray.o.y / ray.d.y >= 0)
+                gCursor = ray.o + ray.d * (-ray.o.y / ray.d.y);
+            else {
+                gStatus = "No surface under the cursor.";
+                doFrame();
+                return;
+            }
+            gCursorVisible = true;
+            gShowRender = false;
+            gStatus = "Placed the 3D cursor.";
+            doFrame();
+            return;
+        }
         dragging = down;
         capturePointer(gIn.down || gRDrag || gMDrag);
         if (down) { gShowRender = false; doFrame(); }
@@ -4262,11 +4673,14 @@ void pointerButton(Mouse button, bool down, int x, int y) {
         gIn.released = true;
     }
     doFrame();
-    if (!down) endInteraction();
+    if (!down) {
+        if (gDrag == DragObj) finishObjectDrag(false);
+        else endInteraction();
+    }
 }
 
 void pointerWheel(float steps, int x, int y) {
-    if (gModal || gLab != LabNone) return;
+    if (gModal || gLab != LabNone || (gIn.down && gDrag == DragObj)) return;
     if (gListR.in(x, y)) {
         static float remainder = 0;
         remainder += steps * 2;

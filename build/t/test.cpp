@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "../../src/render.h"
+#include "../../src/simulation.h"
 #include "../../src/terrain.h"
 
 static bool saveBMP(const std::string& p, int w, int h, const std::vector<uint32_t>& px) {
@@ -56,6 +57,201 @@ static int fails = 0;
 #define CHECK(c) do { if (!(c)) { printf("  FAIL %s:%d %s\n", __FILE__, __LINE__, #c); fails++; } } while (0)
 
 int main() {
+    printf("rigid-body and liquid simulation bakes\n");
+    {
+        Scene scene;
+        scene.fps = 30;
+        scene.frames = 20;
+        Object terrain = makeObject(ObjType::Terrain, 1);
+        terrain.pos = {};
+        terrain.scl = {10, 2, 10};
+        hfInit(*terrain.hf, 9);
+        hfAdd(*terrain.hf, .5f);
+        Object lower = makeObject(ObjType::Cube, 1);
+        lower.pos = {0, 2, 0};
+        lower.scl = V3(.5f);
+        Object upper = makeObject(ObjType::Sphere, 1);
+        upper.pos = {0, 5, 0};
+        upper.scl = V3(.5f);
+        upper.keys.push_back({100, {0, 6, 0}, {}, upper.scl, Ease::Linear});
+        scene.objs = {terrain, lower, upper};
+        RigidSettings rigid;
+        rigid.time.frames = 90;
+        rigid.bounce = .2f;
+        std::string error;
+        bool baked = bakeRigidBodies(scene, {1, 2}, rigid, error);
+        CHECK(baked);
+        if (baked) {
+            CHECK(scene.frames == 90 && scene.objs[2].keys.back().frame == 100);
+            scene.applyFrame(12);
+            CHECK(scene.objs[2].worldPos.y < 5 && scene.objs[2].worldPos.y > 3);
+            scene.applyFrame(89);
+            CHECK(std::fabs(scene.objs[1].worldPos.y - 1.5f) < .03f);
+            CHECK(std::fabs(scene.objs[2].worldPos.y - 2.5f) < .05f);
+        }
+        Scene water;
+        water.fps = 30;
+        Object source = makeObject(ObjType::Cube, 1);
+        source.pos = {0, 3, 0};
+        source.scl = V3(1);
+        water.objs.push_back(source);
+        LiquidSettings liquid;
+        liquid.time.frames = 48;
+        liquid.time.velocity = {0, 0, .55f};
+        liquid.resolution = 3;
+        CHECK(bakeLiquid(water, 0, liquid, error) == 27);
+        if (water.objs.size() == 28) {
+            CHECK(water.objs[0].hidden && water.metaballs.size() == 1);
+            Hit hit;
+            CHECK(intersectScene(water, {{0, 3, 8}, {0, 0, -1}}, 20, hit) && hit.obj > 0);
+            water.applyFrame(47);
+            float peak = 0, width = 0;
+            for (size_t i = 1; i < water.objs.size(); ++i) {
+                V3 p = water.objs[i].worldPos;
+                CHECK(p.y >= .47f);
+                peak = std::max(peak, p.y);
+                width = std::max(width, std::fabs(p.x));
+            }
+            CHECK(peak < 2.5f && width > .8f);
+            const char* path = "build/t/liquid bake.c3d";
+            CHECK(water.save(path));
+            Scene reopened;
+            CHECK(reopened.load(path) && reopened.objs.size() == water.objs.size());
+            if (reopened.objs.size() == water.objs.size()) {
+                reopened.applyFrame(47);
+                CHECK(length(reopened.objs.back().worldPos - water.objs.back().worldPos) < 1e-4f);
+                CHECK(reopened.metaballs.size() == 1);
+            }
+        }
+    }
+    printf("preset forces, rolling orientation, and ranged animation clips\n");
+    {
+        auto fall = [](GravityPreset preset) {
+            Scene scene;
+            scene.fps = 30;
+            auto body = makeObject(ObjType::Sphere, 1);
+            body.pos = {5, 10, 0};
+            body.scl = V3(.5f);
+            scene.objs.push_back(body);
+            RigidSettings settings;
+            applyGravityPreset(settings.time, preset);
+            settings.time.frames = 31;
+            settings.time.floor = false;
+            settings.time.startFrame = 12;
+            std::string error;
+            CHECK(bakeRigidBodies(scene, {0}, settings, error));
+            scene.applyFrame(11);
+            CHECK(length(scene.objs[0].pos - body.pos) < 1e-5f);
+            scene.applyFrame(42);
+            return scene.objs[0].pos;
+        };
+        CHECK(std::fabs(fall(GravityPreset::Earth).y - 5.095f) < .001f);
+        CHECK(std::fabs(fall(GravityPreset::Moon).y - 9.19f) < .001f);
+        CHECK(std::fabs(fall(GravityPreset::Reverse).y - 14.905f) < .001f);
+        CHECK(std::fabs(fall(GravityPreset::Zero).y - 10.f) < .001f);
+        CHECK(fall(GravityPreset::Attract).x < 5.f && fall(GravityPreset::Repel).x > 5.f);
+
+        Scene ranged;
+        ranged.fps = 30;
+        auto ball = makeObject(ObjType::Sphere, 1);
+        ball.scl = V3(.5f);
+        ball.keys = {{0, {0, .5f, 0}, {}, ball.scl, Ease::Linear},
+                     {50, {10, .5f, 0}, {}, ball.scl, Ease::Linear}};
+        ranged.objs.push_back(ball);
+        ranged.applyFrame(10);
+        RigidSettings rolling;
+        rolling.time.startFrame = 10;
+        rolling.time.frames = 20;
+        rolling.time.velocity = {2, 0, 0};
+        applyRigidPreset(rolling, RigidPreset::Rubber);
+        std::string error;
+        CHECK(bakeRigidBodies(ranged, {0}, rolling, error));
+        CHECK(ranged.frame == 10);
+        ranged.applyFrame(9);
+        CHECK(std::fabs(ranged.objs[0].pos.x - 1.8f) < .001f);
+        ranged.applyFrame(29);
+        CHECK(std::fabs(ranged.objs[0].rot.z) > 10.f);
+        ranged.applyFrame(30);
+        CHECK(std::fabs(ranged.objs[0].pos.x - 6.f) < .001f);
+
+        Scene liquid;
+        auto source = makeObject(ObjType::Cube, 1);
+        source.pos = {0, 4, 0};
+        source.scl = V3(1);
+        liquid.objs.push_back(source);
+        LiquidSettings syrup;
+        applyLiquidPreset(syrup, LiquidPreset::Syrup);
+        CHECK(syrup.viscosity > .7f && syrup.cohesion > .5f);
+        syrup.time.frames = 4;
+        syrup.time.startFrame = 12;
+        syrup.time.detail = 2;
+        syrup.resolution = 8;
+        CHECK(bakeLiquid(liquid, 0, syrup, error) == 512);
+        if (liquid.objs.size() > 1) {
+            CHECK(liquid.frame == 12 && liquid.objs[1].mat.name == "Syrup");
+            liquid.applyFrame(11);
+            CHECK(!liquid.objs[0].hidden && liquid.objs[1].hidden && liquid.metaballs.empty());
+            liquid.applyFrame(12);
+            CHECK(liquid.objs[0].hidden && !liquid.objs[1].hidden && liquid.metaballs.size() == 1);
+            const char* path = "build/t/fine syrup.c3d";
+            CHECK(liquid.save(path));
+            Scene reopened;
+            CHECK(reopened.load(path) && reopened.objs.size() == liquid.objs.size());
+            if (reopened.objs.size() > 1) {
+                reopened.applyFrame(11);
+                CHECK(reopened.objs[1].hidden);
+                reopened.applyFrame(15);
+                CHECK(!reopened.objs[1].hidden && reopened.objs[1].pos.y < liquid.objs[1].pos.y);
+            }
+        }
+    }
+    printf("scene and terrain symmetry\n");
+    {
+        Scene scene;
+        Object parent = makeObject(ObjType::Disc, 1);
+        parent.pos = {5, 2, 3};
+        parent.rot = {10, 20, 30};
+        Object child = makeObject(ObjType::Terrain, 1);
+        child.pos = {7, 1, 4};
+        hfInit(*child.hf, 5);
+        Object locked = makeObject(ObjType::Disc, 2);
+        locked.locked = true;
+        scene.objs = {parent, child, locked};
+        scene.updateAll();
+        CHECK(scene.setParent(1, 0));
+        CHECK(scene.duplicateMirrored({0, 1, 1, 2}, 0, {2, 0, 0}) == 2);
+        if (scene.objs.size() == 5) {
+            CHECK(scene.objs[4].parent == 3 && scene.objs[4].hf != scene.objs[1].hf);
+            for (int i = 0; i < 2; ++i) {
+                V3 original = scene.objs[i].worldPos;
+                CHECK(length(scene.objs[3 + i].worldPos - V3(4 - original.x, original.y, original.z)) < 1e-4f);
+            }
+            auto parts = meshSelection(scene, {3}, 24);
+            CHECK(parts.size() == 1);
+            if (!parts.empty()) {
+                const Mesh& mesh = parts[0].mesh;
+                V3 a = mesh.v[mesh.tri[0]], b = mesh.v[mesh.tri[1]], c = mesh.v[mesh.tri[2]];
+                CHECK(dot(cross(b - a, c - a), scene.objs[3].nrm * V3(0, 1, 0)) > 0);
+            }
+            auto& heights = *scene.objs[4].hf;
+            heights.h[5] = .25f;
+            heights.h[9] = .75f;
+            hfMirrorX(heights, true);
+            CHECK(heights.at(4, 1) == .25f && scene.objs[1].hf->at(4, 1) == 0.f);
+            heights.h[9] = .75f;
+            heights.h[7] = .5f;
+            hfMirrorX(heights, false);
+            CHECK(heights.at(0, 1) == .75f && heights.at(2, 1) == .5f);
+            const char* path = "build/t/mirrored.c3d";
+            CHECK(scene.save(path));
+            Scene reopened;
+            CHECK(reopened.load(path) && reopened.objs.size() == 5);
+            if (reopened.objs.size() == 5) {
+                CHECK(reopened.objs[4].parent == 3);
+                CHECK(length(reopened.objs[4].worldPos - scene.objs[4].worldPos) < 1e-4f);
+            }
+        }
+    }
     printf("HDR lighting, terrain precision, and linked scatter\n");
     {
         const char* hdr = "build/t/parity fixture.hdr";

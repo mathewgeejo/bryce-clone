@@ -313,6 +313,18 @@ void Scene::updateAll() {
         booleanNodes[index].field = (int)field->second;
         metaballs[field->second].nested = true;
     }
+    for (auto& field : metaballs) {
+        auto include = [&](int i) {
+            V3 low, high;
+            if (!worldBounds(objs[i], low, high)) return;
+            auto& a = field.lower;
+            auto& b = field.upper;
+            a = {std::min(a.x, low.x), std::min(a.y, low.y), std::min(a.z, low.z)};
+            b = {std::max(b.x, high.x), std::max(b.y, high.y), std::max(b.z, high.z)};
+        };
+        for (int i : field.balls) if (!objs[i].metaNegative) include(i);
+        for (int i : field.operands) if (objs[i].boolMode == BoolMode::Positive) include(i);
+    }
     for (const auto& link : booleanLinks) {
         int child = nested[link.child];
         booleanNodes[nested[link.parent]].children.emplace_back(child, link.mode);
@@ -659,6 +671,16 @@ template <class K, class G> static V3 motion(const std::vector<K>& v, int a, int
     return v[a].ease == Ease::Spline ? spline(v, a, b, t, get) : lerp(get(v[a]), get(v[b]), easeTime(v[a].ease, t));
 }
 
+Key Object::transformAt(int frame) const {
+    int first, next;
+    float t;
+    if (!keySpan(keys, (float)frame, first, next, t)) return {frame, pos, rot, scl};
+    V3 scale = motion(keys, first, next, t, [](const Key& k) { return k.scl; });
+    return {frame, motion(keys, first, next, t, [](const Key& k) { return k.pos; }),
+            motion(keys, first, next, t, [](const Key& k) { return k.rot; }),
+            {std::max(scale.x, .01f), std::max(scale.y, .01f), std::max(scale.z, .01f)}, keys[first].ease};
+}
+
 AppearanceKey Object::appearance(int f) const {
     AppearanceKey key{f, mat, picture, terrain, lightColor, {lightPower, spotAngle, spotSoft, lightSize}, hidden};
     if (isLight(type)) key.lighting = lighting;
@@ -712,11 +734,11 @@ void Scene::applyFrame(int f) {
     int i0, i1;
     float t;
     for (Object& o : objs) {
-        if (keySpan(o.keys, (float)f, i0, i1, t)) {
-            o.pos = motion(o.keys, i0, i1, t, [](const Key& k) { return k.pos; });
-            o.rot = motion(o.keys, i0, i1, t, [](const Key& k) { return k.rot; });
-            o.scl = motion(o.keys, i0, i1, t, [](const Key& k) { return k.scl; });
-            o.scl = V3(std::max(o.scl.x, 0.01f), std::max(o.scl.y, 0.01f), std::max(o.scl.z, 0.01f));
+        if (!o.keys.empty()) {
+            Key pose = o.transformAt(f);
+            o.pos = pose.pos;
+            o.rot = pose.rot;
+            o.scl = pose.scl;
         }
         if (keySpan(o.appearances, (float)f, i0, i1, t)) blendAppearance(o, o.appearances[i0], o.appearances[i1], t);
     }
@@ -1181,6 +1203,8 @@ static bool fieldCrossing(const std::vector<FieldRay>& parts, double a, double b
 }
 
 static bool intersectMetaballs(const Scene& s, const MetaballGroup& g, const Ray& r, float tmax, Hit& h, int skip) {
+    float near = EPS, far = tmax;
+    if (g.lower.x > g.upper.x || !boxSpan(g.lower, g.upper, r.o, r.d, near, far)) return false;
     for (int i : g.balls) if (i == skip) return false;
     for (int i : g.operands) if (i == skip) return false;
     if (g.balls.size() == 1 && g.operands.empty()) {
@@ -2650,6 +2674,8 @@ Mesh meshSurface(const Object& o) {
         m.tri = {0, 1, 2, 2, 1, 3};
     }
     for (V3& p : m.v) p = o.worldPos + o.fwd * p;
+    if (dot(cross(o.fwd.col(0), o.fwd.col(1)), o.fwd.col(2)) < 0.f)
+        for (size_t i = 0; i + 2 < m.tri.size(); i += 3) std::swap(m.tri[i + 1], m.tri[i + 2]);
     return m;
 }
 

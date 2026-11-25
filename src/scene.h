@@ -212,6 +212,7 @@ struct Object {
     bool csg = false;
     void update(const Camera* camera = nullptr, const Object* ancestor = nullptr);
     void moveWorld(V3 delta) { pos += parentInv * delta; }
+    Key transformAt(int frame) const;
     float rawTerrainAt(int x, int z) const;
     float terrainAt(int x, int z) const {
         float value = rawTerrainAt(x, z);
@@ -271,6 +272,7 @@ struct Hit {
 
 struct MetaballGroup {
     std::vector<int> balls, operands;
+    V3 lower{1e30f}, upper{-1e30f};
     bool nested = false;
 };
 

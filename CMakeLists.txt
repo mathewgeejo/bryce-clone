@@ -12,6 +12,7 @@ add_library(canyon_core STATIC
     src/presets.cpp
     src/render.cpp
     src/scene.cpp
+    src/simulation.cpp
     src/terrain.cpp
     src/vmath.cpp
 )

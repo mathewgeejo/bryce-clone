@@ -1,5 +1,28 @@
 # Implementation log
 
+## Simulation presets and animation clips
+
+- Added Water, Oil, Syrup, and Lava with distinct materials and flow settings. Added a 512-particle detail mode and faster liquid neighbor searches.
+- Added rigid-body materials, stronger collision detail settings, planetary gravity, custom direction, zero and reverse gravity, and adjustable radial attraction and repulsion.
+- Added starter objects, background baking, baking from the current frame, and a one-click playback preview that ends at the last baked frame.
+- Preserved surrounding rigid-body animation keys and delayed liquid visibility until the chosen start frame. Improved rolling orientation and elapsed-time playback.
+- Extended the agent recipe schema to expose presets, clip timing, gravity fields, and tuning.
+- Passed the Windows core and MCP checks, plus Linux-target C++17 syntax checks. Verified a 512-particle desktop bake from frame 18 through 37 and rendered a saved clip before, at, and after its start.
+
+## Physics and liquid simulation
+
+- Added a rigid-body solver with gravity, sphere and box contacts, terrain collision, bounce, friction, and rolling spheres.
+- Added a particle liquid solver with adjustable viscosity and a ray-traced metaball surface. Added group bounds to skip liquid intersection work on rays that miss the volume.
+- Added **Edit → Simulation** and recipe operations for both solvers. Each bake produces editable animation keys, supports scene undo and save, and works with timeline playback and animation rendering.
+- Passed the Windows core suite, desktop bake checks, MCP composition, and Linux-target C++17 syntax checks. Rendered distinct first and later frames from a saved simulation scene.
+
+## Viewport transforms and symmetry
+
+- Added axis constraints, automatic Move axis locking, grid and surface snapping, precision dragging, and cancellable Move, Rotate, and Scale gestures.
+- Added five pivot choices, a placeable 3D cursor, and selection centering and grid alignment commands.
+- Added mirrored object duplicates around the chosen pivot, corrected mirrored mesh export winding, and added bidirectional terrain symmetry with local undo.
+- Passed the Windows core suite, desktop input checks for snapping, cancellation, mirroring and centering, and Linux-target C++17 syntax checks.
+
 ## Agent authoring and priority 9 and 8 work
 
 - Added scene recipes, a discoverable catalog, scene inspection, and rendering through both a Python CLI and local MCP. Added an editable example recipe and an integration smoke test.

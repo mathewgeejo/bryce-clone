@@ -8,6 +8,7 @@
 #include <string_view>
 
 #include "terrain.h"
+#include "simulation.h"
 
 namespace {
 
@@ -48,6 +49,42 @@ bool camera(std::istream& input, Camera& c) {
     c.lookAt = -1;
     return vec(input, c.target) && scalar(input, c.yaw, -360, 360) && scalar(input, c.pitch, -89.9f, 89.9f)
         && scalar(input, c.dist, .1f, 100000) && scalar(input, c.fov, 5, 150);
+}
+
+bool flag(std::istream& in, bool& enabled) {
+    int value;
+    if (!(in >> value) || (value != 0 && value != 1)) return false;
+    enabled = value != 0;
+    return true;
+}
+
+bool simulationTime(std::istream& in, SimulationSettings& settings) {
+    return in >> settings.frames && scalar(in, settings.gravity, 0, 50)
+        && vec(in, settings.velocity) && flag(in, settings.floor);
+}
+
+bool presetNumber(std::istream& in, float& value, float min, float max) {
+    float overrideValue;
+    if (!(in >> overrideValue)) return false;
+    if (overrideValue == -1) return true;
+    if (overrideValue < min || overrideValue > max) return false;
+    value = overrideValue;
+    return true;
+}
+
+bool simulationControls(std::istream& in, SimulationSettings& time) {
+    std::string preset;
+    if (!name(in, preset)) return false;
+    int index = namedEnum(preset, gravityPresetName);
+    if (index < 0) return false;
+    applyGravityPreset(time, (GravityPreset)index);
+    int floor;
+    if (!(in >> time.frames >> time.startFrame >> time.detail) ||
+        !presetNumber(in, time.gravity, 0, 50) || !vec(in, time.velocity) ||
+        !(in >> floor) || floor < -1 || floor > 1 || !vec(in, time.direction) ||
+        !vec(in, time.center) || !scalar(in, time.radius, .1f, 1000)) return false;
+    if (floor >= 0) time.floor = floor != 0;
+    return true;
 }
 
 int objectIndex(const Scene& s, std::istream& input) {
@@ -104,6 +141,28 @@ bool apply(Scene& s, const std::string& op, std::istream& in, bool first) {
         putKey(s.camKeys, k);
         return true;
     }
+    if (op == "rigid_bake" || op == "rigid_bake_v2") {
+        RigidSettings settings;
+        if (op == "rigid_bake_v2") {
+            if (!simulationControls(in, settings.time) || !name(in, key)) return false;
+            int preset = namedEnum(key, rigidPresetName);
+            if (preset < 0) return false;
+            applyRigidPreset(settings, (RigidPreset)preset);
+            if (!presetNumber(in, settings.bounce, 0, 1) || !presetNumber(in, settings.friction, 0, 1) ||
+                !presetNumber(in, settings.damping, 0, 5)) return false;
+        } else if (!simulationTime(in, settings.time) || !scalar(in, settings.bounce, 0, 1) ||
+                   !scalar(in, settings.friction, 0, 1)) return false;
+        std::vector<int> selection;
+        while ((in >> std::ws) && !in.eof()) {
+            int index = objectIndex(s, in);
+            if (index < 0 || selection.size() >= SIM_MAX_BODIES) return false;
+            selection.push_back(index);
+        }
+        std::string error;
+        bool baked = bakeRigidBodies(s, selection, settings, error);
+        if (!baked) std::fprintf(stderr, "%s\n", error.c_str());
+        return baked;
+    }
     if (op == "object" || op == "terrain" || op == "tree" || op == "mesh" || op == "picture") {
         if (!name(in, key) || s.objs.size() >= 20000) return false;
         for (const auto& obj : s.objs)
@@ -158,6 +217,23 @@ bool apply(Scene& s, const std::string& op, std::istream& in, bool first) {
     int index = objectIndex(s, in);
     if (index < 0) return false;
     Object& obj = s.objs[index];
+    if (op == "liquid_bake" || op == "liquid_bake_v2") {
+        LiquidSettings settings;
+        if (op == "liquid_bake_v2") {
+            if (!simulationControls(in, settings.time) || !name(in, key)) return false;
+            int preset = namedEnum(key, liquidPresetName);
+            if (preset < 0) return false;
+            applyLiquidPreset(settings, (LiquidPreset)preset);
+            if (!(in >> settings.resolution) || !presetNumber(in, settings.viscosity, 0, 1) ||
+                !presetNumber(in, settings.cohesion, 0, 1) || !presetNumber(in, settings.surface, .8f, 1.3f) ||
+                !flag(in, settings.hideSource)) return false;
+        } else if (!simulationTime(in, settings.time) || !(in >> settings.resolution) ||
+                   !scalar(in, settings.viscosity, 0, 1) || !flag(in, settings.hideSource)) return false;
+        std::string error;
+        int particles = bakeLiquid(s, index, settings, error);
+        if (!particles) std::fprintf(stderr, "%s\n", error.c_str());
+        return particles > 0;
+    }
     if (op == "transform") return transform(in, obj.pos, obj.rot, obj.scl);
     if (op == "color") return color(in, obj.mat.color1);
     if (op == "heightmap" || op == "terrain_key") {

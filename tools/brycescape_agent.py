@@ -56,6 +56,23 @@ CAMERA = {
 SEED = optional(number(0, 2147483647, True), 1)
 FRAME = number(0, 99999, True)
 DIMENSION = number(1, 8192, True)
+SIMULATION = {
+    "frames": optional(number(2, 240, True), 60),
+    "gravity": optional(number(0, 50), 9.81),
+    "velocity": optional(vector(-50, 50), [0, 0, 0]),
+    "floor": optional({"type": "boolean"}, True),
+}
+GRAVITY_PRESETS = ["Earth", "Moon", "Mars", "Jupiter", "Zero G", "Reverse", "Attract", "Repel"]
+ADVANCED_SIMULATION = {
+    "gravity_preset": optional({"type": "string", "enum": GRAVITY_PRESETS, "minLength": 1, "maxLength": 32}, "Earth"),
+    "start_frame": optional(FRAME, 0),
+    "detail": optional(number(0, 2, True), 1),
+    "direction": optional(vector(-100, 100), [0, -1, 0]),
+    "center": optional(vector(), [0, 0, 0]),
+    "radius": optional(number(.1, 1000), 5),
+}
+RIGID_PRESETS = {"type": "string", "enum": ["Balanced", "Rubber", "Steel", "Ice", "Wood"], "minLength": 1, "maxLength": 32}
+LIQUID_PRESETS = {"type": "string", "enum": ["Water", "Oil", "Syrup", "Lava"], "minLength": 1, "maxLength": 32}
 OPS = {
     "base": {"path": ASSET},
     "example": {"index": number(0, 10000, True)},
@@ -87,6 +104,15 @@ OPS = {
     "light": {"name": NAME, "rgb": vector(0, 1), "power": number(0, 1000)},
     "key": {"name": NAME, "frame": FRAME, **KEY_TRANSFORM},
     "parent": {"name": NAME, "parent": NAME},
+    "rigid_bake": {**SIMULATION, **ADVANCED_SIMULATION, "preset": optional(RIGID_PRESETS, "Balanced"),
+                   "bounce": optional(number(0, 1), .35),
+                   "friction": optional(number(0, 1), .45),
+                   "damping": optional(number(0, 5), 0),
+                   "names": {"type": "array", "items": NAME, "minItems": 1, "maxItems": 96}},
+    "liquid_bake": {"name": NAME, **SIMULATION, **ADVANCED_SIMULATION, "preset": optional(LIQUID_PRESETS, "Water"),
+                    "resolution": optional(number(2, 8, True), 4), "viscosity": optional(number(0, 1), .08),
+                    "cohesion": optional(number(0, 1), 0), "surface": optional(number(.8, 1.3), 1),
+                    "hide_source": optional({"type": "boolean"}, True)},
     "scatter": {"surface": NAME, "source": NAME, "count": number(1, 10000, True), "seed": SEED,
                 "min": vector(), "max": vector()},
 }
@@ -116,6 +142,8 @@ def validate(value, schema, label):
         if (not isinstance(value, str) or not schema["minLength"] <= len(value.encode("utf-8")) <= schema["maxLength"]
                 or any(ord(c) < 32 for c in value)):
             raise ValueError(f"{label} must be a nonempty string without control characters")
+        if "enum" in schema and value not in schema["enum"]:
+            raise ValueError(f"{label} must be one of {', '.join(schema['enum'])}")
     elif kind == "array":
         if not isinstance(value, list) or not schema.get("minItems", 0) <= len(value) <= schema["maxItems"]:
             raise ValueError(f"{label} has the wrong number of items")
@@ -130,11 +158,27 @@ def validate(value, schema, label):
 
 
 def encode(value):
+    if isinstance(value, bool):
+        return "1" if value else "0"
     if isinstance(value, list):
         return " ".join(map(encode, value))
     if isinstance(value, str):
         return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
     return str(value)
+
+
+def encode_simulation(op, values, command):
+    def override(key):
+        return values[key] if key in command else -1
+
+    preset = values["gravity_preset"]
+    direction = values["direction"] if "direction" in command else [0, 1 if preset == "Reverse" else -1, 0]
+    settings = [preset, values["frames"], values["start_frame"], values["detail"], override("gravity"),
+                values["velocity"], override("floor"), direction, values["center"], values["radius"], values["preset"]]
+    if op == "rigid_bake":
+        return settings + [override("bounce"), override("friction"), override("damping"), values["names"]]
+    return [values["name"]] + settings + [values["resolution"], override("viscosity"), override("cohesion"),
+                                          override("surface"), values["hide_source"]]
 
 
 class Studio:
@@ -187,7 +231,10 @@ class Studio:
                 suffixes = {"base": (".c3d",), "mesh": (".obj",), "environment": (".hdr", ".rgbe", ".pic")}
                 values["path"] = str(self.path(values["path"], suffixes.get(op, ())))
             del values["op"]
-            lines.append(op + " " + " ".join(map(encode, values.values())))
+            if op in ("rigid_bake", "liquid_bake"):
+                lines.append(op + "_v2 " + " ".join(map(encode, encode_simulation(op, values, command))))
+            else:
+                lines.append(op + " " + " ".join(map(encode, values.values())))
         with tempfile.TemporaryDirectory() as temp:
             recipe = Path(temp) / "scene.recipe"
             recipe.write_text("\n".join(lines) + "\n", encoding="utf-8")
