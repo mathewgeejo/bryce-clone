@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "desktop.h"
+#include "agent.h"
 #include "render.h"
 #include "scene.h"
 #include "terrain.h"
@@ -60,7 +61,7 @@ float gPreviewScale = 0.45f;
 std::string gHoverTip, gLastTip;
 uint64_t gTipSince = 0;
 Renderer gMainR, gNanoR, gLabR, gViewR;
-enum Lab { LabNone, LabMat, LabSky, LabTerrain, LabTree, LabRender, LabTools, LabExamples, LabObject, LabAttributes, LabDxf, LabMotion, LabAssets, LabCameras, LabCommands, LabScatter } gLab = LabNone;
+enum Lab { LabNone, LabMat, LabSky, LabTerrain, LabTree, LabRender, LabTools, LabExamples, LabObject, LabAttributes, LabDxf, LabMotion, LabAssets, LabCameras, LabCommands, LabScatter, LabTransform } gLab = LabNone;
 Scene gLabBackup;
 bool gLabChanged = false, gNanoDirty = true, gLabDirty = false, gMainWasBusy = false;
 uint64_t gLastChange = 0, gRenderStart = 0;
@@ -77,7 +78,29 @@ uint32_t gSeed = 100;
 float gBrushSize = 0.06f, gBrushStr = 0.5f, gRough = 0.5f, gTerraces = 6;
 BrushMode gBrush = BrushMode::Raise;
 enum Drag { DragNone, DragObj, DragCam, DragSculpt, DragLightAim, DragScatter } gDrag = DragNone;
+enum class Pivot { Median, Bounds, Active, World, Cursor };
+enum class Snap { Off, Grid, Surface };
+Pivot gPivotMode = Pivot::Median;
+Snap gSnapMode = Snap::Off;
+V3 gCursor;
+bool gCursorVisible = false, gAutoAxis = false;
+int gTransformAxis = -1, gMirrorAxis = 0;
+float gGridStep = 1.f, gAngleStep = 15.f;
+struct TransformObject {
+    int index;
+    V3 position, rotation, scale, world;
+    M3 worldToLocal;
+};
+struct TransformDrag {
+    std::vector<TransformObject> objects;
+    std::unique_ptr<Scene> surfaces;
+    V3 pivot, bottom;
+    ViewBasis view;
+    float dx = 0, dy = 0, unitsPerPixel = 1;
+    int autoAxis = -1;
+} gTransform;
 bool gScatter = false, gScatterAlign = true;
+bool gScatterPalette = false, gScatterErase = false;
 int gScatterSeed = 1, gScatterDab = 0, gScatterX = 0, gScatterY = 0;
 float gScatterRadius = 46, gScatterDensity = 8, gScatterMin = .6f, gScatterMax = 1.4f, gScatterYaw = 360;
 const int TOOL_SCULPT = 3;
@@ -96,6 +119,7 @@ std::string gEditBuf;
 int gQuickCat = 0, gSkyCat = 0, gMatCat = 0, gLabSkyCat = 0;
 bool gMatLayers = false;
 int gLayerIndex = 0;
+int gTerrainBakeLayer = -1;
 Library gLib;
 std::vector<Library> gLibraryUndo, gLibraryRedo;
 std::string gLibPath;
@@ -104,6 +128,7 @@ std::string gDxfPath;
 float gDxfScale = 1;
 bool gDxfZUp = true, gDxfLayers = true;
 bool gAppearanceTrack = false;
+bool gTerrainTrack = false;
 int gMotionKey = 0;
 int gTerrainSeed = 77, gTerrainOctaves = 7;
 float gTerrainFrequency = 4, gErosionDensity = 1;
@@ -220,9 +245,9 @@ bool button(R r, const char* text, bool on = false, Font f = gFont) {
             {"Group", "Ctrl+G groups the selection. Alt-click selects an individual group member."},
             {"Ungroup", "Ctrl+U ungroups the selection."},
             {"Wire", "Wireframe displays object edges. Try Depth Wire for distant objects."},
-            {"Move", "Drag to move in the view plane. Hold Ctrl to move vertically."},
-            {"Rotate", "Drag to rotate. Hold Shift to roll around the object's Z axis."},
-            {"Resize", "Drag to scale evenly. Hold Shift to change only the Y axis."},
+            {"Move", "G selects Move. Press X, Y, or Z to constrain the drag."},
+            {"Rotate", "R selects Rotate. Press X, Y, or Z for single-axis rotation."},
+            {"Resize", "S selects Scale. Press X, Y, or Z for single-axis scaling."},
             {"Sculpt", "[ and ] resize the brush. Ctrl lowers height and Shift smooths."},
             {"Key", "Ctrl+K records a transform key for the selection or camera."},
             {"Frame Sel", "F frames the selection. With no selection, it frames the scene."},
@@ -512,6 +537,70 @@ bool sceneBounds(bool selected, V3& lo, V3& hi) {
         hi = {std::max(hi.x, b.x), std::max(hi.y, b.y), std::max(hi.z, b.z)};
     }
     return any;
+}
+
+V3 axisVector(int axis) { return {axis == 0 ? 1.f : 0.f, axis == 1 ? 1.f : 0.f, axis == 2 ? 1.f : 0.f}; }
+
+std::vector<int> transformRoots() {
+    std::vector<int> roots;
+    for (int i : gSelSet) {
+        const auto& obj = gScene.objs[i];
+        if (obj.locked || obj.hidden) continue;
+        int parent = obj.parent;
+        while (parent >= 0 && (!isSel(parent) || gScene.objs[parent].locked || gScene.objs[parent].hidden))
+            parent = gScene.objs[parent].parent;
+        if (parent < 0) roots.push_back(i);
+    }
+    return roots;
+}
+
+V3 selectionPivot(Pivot mode, const std::vector<int>& roots) {
+    if (mode == Pivot::World) return {};
+    if (mode == Pivot::Cursor) return gCursor;
+    if (mode == Pivot::Active && validSel()) return gScene.objs[gSel].worldPos;
+    if (mode == Pivot::Bounds) {
+        V3 low, high;
+        if (sceneBounds(true, low, high)) return (low + high) * .5f;
+    }
+    V3 p;
+    for (int i : roots) p += gScene.objs[i].worldPos;
+    return roots.empty() ? p : p / (float)roots.size();
+}
+
+float snapValue(float value, float step) { return std::round(value / step) * step; }
+
+V3 snapPoint(V3 p, float step) {
+    return {snapValue(p.x, step), snapValue(p.y, step), snapValue(p.z, step)};
+}
+
+enum class Placement { Grid, Origin, Cursor };
+
+void placeSelection(Placement target) {
+    auto roots = transformRoots();
+    if (roots.empty()) { gStatus = "Select an unlocked object to place."; return; }
+    V3 center = selectionPivot(target == Placement::Grid ? Pivot::Median : Pivot::Bounds, roots);
+    V3 destination;
+    if (target == Placement::Grid) destination = snapPoint(center, gGridStep);
+    else if (target == Placement::Cursor) destination = gCursor;
+    V3 delta = destination - center;
+    if (length(delta) < 1e-6f) return;
+    for (int i : roots) gScene.objs[i].moveWorld(delta);
+    sceneChanged();
+    if (target == Placement::Grid) gStatus = "Snapped the selection center to the grid.";
+    else if (target == Placement::Cursor) gStatus = "Centered the selection at the 3D cursor.";
+    else gStatus = "Centered the selection at the world origin.";
+}
+
+void mirrorSelection() {
+    auto roots = transformRoots();
+    int start = (int)gScene.objs.size();
+    int count = gScene.duplicateMirrored(gSelSet, gMirrorAxis, selectionPivot(gPivotMode, roots));
+    if (!count) { gStatus = "Select an unlocked object to mirror."; return; }
+    gSelSet.clear();
+    for (int i = start; i < start + count; ++i) gSelSet.push_back(i);
+    gSel = start;
+    sceneChanged();
+    gStatus = "Created " + std::to_string(count) + " mirrored objects.";
 }
 
 void frameView(bool selection) {
@@ -1420,7 +1509,8 @@ void drawTop() {
         textIn({136, 64, 92, 24}, cats[gQuickCat].c_str(), rgb(255, 255, 255), gBold);
         if (button({230, 64, 22, 24}, ">")) gQuickCat++;
         if (button({260, 64, 58, 24}, "Assets")) openLab(LabAssets);
-        int qx = 324;
+        if (button({324, 64, 96, 24}, "Transform...")) openLab(LabTransform);
+        int qx = 426;
         for (auto& m : materialPresets()) {
             if (m.category != cats[gQuickCat]) continue;
             if (qx + 92 > gW - 10) break;
@@ -1757,44 +1847,118 @@ void sculptStep() {
     sceneChanged();
 }
 
+Ray viewportRay(const ViewBasis& view, int x, int y) {
+    float half = gVP.h * .5f;
+    return view.ray((x - gVP.x - gVP.w * .5f) / half, (gVP.y + half - y) / half);
+}
+
+void beginObjectDrag() {
+    gDrag = DragObj;
+    gTransform = {};
+    auto roots = transformRoots();
+    if (roots.empty()) { gStatus = "The selection is locked."; return; }
+    gPlaying = false;
+    gTransform.pivot = selectionPivot(gPivotMode, roots);
+    gTransform.bottom = gTransform.pivot;
+    gTransform.view = curBasis();
+    const auto& view = gTransform.view;
+    float depth = view.ortho ? 1.f : std::max(.5f, view.toCam(gScene.objs[gSel].worldPos).z);
+    gTransform.unitsPerPixel = depth * view.k / (gVP.h * .5f);
+    std::vector<bool> moving(gScene.objs.size(), false);
+    for (int i : roots) {
+        const auto& obj = gScene.objs[i];
+        gTransform.objects.push_back({i, obj.pos, obj.rot, obj.scl, obj.worldPos, obj.parentInv});
+        moving[i] = true;
+    }
+    if (gTool != 0 || gSnapMode != Snap::Surface) return;
+    gTransform.surfaces = std::make_unique<Scene>(gScene);
+    bool bounded = false;
+    for (int i = 0; i < (int)gScene.objs.size(); ++i) {
+        for (int parent = gScene.objs[i].parent; !moving[i] && parent >= 0; parent = gScene.objs[parent].parent)
+            if (moving[parent]) moving[i] = true;
+        if (!moving[i]) continue;
+        gTransform.surfaces->objs[i].hidden = true;
+        V3 low, high;
+        if (!gScene.objs[i].hidden && !isLight(gScene.objs[i].type) && worldBounds(gScene.objs[i], low, high)) {
+            gTransform.bottom.y = bounded ? std::min(gTransform.bottom.y, low.y) : low.y;
+            bounded = true;
+        }
+    }
+    gTransform.surfaces->updateAll();
+}
+
 void dragObject() {
-    ViewBasis vb = curBasis();
-    float hh = gVP.h * 0.5f, dx = (float)gIn.dx, dy = (float)gIn.dy;
-    std::vector<int> s;
-    for (int i : gSelSet) {
-        if (gScene.objs[i].locked) continue;
-        int parent = gScene.objs[i].parent;
-        while (parent >= 0 && (!isSel(parent) || gScene.objs[parent].locked)) parent = gScene.objs[parent].parent;
-        if (parent < 0) s.push_back(i);
+    auto& drag = gTransform;
+    if (drag.objects.empty()) return;
+    float precision = gIn.shift ? .1f : 1.f;
+    drag.dx += gIn.dx * precision;
+    drag.dy += gIn.dy * precision;
+    const auto& view = drag.view;
+    V3 screenDelta = view.r * drag.dx - view.u * drag.dy;
+    if (gTool == 0 && gAutoAxis && gTransformAxis < 0 && drag.autoAxis < 0 && length(screenDelta) >= 8.f) {
+        float best = 0;
+        for (int axis = 0; axis < 3; ++axis) {
+            V3 unit = axisVector(axis);
+            float projected = std::hypot(dot(unit, view.r), dot(unit, view.u));
+            if (projected < .15f) continue;
+            float score = std::fabs(dot(screenDelta, unit)) / projected;
+            if (score > best) { best = score; drag.autoAxis = axis; }
+        }
     }
-    if (s.empty()) { gStatus = "The selection is locked."; return; }
-    V3 c(0.f);
-    for (int i : s) c += gScene.objs[i].worldPos;
-    c = c / (float)s.size();
+    int axis = gTransformAxis >= 0 ? gTransformAxis : (gTool == 0 && gAutoAxis ? drag.autoAxis : -1);
+    V3 unit = axisVector(axis);
+    bool grid = gSnapMode == Snap::Grid || (gIn.ctrl && gSnapMode == Snap::Off);
+    V3 move, angles, factors(1.f);
+    M3 orbit;
     if (gTool == 0) {
-        float wpp = (vb.ortho ? 1.f : std::max(0.5f, vb.toCam(gScene.objs[gSel].worldPos).z)) * vb.k / hh;
-        V3 d = gIn.ctrl ? V3(0, -dy * wpp, 0) : (vb.r * dx - vb.u * dy) * wpp;
-        for (int i : s) gScene.objs[i].moveWorld(d);
+        move = screenDelta * drag.unitsPerPixel;
+        if (axis >= 0) {
+            float projected = 1 - std::pow(dot(unit, view.f), 2.f);
+            move = unit * (projected > .025f ? dot(move, unit) / projected : -drag.dy * drag.unitsPerPixel);
+        }
+        if (drag.surfaces && gVP.in(gIn.mx, gIn.my) && (drag.dx || drag.dy)) {
+            Hit hit;
+            if (intersectScene(*drag.surfaces, viewportRay(view, gIn.mx, gIn.my), 1e30f, hit))
+                move = hit.p - drag.bottom;
+        }
+        if (grid && length(move) > 1e-6f) {
+            V3 snapped = snapPoint(drag.pivot + move, gGridStep) - drag.pivot;
+            move = snapped * V3(std::fabs(move.x) > 1e-6f ? 1.f : 0.f,
+                                std::fabs(move.y) > 1e-6f ? 1.f : 0.f,
+                                std::fabs(move.z) > 1e-6f ? 1.f : 0.f);
+        }
+        if (axis >= 0) move = unit * dot(move, unit);
     } else if (gTool == 1) {
-        float yaw = gIn.shift ? 0 : dx * 0.5f;
-        M3 ry = rotY(rad(yaw));
-        for (int i : s) {
-            Object& o = gScene.objs[i];
-            if (gIn.shift || (o.type == ObjType::Picture && o.picture.billboard)) o.rot.z += dx * 0.5f;
-            else { o.rot.y += yaw; o.rot.x += dy * 0.5f; }
-            if (s.size() > 1) o.moveWorld(c + ry * (o.worldPos - c) - o.worldPos);
-        }
+        angles = axis < 0 ? V3(drag.dy * .5f, drag.dx * .5f, 0) :
+                 unit * ((axis == 0 ? drag.dy : drag.dx) * .5f);
+        if (grid) angles = snapPoint(angles, gAngleStep);
+        orbit = rotY(rad(angles.y)) * rotX(rad(angles.x)) * rotZ(rad(angles.z));
     } else {
-        float f = std::exp(-dy * 0.01f + dx * 0.005f);
-        for (int i : s) {
-            Object& o = gScene.objs[i];
-            if (isLight(o.type)) continue;
-            if (gIn.shift) o.scl.y = std::max(0.01f, o.scl.y * f);
-            else o.scl = V3(std::max(0.01f, o.scl.x * f), std::max(0.01f, o.scl.y * f), std::max(0.01f, o.scl.z * f));
-            if (s.size() > 1) o.moveWorld(c + (o.worldPos - c) * f - o.worldPos);
-        }
+        float scale = std::exp(clampf(-drag.dy * .01f + drag.dx * .005f, -4.6f, 6.9f));
+        if (grid) scale = std::max(.1f, snapValue(scale, .1f));
+        factors = axis < 0 ? V3(scale) : V3(1.f) + unit * (scale - 1);
     }
-    sceneChanged();
+    bool changed = false;
+    for (const auto& start : drag.objects) {
+        auto& obj = gScene.objs[start.index];
+        V3 offset = start.world - drag.pivot;
+        V3 delta = move, rotation = start.rotation, scale = start.scale;
+        if (gTool == 1) {
+            delta = orbit * offset - offset;
+            if (obj.type == ObjType::Picture && obj.picture.billboard && axis < 0) rotation.z += angles.y;
+            else rotation += angles;
+        } else if (gTool == 2 && !isLight(obj.type)) {
+            delta = offset * factors - offset;
+            scale = scale * factors;
+        }
+        V3 position = start.position + start.worldToLocal * delta;
+        changed |= length(position - obj.pos) > 1e-6f || length(rotation - obj.rot) > 1e-6f ||
+                   length(scale - obj.scl) > 1e-6f;
+        obj.pos = position;
+        obj.rot = rotation;
+        obj.scl = scale;
+    }
+    if (changed) sceneChanged();
 }
 
 V3 lightAimTip(const Object& o) { return o.worldPos + o.lightAxis() * (o.type == ObjType::Spotlight ? 4.f : 5.f); }
@@ -2074,6 +2238,7 @@ void drawViewport() {
     }
     if (gActive == VIEW_ID && gIn.down && gDrag == DragScatter && overCanvas &&
         (gIn.pressed || std::hypot((float)(gIn.mx - gScatterX), (float)(gIn.my - gScatterY)) >= gScatterRadius * .45f)) {
+        if (!validSel()) { gStatus = "Select a receiving surface."; return; }
         gScatterX = gIn.mx;
         gScatterY = gIn.my;
         ViewBasis view = curBasis();
@@ -2086,11 +2251,60 @@ void drawViewport() {
             float x = gIn.mx + radius * std::cos(angle), y = gIn.my + radius * std::sin(angle);
             if (vp.in((int)x, (int)y)) rays.push_back(view.ray((x - cx) / half, (cy - y) / half));
         }
-        int made = gScene.scatter(sortedSel(), gSel, rays, std::min(gScatterMin, gScatterMax), std::max(gScatterMin, gScatterMax),
-                                  gScatterYaw, gScatterAlign, rng);
-        if (made) sceneChanged();
-        gStatus = made ? "Painted " + std::to_string(made) + " instances. Press Esc to stop painting." :
-                        "No instances placed. Select source objects, then Shift-click the receiving surface last.";
+        if (gScatterErase || gIn.shift) {
+            std::vector<int> keep;
+            std::set<int> groups;
+            std::vector<bool> erase(gScene.objs.size());
+            for (size_t i = 0; i < gScene.objs.size(); ++i) {
+                const auto& obj = gScene.objs[i];
+                if (obj.instanceSource < 0 || obj.parent != gSel || obj.locked || isSel((int)i)) continue;
+                V3 p = view.toCam(obj.worldPos);
+                if (!view.ortho && p.z <= 0) continue;
+                float scale = half / (view.k * (view.ortho ? 1 : p.z));
+                if (std::hypot(cx + p.x * scale - gIn.mx, cy - p.y * scale - gIn.my) <= gScatterRadius) {
+                    erase[i] = true;
+                    if (obj.group > 0) groups.insert(obj.group);
+                }
+            }
+            std::vector<int> remap(erase.size(), -1);
+            for (size_t i = 0; i < erase.size(); ++i) {
+                const auto& obj = gScene.objs[i];
+                if (erase[i] || (obj.instanceSource >= 0 && obj.parent == gSel && !obj.locked &&
+                                 !isSel((int)i) && groups.count(obj.group))) continue;
+                remap[i] = (int)keep.size();
+                keep.push_back((int)i);
+            }
+            if (keep.size() != erase.size()) {
+                gScene = gScene.subset(keep);
+                gSel = remap[gSel];
+                for (int& i : gSelSet) i = remap[i];
+                sceneChanged();
+            }
+            gStatus = "Erased " + std::to_string(erase.size() - keep.size()) + " scatter instances.";
+        } else {
+            auto paint = [&](const auto& sources, const auto& sampleRays) {
+                return gScene.scatter(sources, gSel, sampleRays, std::min(gScatterMin, gScatterMax),
+                                      std::max(gScatterMin, gScatterMax), gScatterYaw, gScatterAlign, rng);
+            };
+            int made = 0;
+            if (gScatterPalette) {
+                std::map<int, std::vector<int>> species;
+                for (int i : sortedSel()) if (i != gSel) {
+                    int group = gScene.objs[i].group;
+                    species[group > 0 ? group : -i - 1].push_back(i);
+                }
+                std::vector<std::vector<Ray>> samples(species.size());
+                if (!samples.empty()) for (const Ray& ray : rays) samples[rng.u() % samples.size()].push_back(ray);
+                size_t i = 0;
+                for (const auto& entry : species) {
+                    if (!samples[i].empty()) made += paint(entry.second, samples[i]);
+                    ++i;
+                }
+            } else made = paint(sortedSel(), rays);
+            if (made) sceneChanged();
+            gStatus = made ? "Painted " + std::to_string(made) + " instances. Shift erases. Esc stops." :
+                            "No instances placed. Select sources, then Shift-click the receiving surface last.";
+        }
     } else if (gActive == VIEW_ID && gIn.down && gDrag == DragSculpt && (gIn.dx || gIn.dy)) {
         SculptHit sh = sculptPick(gIn.mx, gIn.my);
         if (sh.obj == gSculpt.obj) gSculpt = sh;
@@ -2221,18 +2435,57 @@ void drawDxfLab() {
 
 void drawMotionLab() {
     Object* object = validSel() ? &gScene.objs[gSel] : nullptr;
-    R p = panel(548, 384, std::string("Motion Editor  -  ") + (object ? object->name : "Camera"));
+    R p = panel(548, 416, std::string("Motion Editor  -  ") + (object ? object->name : "Camera"));
     int x = p.x + 16, y = p.y + 48, w = p.w - 32;
     int frame = gScene.frame;
     if (sliderI({x, y, w, 24}, "Frame", frame, 0, gScene.frames - 1)) setFrame(frame);
     y += 32;
-    if (object && toggle({x, y, 174, 24}, "Appearance Track", gAppearanceTrack)) gMotionKey = 0;
+    bool terrain = object && isHeightfield(object->type) && object->hf;
+    if (object) {
+        const char* label = terrain && gTerrainTrack ? "Terrain Shape Track" : (gAppearanceTrack ? "Appearance Track" : "Transform Track");
+        if (button({x, y, 174, 24}, label)) {
+            if (terrain && gTerrainTrack) gTerrainTrack = gAppearanceTrack = false;
+            else if (terrain && gAppearanceTrack) gTerrainTrack = true;
+            else gAppearanceTrack = !gAppearanceTrack;
+            gMotionKey = 0;
+        }
+    }
+    bool terrainTrack = terrain && gTerrainTrack;
     bool appearance = object && gAppearanceTrack;
     if (button({x + 184, y, 132, 24}, "Set Key Here")) {
-        if (appearance) putKey(object->appearances, object->appearance(frame));
+        if (terrainTrack) {
+            auto& keys = object->terrainKeys;
+            bool replace = std::any_of(keys.begin(), keys.end(), [frame](const auto& key) { return key.frame == frame; });
+            if (keys.size() < 32 || replace) {
+                auto height = std::make_shared<Heightfield>(*object->hf);
+                if (height->res > 1025) hfResample(*height, 1025);
+                height->n.clear();
+                putKey(keys, TerrainKey{frame, std::move(height)});
+                gStatus = "Captured the base heightfield at this frame.";
+            } else gStatus = "Remove a terrain shape key before adding another.";
+        } else if (appearance) putKey(object->appearances, object->appearance(frame));
         else if (object) putKey(object->keys, Key{frame, object->pos, object->rot, object->scl});
         else putKey(gScene.camKeys, CamKey{frame, gScene.cam});
         sceneChanged();
+    }
+    if (terrainTrack && button({x + 322, y, 190, 24}, "Load Heightmap Here...")) {
+        int selected = gSel;
+        defer([selected, frame] {
+            auto& obj = gScene.objs[selected];
+            auto& keys = obj.terrainKeys;
+            bool replace = std::any_of(keys.begin(), keys.end(), [frame](const auto& key) { return key.frame == frame; });
+            if (keys.size() >= 32 && !replace) { gStatus = "Remove a terrain shape key before adding another."; return; }
+            std::string path;
+            if (!fileDialog(false, IMAGE_FILTER, "pgm", path)) return;
+            auto source = loadImageCached(path, true);
+            if (!source) { gStatus = "Could not load the heightmap."; return; }
+            auto field = std::make_shared<Heightfield>();
+            hfInit(*field, std::min(obj.hf->res, 1025));
+            hfFromImage(*field, *source);
+            field->n.clear();
+            putKey(keys, TerrainKey{frame, std::move(field)});
+            sceneChanged();
+        });
     }
     y += 34;
     auto track = [&](auto& keys, const auto& edit) {
@@ -2256,9 +2509,28 @@ void drawMotionLab() {
             return;
         }
         y += 36;
+        int newFrame = k.frame;
+        if (sliderI({x, y, w, 24}, "Key Timing", newFrame, 0, gScene.frames - 1) &&
+            std::none_of(keys.begin(), keys.end(), [newFrame](const auto& other) { return other.frame == newFrame; })) {
+            auto moved = k;
+            moved.frame = newFrame;
+            keys.erase(keys.begin() + gMotionKey);
+            putKey(keys, moved);
+            gMotionKey = (int)(std::lower_bound(keys.begin(), keys.end(), newFrame,
+                 [](const auto& point, int f) { return point.frame < f; }) - keys.begin());
+            gScene.applyFrame(gScene.frame);
+            sceneChanged();
+            return;
+        }
+        y += 29;
         if (edit(k)) { gScene.applyFrame(gScene.frame); sceneChanged(); }
     };
-    if (appearance) {
+    if (terrainTrack) {
+        track(object->terrainKeys, [&](TerrainKey&) {
+            note({x, y, w, 58}, "Capture the base heightfield or load a heightmap at two or more frames to animate the terrain.");
+            return false;
+        });
+    } else if (appearance) {
         track(object->appearances, [&](AppearanceKey& k) {
             bool changed = toggle({x, y, 128, 24}, "Hidden", k.hidden);
             if (isLight(object->type)) changed |= slider({x + 134, y, 240, 24}, "Light Power", k.light[0], 0, 5);
@@ -2361,7 +2633,7 @@ void drawCamerasLab() {
 }
 
 void drawScatterLab() {
-    R p = panel(490, 372, "Scatter Brush");
+    R p = panel(490, 404, "Scatter Brush");
     int x = p.x + 16, y = p.y + 46, w = p.w - 32;
     label(x, y, "Select sources, then Shift-click the surface last.", w); y += 24;
     slider({x, y, w, 24}, "Brush Radius (px)", gScatterRadius, 8, 180, "%.0f"); y += 30;
@@ -2371,8 +2643,10 @@ void drawScatterLab() {
     slider({x, y, w, 24}, "Rotation Range", gScatterYaw, 0, 360, "%.0f"); y += 30;
     sliderI({x, y, w, 24}, "Random Seed", gScatterSeed, 1, 65535); y += 30;
     toggle({x, y, w, 24}, "Align to Surface", gScatterAlign); y += 34;
+    toggle({x, y, w / 2 - 4, 24}, "Mix Selected Species", gScatterPalette);
+    toggle({x + w / 2 + 4, y, w / 2 - 4, 24}, "Erase Instances", gScatterErase); y += 32;
     if (button({x, y, w, 28}, "Start Painting", false, gBold)) {
-        if (gSelSet.size() < 2) {
+        if ((!gScatterErase && gSelSet.size() < 2) || gSel < 0) {
             gStatus = "Select at least one source object and one receiving surface.";
             closeLab(true);
             return;
@@ -2388,7 +2662,7 @@ void drawScatterLab() {
 }
 
 void drawCommandsLab() {
-    R p = panel(770, 480, "Commands");
+    R p = panel(770, 516, "Commands");
     struct Command { const char* label; const char* key; std::function<void()> run; };
     const Command commands[] = {
         {"Render / Resume", "Ctrl+R", actRender}, {"Frame Selection", "F", [] { frameView(validSel()); }},
@@ -2416,7 +2690,7 @@ void drawCommandsLab() {
         }
         textIn({x + 192, y, 164, 27}, commands[i].key, TXT_DIM, gSmall, TextLeft | TextMiddle);
     }
-    note({p.x + 20, p.y + 411, p.w - 48, 22}, "Shift-click adds to selection. Alt-click picks a group member. Ctrl lowers terrain and Shift smooths.");
+    note({p.x + 20, p.y + 448, p.w - 48, 22}, "Shift-click adds to selection. Alt-click picks a group member. Ctrl lowers terrain and Shift smooths.");
     labFooter(p, true);
 }
 
@@ -2675,6 +2949,17 @@ void drawTextureLayers(Material& m) {
                 affected += channel[i];
             }
         }
+        const char* outputs[] = {"Default", "Luminance", "Alpha", "Red", "Green", "Blue"};
+        auto chooseOutput = [&](const char* label, TexOutput& output) {
+            std::string caption = std::string(label) + " " + outputs[(int)output];
+            if (button({ax, y, 212, 24}, caption.c_str())) {
+                output = (TexOutput)(((int)output + 1) % (int)TexOutput::COUNT);
+                ch = true;
+            }
+            y += 28;
+        };
+        chooseOutput("Bump Source", layer.heightOutput);
+        chooseOutput("Transparency Source", layer.transparencyOutput);
         if (button({ax, y, 212, 24}, "Save Texture...")) {
             TextureLayer preset = layer;
             defer([preset] {
@@ -2943,8 +3228,9 @@ void drawSkyLab() {
         ch |= toggle({sx + 172, sy, 168, 24}, "HDR Background", k.environmentBackground);
         sy += 28;
     }
-    ch |= slider({sx, sy, 166, 24}, "Indirect Light", k.indirectStrength, 0, 2);
-    ch |= sliderI({sx + 172, sy, 168, 24}, "Bounce Samples", k.indirectSamples, 1, 16);
+    ch |= slider({sx, sy, 110, 24}, "Indirect Light", k.indirectStrength, 0, 2);
+    ch |= sliderI({sx + 114, sy, 110, 24}, "Samples", k.indirectSamples, 1, 16);
+    ch |= sliderI({sx + 228, sy, 112, 24}, "Bounces", k.indirectBounces, 1, 4);
     sy += 28;
     const char* rigs[] = {"Add Dome", "Add Cluster", "Add Fill"};
     for (int i = 0; i < 3; ++i)
@@ -3034,8 +3320,20 @@ void drawTerrainLab() {
     }
     if (button({hm.x, ry + 28, 128, 24}, "Undo Terrain Edit")) terrainHistory(false);
     if (button({hm.x + 132, ry + 28, 132, 24}, "Redo Terrain Edit")) terrainHistory(true);
+    if (button({hm.x, ry + 56, 128, 24}, "Make Tileable")) {
+        rememberTerrain(f);
+        hfMakeTileable(f, .15f);
+        ch = true;
+    }
+    if (gTerrainBakeLayer >= (int)o.mat.layers.size()) gTerrainBakeLayer = -1;
+    if (!o.mat.layers.empty()) {
+        std::string source = gTerrainBakeLayer < 0 ? "Bake Source  Full Material" :
+                             "Bake Source  Layer " + std::to_string(gTerrainBakeLayer + 1);
+        if (button({hm.x + 268, ry + 56, 132, 24}, source.c_str(), false, gSmall))
+            gTerrainBakeLayer = gTerrainBakeLayer + 1 < (int)o.mat.layers.size() ? gTerrainBakeLayer + 1 : -1;
+    }
     if (button({hm.x + 268, ry + 28, 132, 24}, "Material to Height")) {
-        Image heights = terrainMaterialHeightMap(o, std::min(f.res, 1025));
+        Image heights = terrainMaterialHeightMap(o, std::min(f.res, 1025), gTerrainBakeLayer);
         if (!heights.px.empty()) {
             rememberTerrain(f);
             hfBlendImage(f, region, heights, gTerrainBlend, gTerrainBlendMask.get());
@@ -3475,16 +3773,16 @@ void drawAssetsLab() {
 }
 
 void drawExamplesLab() {
-    R P = panel(700, 40 + 32 * (int)exampleNames().size() + 120, "Example Scenes");
+    R P = panel(700, 150 + 28 * (int)exampleNames().size(), "Example Scenes");
     int y = P.y + 50;
     for (size_t i = 0; i < exampleNames().size(); i++) {
-        if (button({P.x + 20, y, 180, 28}, exampleNames()[i].c_str(), false, gBold)) {
+        if (button({P.x + 20, y, 180, 24}, exampleNames()[i].c_str(), false, gBold)) {
             int n = (int)i;
             closeLab(true);
             defer([n] { loadExample(n); });
         }
-        textIn({P.x + 214, y, P.w - 234, 28}, exampleDescriptions()[i].c_str(), TXT, gFont, TextLeft | TextMiddle);
-        y += 32;
+        textIn({P.x + 214, y, P.w - 234, 24}, exampleDescriptions()[i].c_str(), TXT, gFont, TextLeft | TextMiddle);
+        y += 28;
     }
     note({P.x + 20, y + 6, P.w - 40, 40}, "Loading an example replaces the current scene.");
     labFooter(P, true);
@@ -3842,6 +4140,7 @@ int renderFrames(const char* path, const char* directory, int first, int last) {
 
 int headless(int argc, char** argv) {
     std::string_view command = argv[1];
+    if (command == "--compose" || command == "--inspect" || command == "--catalog") return agentCommand(argc, argv);
     if (command == "--help") { usage(stdout); return 0; }
     if (command == "--render-frames") {
         int first, last;

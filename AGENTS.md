@@ -4,6 +4,7 @@ Native desktop landscape studio with a C++17 software ray tracer. The editor use
 
 - Build: `build.bat` (uses VS 2019+ Build Tools via vswhere; output `build\Brycescape.exe`). Close the running app first or linking fails.
 - Headless render check: `build\Brycescape.exe --render out.bmp 640 400 [scene.c3d]` (renders the default scene when no scene is given).
+- Agent entry point is `python tools/brycescape_agent.py`. Use `catalog` for preset names, `schema` for recipe operations, and `compose tools/example_recipe.json scene.c3d` for an editable example. MCP setup is in the README.
 - Linux build: `cmake -S . -B out/linux -DCMAKE_BUILD_TYPE=Release`, then `cmake --build out/linux --parallel`. Run `./out/linux/Brycescape`.
 - Linux checks: configure with `-DBUILD_TESTING=ON`, build, then run `ctest --output-on-failure` from `out/linux`.
 

@@ -334,15 +334,18 @@ void hfBrush(Heightfield& f, float u, float v, float radius, float amount, Brush
         z0 = std::max(z0, mask->z0); z1 = std::min(z1, mask->z1);
     }
     if (x0 > x1 || z0 > z1) return;
-    std::vector<float> copy;
-    if (mode == BrushMode::Smooth || mode == BrushMode::Erode) copy = f.h;
-    const auto& o = copy.empty() ? f.h : copy;
-    float centre = o[std::min(N - 1, std::max(0, (int)cz)) * N + std::min(N - 1, std::max(0, (int)cx))];
+    HeightRegion border{std::max(0, x0 - 2), std::max(0, z0 - 2), std::min(N - 1, x1 + 2), std::min(N - 1, z1 + 2)};
+    TerrainPatch copy;
+    if (mode == BrushMode::Smooth || mode == BrushMode::Erode) copy = hfCopyRegion(f, border);
+    auto original = [&](int x, int z) {
+        return copy.values.empty() ? f.at(x, z) : copy.values[(z - border.z0) * copy.width + x - border.x0];
+    };
+    float centre = f.at(std::clamp((int)cx, 0, N - 1), std::clamp((int)cz, 0, N - 1));
     float top = 0;
     if (mode == BrushMode::Plateau)
         for (int z = z0; z <= z1; z++)
             for (int x = x0; x <= x1; x++)
-                if ((x - cx) * (x - cx) + (z - cz) * (z - cz) < rp * rp * 0.25f) top = std::max(top, o[z * N + x]);
+                if ((x - cx) * (x - cx) + (z - cz) * (z - cz) < rp * rp * 0.25f) top = std::max(top, original(x, z));
     for (int z = z0; z <= z1; z++)
         for (int x = x0; x <= x1; x++) {
             float d2 = ((x - cx) * (x - cx) + (z - cz) * (z - cz)) / (rp * rp);
@@ -367,9 +370,9 @@ void hfBrush(Heightfield& f, float u, float v, float radius, float amount, Brush
                         int xx = x + dx, zz = z + dz;
                         if (xx >= 0 && zz >= 0 && xx < N && zz < N &&
                             (!mask || (xx >= mask->x0 && xx <= mask->x1 && zz >= mask->z0 && zz <= mask->z1)) &&
-                            o[zz * N + xx] < lo) { lo = o[zz * N + xx]; lx = xx; lz = zz; }
+                            original(xx, zz) < lo) { lo = original(xx, zz); lx = xx; lz = zz; }
                     }
-                float drop = o[z * N + x] - lo, talus = 1.5f / N;
+                float drop = original(x, z) - lo, talus = 1.5f / N;
                 if (drop > talus) {
                     float m = (drop - talus) * clampf(amount * 10 * w, 0, 0.5f);
                     hv -= m;
@@ -383,13 +386,46 @@ void hfBrush(Heightfield& f, float u, float v, float radius, float amount, Brush
                 for (int dz = -2; dz <= 2; dz++)
                     for (int dx = -2; dx <= 2; dx++) {
                         int xx = x + dx, zz = z + dz;
-                        if (xx >= 0 && zz >= 0 && xx < N && zz < N) { s += o[zz * N + xx]; c++; }
+                        if (xx >= 0 && zz >= 0 && xx < N && zz < N) { s += original(xx, zz); c++; }
                     }
                 hv = lerpf(hv, s / c, clampf(amount * 12 * w, 0, 1));
             }
             hv = clampf(hv, 0, 1);
         }
     f.computeNormals(x0 - 2, z0 - 2, x1 + 2, z1 + 2);
+}
+
+void hfMakeTileable(Heightfield& f, float borderFraction) {
+    if (f.res < 2) return;
+    int last = f.res - 1;
+    int border = std::clamp((int)(last * borderFraction), 1, std::max(1, (last + 1) / 2));
+    for (int axis = 0; axis < 2; ++axis) {
+        auto cell = [&](int a, int b) -> float& { return f.h[axis == 0 ? b * f.res + a : a * f.res + b]; };
+        for (int row = 0; row <= last; ++row) {
+            float average = (cell(0, row) + cell(last, row)) * .5f;
+            float left = average - cell(0, row), right = average - cell(last, row);
+            cell(0, row) = cell(last, row) = average;
+            for (int i = 1; i < border; ++i) {
+                float weight = 1 - smoothstep(0, (float)border, (float)i);
+                cell(i, row) = clampf(cell(i, row) + left * weight, 0, 1);
+                cell(last - i, row) = clampf(cell(last - i, row) + right * weight, 0, 1);
+            }
+        }
+    }
+    f.computeNormals();
+}
+
+void hfMirrorX(Heightfield& f, bool fromNegative) {
+    if (f.res < 2) return;
+    for (int z = 0; z < f.res; ++z) {
+        for (int x = 0; x < f.res / 2; ++x) {
+            float& left = f.h[z * f.res + x];
+            float& right = f.h[z * f.res + f.res - 1 - x];
+            if (fromNegative) right = left;
+            else left = right;
+        }
+    }
+    f.computeNormals();
 }
 
 void hfTerrace(Heightfield& f, int levels) {

@@ -26,6 +26,7 @@ struct Texture {
 
 enum class TexBlend { Mix, Multiply, Add, Subtract, Screen, COUNT };
 enum class TexMask { None, Luminance, InverseLuminance, Previous, Elevation, Slope, COUNT };
+enum class TexOutput { Default, Luminance, Alpha, Red, Green, Blue, COUNT };
 enum TexChannel { TexColor, TexBump, TexSpecular, TexReflection, TexTransparency, TexAmbient, TexChannelCount };
 constexpr int MAX_TEXTURE_LAYERS = 16;
 
@@ -37,6 +38,7 @@ struct TextureLayer : Texture {
     float warp = 0, contrast = 1, bias = 0;
     float maskLow = 0.25f, maskHigh = 0.75f, maskFeather = 0.1f;
     int octaves = 5;
+    TexOutput heightOutput = TexOutput::Default, transparencyOutput = TexOutput::Default;
     std::array<float, TexChannelCount> influence{1};
     bool save(const std::string& path) const;
     bool load(const std::string& path);
@@ -80,6 +82,7 @@ struct Sky {
     bool environmentBackground = true;
     float indirectStrength = 0;
     int indirectSamples = 4;
+    int indirectBounces = 1;
     V3 sunDir() const { return dirFrom(sunAlt, sunAz); }
     V3 moonDir() const { return dirFrom(moonAlt, moonAz); }
     static V3 dirFrom(float alt, float az) {
@@ -129,6 +132,7 @@ constexpr int MAX_TERRAIN_RESOLUTION = 4097;
 enum class Ease { Spline, Linear, Smooth, Hold, COUNT };
 const char* easeName(Ease ease);
 struct Key { int frame = 0; V3 pos, rot, scl{1, 1, 1}; Ease ease = Ease::Spline; };
+struct TerrainKey { int frame = 0; std::shared_ptr<const Heightfield> field; Ease ease = Ease::Linear; };
 struct Camera;
 
 struct Picture {
@@ -176,6 +180,7 @@ struct Object {
     int instanceSource = -1;
     bool terrainAnchor = false;
     V3 anchorPoint;
+    V3 anchorNormal;
     M3 bind;
     V3 bindOffset;
     bool hasBind = false;
@@ -197,19 +202,23 @@ struct Object {
     std::shared_ptr<const Mesh> mesh;
     std::vector<Key> keys;
     std::vector<AppearanceKey> appearances;
+    std::vector<TerrainKey> terrainKeys;
     // derived by update()
+    std::shared_ptr<const Heightfield> morphFrom, morphTo;
+    float morphWeight = 0;
     M3 fwd, inv, nrm, parentSpace, parentInv;
     V3 bcenter, worldPos;
     float bradius = -1;
     bool csg = false;
     void update(const Camera* camera = nullptr, const Object* ancestor = nullptr);
     void moveWorld(V3 delta) { pos += parentInv * delta; }
+    float rawTerrainAt(int x, int z) const;
     float terrainAt(int x, int z) const {
-        float value = hf->at(x, z);
+        float value = rawTerrainAt(x, z);
         if (terrain.smoothing > 0) {
             int limit = hf->res - 1;
-            float neighbors = hf->at(std::max(0, x - 1), z) + hf->at(std::min(limit, x + 1), z) +
-                              hf->at(x, std::max(0, z - 1)) + hf->at(x, std::min(limit, z + 1));
+            float neighbors = rawTerrainAt(std::max(0, x - 1), z) + rawTerrainAt(std::min(limit, x + 1), z) +
+                              rawTerrainAt(x, std::max(0, z - 1)) + rawTerrainAt(x, std::min(limit, z + 1));
             value = lerpf(value, neighbors * .25f, terrain.smoothing);
         }
         return std::max(terrain.clip, value) * terrain.height;
@@ -317,6 +326,7 @@ struct Scene {
     int scatter(const std::vector<int>& sources, int surface, const std::vector<Ray>& rays,
                 float minScale, float maxScale, float yawRange, bool align, Rng& rng);
     Scene subset(const std::vector<int>& indices) const;
+    int duplicateMirrored(const std::vector<int>& indices, int axis, V3 pivot);
 private:
     bool writeFile(const std::string& path) const;
 };

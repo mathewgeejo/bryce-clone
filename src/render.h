@@ -7,7 +7,7 @@
 #include "scene.h"
 
 V3 skyColor(const Sky& k, V3 d);
-Image terrainMaterialHeightMap(const Object& terrain, int samples);
+Image terrainMaterialHeightMap(const Object& terrain, int samples, int layerIndex = -1);
 // quality: -1 = use the scene's render settings, 0 draft, 1 normal (adaptive AA), 2 premium (accumulated samples).
 void renderImage(const Scene& s, int w, int h, uint32_t* out, int quality = -1);
 enum class RenderPass { Alpha, Depth, ObjectId };

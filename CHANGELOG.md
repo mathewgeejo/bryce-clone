@@ -1,7 +1,20 @@
 # Implementation log
 
+## Agent authoring and priority 9 and 8 work
+
+- Added scene recipes, a discoverable catalog, scene inspection, and rendering through both a Python CLI and local MCP. Added an editable example recipe and an integration smoke test.
+- Added independent bump and transparency sources for texture layers and material baking from an individual layer.
+- Added up to four diffuse bounces and the original Sundial Basin example with an embedded HDR environment, layered rock, directional waves and camera animation.
+- Added terrain shape keys, key retiming, seamless border blending, and linked terrain grids through recipes.
+- Added mixed-species scatter, instance erasing and surface alignment that follows terrain edits.
+- Limited smooth and erosion brush copies to the affected terrain patch. A Windows run exercised 24 strokes on a 4097-point grid and benchmarked a 2,062-object render plus cancellation.
+- Added a BR7 container diagnostic and checked it against a public sample. Native scene and preset decoding still require verified record layouts and reference fixtures.
+- Added version 6 scene and library records and version 3 texture presets. Older formats still load.
+- Passed the Windows core suite, MCP integration test, desktop smoke test, and Linux-target C++17 syntax check. Rendered the embedded HDR example and a version 5 scene.
+
 ## Bryce 7.1 workflows
 
+- Refreshed the remaining backlog with concrete compatibility, fidelity, library and validation gaps and recorded the checks already performed.
 - Added a reproducible Scatter Brush with density, radius, rotation, scale variation and normal alignment. Copies share source geometry and follow receiver transforms. Terrain placements also follow height edits.
 - Added Radiance RGBE maps for HDR backgrounds, reflections and importance-sampled illumination. Sky Lab controls rotation, intensity, sample count and background visibility. Scene packaging and embedding preserve HDR assets.
 - Added indirect diffuse lighting, grouped dome, cluster and fill rigs, and per-light controls for diffuse strength, specular strength and group influence.

@@ -24,6 +24,8 @@ void hfPasteRegion(Heightfield& f, HeightRegion area, const TerrainPatch& patch)
 void hfBlendImage(Heightfield& f, HeightRegion area, const Image& image, float amount, const Image* mask);
 void hfBrush(Heightfield& f, float u, float v, float radius, float amount, BrushMode mode = BrushMode::Raise, const HeightRegion* mask = nullptr);
 void hfResample(Heightfield& f, int res);
+void hfMakeTileable(Heightfield& f, float borderFraction);
+void hfMirrorX(Heightfield& f, bool fromNegative);
 void hfTerrace(Heightfield& f, int levels);
 void hfSpikes(Heightfield& f, uint32_t seed, int count);
 void hfCrater(Heightfield& f, float u, float v, float radius, float depth);

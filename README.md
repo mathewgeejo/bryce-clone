@@ -56,16 +56,55 @@ Close the studio before rebuilding so the linker can replace `Brycescape.exe`. T
 - Add picture cards with PNG alpha or chroma cutouts. Use fixed planes or cards that face the camera.
 - Combine primitives with Boolean operations, generate trees, import OBJ or layered DXF meshes, and export selections as OBJ or DXF.
 - Parent objects through **Edit Tools → Parent to Active** and inspect the relationships in the scene hierarchy.
-- Paint linked vegetation or geometry onto terrain with **F1 → Scatter Brush**. Select the source objects first and Shift-click the receiving surface last. Set the brush density, size variation, rotation, alignment and seed, then paint in the viewport. Press **Esc** to leave the brush. Terrain instances follow height edits and share their source geometry.
+- Paint linked vegetation or geometry onto terrain with **F1 → Scatter Brush**. Select the source objects first and Shift-click the receiving surface last. Enable **Mix Selected Species** to distribute the selected groups. Hold **Shift** to erase painted instances and press **Esc** to leave the brush. New terrain instances follow height edits and can track changes in surface angle.
 - Layer procedural and image textures across material channels, and save individual texture layers as `.c3tex` presets.
-- Use **Texture Layers** to warp procedural coordinates, shape levels, and mask layers by elevation or slope. The **Mesh UV** mapping option uses the texture coordinates supplied by an imported OBJ.
+- Use **Texture Layers** to warp procedural coordinates, route separate bump and transparency inputs, and mask layers by elevation or slope. The **Mesh UV** mapping option uses the texture coordinates supplied by an imported OBJ.
 - Place point, spot, and directional lights, and tune fog, clouds, sunlight, and moonlight.
-- Load a Radiance HDR environment in **Sky Lab** for background, reflections and lighting. Use the indirect light controls for a diffuse bounce, or add a grouped dome, cluster or fill rig.
-- Blend a heightmap into a terrain or rectangle with an optional grayscale mask. **Material to Height** blends the material's bump or color into the heightfield, sampled on a grid of up to 1025 points per side. The terrain editor supports 16-bit grayscale TIFF and PGM and a 4097-point grid. Press **E** on water to edit directional waves.
+- Load a Radiance HDR environment in **Sky Lab** for background, reflections and lighting. Set up to four diffuse bounces, or add a grouped dome, cluster or fill rig.
+- Blend heightmaps with grayscale masks, match opposite edges with **Make Tileable**, or bake a complete material or individual layer into the heightfield. The terrain editor supports 16-bit grayscale TIFF and PGM and a 4097-point grid.
+- Use the **Terrain Shape Track** in **Motion Editor** to capture or import heightmaps at different frames. The track interpolates between up to 32 keys, each sampled at up to 1025 points per side. Use **Key Timing** to move a key to an unused frame. **Sundial Basin** has an embedded HDR environment, layered rock, directional waves and a camera orbit.
 - Animate transforms and appearance tracks, switch between named cameras, and render stills, panoramas or numbered animation frames.
 - Save scene fragments in the thumbnail library. Package, embed or relink image assets through **Commands**.
 
 ## Render from the command line
+
+### Create and render scenes with an agent
+
+Build Brycescape and use Python 3.10 or newer. The agent tools write editable `.c3d` scenes and can return PNG previews for visual iteration. The included recipe builds a lake landscape with layered terrain and scattered trees.
+
+```text
+python tools/brycescape_agent.py catalog
+python tools/brycescape_agent.py schema
+python tools/brycescape_agent.py compose tools/example_recipe.json "cedar lake.c3d"
+python tools/brycescape_agent.py inspect "cedar lake.c3d"
+python tools/brycescape_agent.py render "cedar lake.c3d" "cedar lake.png" --width 640 --height 400
+```
+
+Recipes run in order. Use exact preset names from `catalog` and unique object names. Place a `base` operation first to edit an existing scene or an `example` operation first to start from a built-in scene. Coordinates are X, Y up, Z. Rotations and camera angles are in degrees. Use `--binary` before the command for builds outside the default locations.
+
+Use `terrain_tiles` on an ungrouped, unparented terrain without animation keys to make a grid that shares one seamless heightfield. Use `terrain_key` to load a heightmap at a particular frame. A tree name can be used as the source of a `scatter` operation to plant both trunk and foliage together.
+
+To connect an MCP client that supports local stdio servers, add a server entry with absolute paths to this script, the built program, and a directory for scenes and assets.
+
+```json
+{
+  "mcpServers": {
+    "brycescape": {
+      "command": "python",
+      "args": [
+        "/path/to/Brycescape/tools/brycescape_agent.py",
+        "--binary", "/path/to/Brycescape",
+        "--workspace", "/path/to/scenes",
+        "mcp"
+      ]
+    }
+  }
+}
+```
+
+The server exposes `brycescape_catalog`, `brycescape_compose`, `brycescape_inspect`, and `brycescape_render`. File arguments resolve inside the configured workspace. Save to a new filename or explicitly set `overwrite`. The agent integration smoke test is `python tools/check_agent.py PATH_TO_BRYCESCAPE`. [MCP stdio transport](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#stdio)
+
+### Render existing scenes
 
 ```bash
 ./out/linux/Brycescape --render out.bmp 640 400

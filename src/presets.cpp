@@ -93,11 +93,13 @@ const std::vector<Material>& materialPresets() {
         M("Terrains", "Tundra", T::Altitude, {.85f, .87f, .9f}, {.4f, .4f, .38f}, .9f, .3f, .05f, 10, 0, 0, 1, .4f, 2),
         M("Terrains", "Lunar Dust", T::Spots, {.62f, .62f, .6f}, {.42f, .42f, .41f}, .9f, .25f, .02f, 10, 0, 0, 1, .7f, 1.2f),
         M("Terrains", "Salt Crust", T::Granite, {.92f, .88f, .81f}, {.62f, .55f, .47f}, .9f, .3f, .05f, 10, 0, 0, 1, .22f, 2.6f),
+        M("Terrains", "Copper Clay", T::Ridged, {.64f, .33f, .20f}, {.27f, .16f, .11f}, .86f, .34f, .15f, 20, 0, 0, 1, .36f, 2.5f),
         // Waters
         M("Waters", "Water", T::Waves, {.12f, .32f, .42f}, {0, 0, 0}, .25f, .3f, .9f, 120, .35f, .55f, 1.33f, .5f, .6f),
         M("Waters", "Tropical Lagoon", T::Waves, {.1f, .6f, .6f}, {0, 0, 0}, .3f, .35f, .9f, 120, .25f, .7f, 1.33f, .35f, .5f),
         M("Waters", "Murky Pond", T::Waves, {.2f, .25f, .12f}, {0, 0, 0}, .5f, .3f, .6f, 80, .2f, .2f, 1.33f, .2f, .8f),
         M("Waters", "Deep Ocean", T::Waves, {.02f, .1f, .2f}, {0, 0, 0}, .2f, .2f, 1, 150, .5f, .3f, 1.33f, .8f, .3f),
+        M("Waters", "Glacial Tarn", T::Waves, {.12f, .35f, .39f}, {.03f, .10f, .15f}, .28f, .2f, .92f, 130, .37f, .45f, 1.33f, .28f, .55f),
         M("Waters", "Ice", T::Noise, {.8f, .9f, 1}, {.65f, .8f, .95f}, .2f, .3f, .9f, 120, .15f, .6f, 1.31f, .2f, 2),
         M("Waters", "Molten Lava", T::Lava, {1, .75f, .2f}, {.25f, .03f, .01f}, .9f, .2f, .2f, 20, 0, 0, 1, .6f, 1, 0, 1.2f),
         M("Waters", "Mirror Water", T::Waves, {.05f, .08f, .12f}, {0, 0, 0}, .1f, .1f, 1, 200, .85f, .1f, 1.33f, .08f, .4f),
@@ -190,7 +192,7 @@ const std::vector<Sky>& skyPresets() {
 const std::vector<std::string>& exampleNames() {
     static const std::vector<std::string> n = {"Snowy Island", "Desert Canyon", "Moonlit Lake", "Boolean Studio", "Forest Glade", "Alien World",
                                                "Chrome Dreams", "Floating Isles", "Ringed Planet", "Monolith Lake", "Stone Arch", "Volcano Isle",
-                                               "Salt Road", "Boolean Observatory", "Windward Basin", "Pines at the Inlet"};
+                                               "Salt Road", "Boolean Observatory", "Windward Basin", "Pines at the Inlet", "Sundial Basin"};
     return n;
 }
 
@@ -205,7 +207,8 @@ const std::vector<std::string>& exampleDescriptions() {
         "Salt flats and badlands with a freestanding survey-marker cutout.",
         "A carved and nested stone observatory over a reflective floor.",
         "A glacial bowl, cloud shadows and low drifting mist.",
-        "Linked pines on a layered hillside beside wind-rippled water."};
+        "Linked pines on a layered hillside beside wind-rippled water.",
+        "An embedded HDR sky lights layered stone, animated water and a camera orbit."};
     return d;
 }
 
@@ -556,6 +559,49 @@ Scene makeExample(int i) {
         s.scatter({2, 3}, 0, rays, .65f, 1.3f, 360, false, rng);
         s.objs[2].hidden = s.objs[3].hidden = true;
         s.cam.target = {0, 2.6f, -13}; s.cam.dist = 33; s.cam.pitch = 13; s.cam.yaw = 22;
+        break;
+    }
+    case 16: {
+        auto environment = std::make_shared<Image>();
+        environment->w = 128;
+        environment->h = 64;
+        environment->hdr = true;
+        for (int y = 0; y < environment->h; ++y) for (int x = 0; x < environment->w; ++x) {
+            float theta = PI * (y + .5f) / environment->h;
+            float phi = 2 * PI * ((x + .5f) / environment->w - .5f);
+            V3 direction(std::sin(theta) * std::sin(phi), std::cos(theta), std::sin(theta) * std::cos(phi));
+            float warmth = std::pow(std::max(0.f, dot(direction, normalize(V3(-.5f, .32f, .32f)))), 256.f);
+            V3 gradient = lerp(V3(.26f, .20f, .17f), V3(.20f, .38f, .7f), std::max(0.f, direction.y));
+            environment->px.push_back(gradient + V3(14.f, 8.f, 3.f) * warmth);
+        }
+        environment->buildLightDistribution();
+        s.sky = skyNamed("Overcast");
+        s.sky.name = "Amber HDR";
+        s.sky.environment = "embed:sundial-sky";
+        s.sky.environmentImage = environment;
+        s.embeddedImages[s.sky.environment] = environment;
+        s.sky.shadows = true;
+        s.sky.indirectStrength = .24f;
+        s.sky.indirectBounces = 2;
+        Object basin = kindTerrain(1, {0, -2, -10}, {23, 8, 18}, "Canyon Strata", TerrainKind::Badlands, 112);
+        TextureLayer deposit;
+        deposit.tex = TexType::Cellular;
+        deposit.mask = TexMask::Elevation;
+        deposit.maskLow = .17f; deposit.maskHigh = .53f;
+        deposit.color1 = {.83f, .53f, .29f}; deposit.color2 = {.27f, .14f, .12f};
+        deposit.influence[TexBump] = .2f;
+        deposit.heightOutput = TexOutput::Red;
+        basin.mat.layers.push_back(deposit);
+        s.objs.push_back(basin);
+        Object water = prim(ObjType::Water, 1, {0, .65f, 0}, V3(1), "Glacial Tarn");
+        water.directionalWater = true;
+        s.objs.push_back(water);
+        s.objs.push_back(prim(ObjType::Torus, 1, {-2, 3, -4}, V3(2.3f), "Bronze"));
+        s.cam.target = {0, 2, -9}; s.cam.yaw = 16; s.cam.pitch = 13; s.cam.dist = 35;
+        s.camKeys.push_back({0, s.cam, Ease::Smooth});
+        Camera ending = s.cam;
+        ending.yaw = -19;
+        s.camKeys.push_back({s.frames - 1, ending, Ease::Smooth});
         break;
     }
     default: {

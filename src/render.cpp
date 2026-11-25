@@ -164,6 +164,43 @@ template <class T> static T blendTexture(T base, T texture, float weight, TexBle
     return base + (texture - base) * weight;
 }
 
+static TextureSample sampleLayer(const TextureLayer& layer, const Object& o, const Hit& h) {
+    float u = 0, v = 0;
+    V3 p = texCoord(layer, o, h, u, v) * layer.texScale;
+    M3 rot = rotY(rad(layer.rotation.y)) * rotX(rad(layer.rotation.x)) * rotZ(rad(layer.rotation.z));
+    p = rot * p + layer.offset;
+    if (layer.warp > 0 && layer.tex != TexType::Image)
+        p += V3(noise3(p), noise3(p + V3(43)), noise3(p - V3(31))) * layer.warp;
+    if (layer.tex == TexType::Image) {
+        V3 uv = rot * V3((u - 0.5f) * layer.texScale, (v - 0.5f) * layer.texScale, 0) + layer.offset;
+        u = uv.x + 0.5f;
+        v = uv.y + 0.5f;
+    }
+    TextureSample component = evalTexture(layer, p, u, v, p.y, h.n.y, 0, true, layer.octaves);
+    if (layer.tex == TexType::Image && layer.img)
+        component.trans = 1 - layer.img->opacity(u - std::floor(u), 1 - v - std::floor(1 - v));
+    if (layer.contrast != 1 || layer.bias != 0) {
+        auto adjust = [&](float value) { return clampf((value - .5f) * layer.contrast + .5f + layer.bias, 0, 1); };
+        V3 c = component.color;
+        component.color = {adjust(c.x), adjust(c.y), adjust(c.z)};
+    }
+    return component;
+}
+
+static float luminance(V3 color) {
+    return clampf(dot(color, V3(.299f, .587f, .114f)), 0, 1);
+}
+
+static float layerOutput(TexOutput source, const TextureSample& sample, bool transparency) {
+    switch (source) {
+    case TexOutput::Alpha: return transparency ? sample.trans : 1 - sample.trans;
+    case TexOutput::Red: return sample.color.x;
+    case TexOutput::Green: return sample.color.y;
+    case TexOutput::Blue: return sample.color.z;
+    default: return luminance(sample.color);
+    }
+}
+
 static Surf evalSurface(const Material& m, const Object& o, const Hit& h, bool bumpOnly = false) {
     Surf s{m.color1, m.transparency, 1, m.specular, m.reflect, m.ambient};
     if (!bumpOnly) {
@@ -183,23 +220,8 @@ static Surf evalSurface(const Material& m, const Object& o, const Hit& h, bool b
     }
     float previous = 1;
     for (const TextureLayer& layer : m.layers) {
-        float u = 0, v = 0;
-        V3 p = texCoord(layer, o, h, u, v) * layer.texScale;
-        M3 rot = rotY(rad(layer.rotation.y)) * rotX(rad(layer.rotation.x)) * rotZ(rad(layer.rotation.z));
-        p = rot * p + layer.offset;
-        if (layer.warp > 0 && layer.tex != TexType::Image)
-            p += V3(noise3(p), noise3(p + V3(43)), noise3(p - V3(31))) * layer.warp;
-        if (layer.tex == TexType::Image) {
-            V3 uv = rot * V3((u - 0.5f) * layer.texScale, (v - 0.5f) * layer.texScale, 0) + layer.offset;
-            u = uv.x + 0.5f; v = uv.y + 0.5f;
-        }
-        TextureSample component = evalTexture(layer, p, u, v, p.y, h.n.y, 0, true, layer.octaves);
-        if (layer.contrast != 1 || layer.bias != 0) {
-            auto adjust = [&](float value) { return clampf((value - .5f) * layer.contrast + .5f + layer.bias, 0, 1); };
-            V3 c = component.color;
-            component.color = {adjust(c.x), adjust(c.y), adjust(c.z)};
-        }
-        float lum = clampf(dot(component.color, V3(0.299f, 0.587f, 0.114f)), 0, 1);
+        TextureSample component = sampleLayer(layer, o, h);
+        float lum = luminance(component.color);
         float weight = layer.opacity;
         if (layer.mask == TexMask::Luminance) weight *= lum;
         else if (layer.mask == TexMask::InverseLuminance) weight *= 1 - lum;
@@ -218,19 +240,21 @@ static Surf evalSurface(const Material& m, const Object& o, const Hit& h, bool b
         };
         if (layer.influence[TexBump] > 0 && layer.opacity > 0) {
             s.layeredBump = true;
-            s.height = scalar(s.height, TexBump, lum);
+            s.height = scalar(s.height, TexBump, layerOutput(layer.heightOutput, component, false));
         }
         if (bumpOnly) continue;
         s.color = blendTexture(s.color, component.color, weight * layer.influence[TexColor], layer.blend);
         s.specular = scalar(s.specular, TexSpecular, lum);
         s.reflect = scalar(s.reflect, TexReflection, lum);
-        s.trans = scalar(s.trans, TexTransparency, layer.tex == TexType::Clouds ? component.trans : lum);
+        float trans = layer.transparencyOutput == TexOutput::Default && layer.tex == TexType::Clouds
+            ? component.trans : layerOutput(layer.transparencyOutput, component, true);
+        s.trans = scalar(s.trans, TexTransparency, trans);
         s.ambient = scalar(s.ambient, TexAmbient, lum);
     }
     return s;
 }
 
-Image terrainMaterialHeightMap(const Object& terrain, int samples) {
+Image terrainMaterialHeightMap(const Object& terrain, int samples, int layerIndex) {
     Image output;
     if (!terrain.hf || terrain.hf->res < 2 || samples < 2 || samples > 1025) return output;
     output.w = output.h = samples;
@@ -248,8 +272,14 @@ Image terrainMaterialHeightMap(const Object& terrain, int samples) {
             normal.x *= terrain.terrain.height;
             normal.z *= terrain.terrain.height;
             hit.n = normalize(terrain.nrm * normal);
-            Surf result = evalSurface(terrain.mat, terrain, hit);
-            float height = result.layeredBump ? result.height : dot(result.color, V3(.3f, .59f, .11f));
+            float height;
+            if (layerIndex >= 0 && layerIndex < (int)terrain.mat.layers.size()) {
+                const auto& layer = terrain.mat.layers[layerIndex];
+                height = layerOutput(layer.heightOutput, sampleLayer(layer, terrain, hit), false);
+            } else {
+                Surf result = evalSurface(terrain.mat, terrain, hit);
+                height = result.layeredBump ? result.height : luminance(result.color);
+            }
             output.px[(size_t)z * samples + x] = V3(clampf(height, 0, 1));
         }
     }
@@ -471,7 +501,8 @@ struct Medium {
     int top() const { return count ? layers[count - 1] : -1; }
 };
 
-static V3 trace(Ctx& c, const Ray& r, int depth, RayPurpose purpose = RayPurpose::Surface, Medium media = {}) {
+static V3 trace(Ctx& c, const Ray& r, int depth, RayPurpose purpose = RayPurpose::Surface, Medium media = {},
+                int diffuseDepth = 0) {
     const Scene& s = c.s;
     const Sky& k = s.sky;
     Hit h;
@@ -616,21 +647,22 @@ static V3 trace(Ctx& c, const Ray& r, int depth, RayPurpose purpose = RayPurpose
         transF *= 1 - kr;
     }
     int maxDepth = s.render.bounces > 0 ? s.render.bounces : (c.premium ? 6 : 5);
-    if (depth == 0 && k.indirectStrength > 0 && m.diffuse > 0 && reflF + transF < 0.99f) {
-        int samples = c.premium ? k.indirectSamples : 1;
+    if ((depth == 0 || diffuseDepth > 0) && diffuseDepth < k.indirectBounces
+        && k.indirectStrength > 0 && m.diffuse > 0 && reflF + transF < 0.99f) {
+        int samples = c.premium && diffuseDepth == 0 ? k.indirectSamples : 1;
         V3 right = normalize(cross(nf, std::fabs(nf.y) > .95f ? V3(0, 0, 1) : V3(0, 1, 0)));
         V3 forward = cross(nf, right), bounced;
         for (int i = 0; i < samples; ++i) {
             float radius2 = (i + c.rng.f()) / samples, angle = 2 * PI * c.rng.f();
             float radius = std::sqrt(radius2);
             V3 direction = nf * std::sqrt(1 - radius2) + (right * std::cos(angle) + forward * std::sin(angle)) * radius;
-            bounced += trace(c, {h.p + nf * EPS, direction}, maxDepth + 1);
+            bounced += trace(c, {h.p + nf * EPS, direction}, depth + 1, RayPurpose::Surface, {}, diffuseDepth + 1);
         }
         diff += bounced * sf.color * (k.indirectStrength * m.diffuse / samples);
     }
     V3 col = diff * std::max(0.f, 1 - reflF - transF) + spec + sf.color * (m.emission * sf.glow);
     bool blur = c.blur && m.blur > 0;
-    if (depth < maxDepth) {
+    if (diffuseDepth == 0 && depth < maxDepth) {
         if (reflF > 0.01f) {
             V3 rd = reflect(r.d, nf);
             if (blur) {

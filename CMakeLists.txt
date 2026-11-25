@@ -31,6 +31,7 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 else()
     message(FATAL_ERROR "The desktop application supports Windows and Linux.")
 endif()
+target_sources(Brycescape PRIVATE src/agent.cpp)
 target_link_libraries(Brycescape PRIVATE canyon_core)
 install(TARGETS Brycescape RUNTIME DESTINATION bin)
 

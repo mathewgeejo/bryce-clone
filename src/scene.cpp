@@ -107,6 +107,19 @@ bool localBounds(const Object& o, V3& lo, V3& hi) {
     return true;
 }
 
+float Object::rawTerrainAt(int x, int z) const {
+    if (!morphFrom) return hf->at(x, z);
+    auto sample = [&](const Heightfield& field) {
+        if (field.res == hf->res) return field.at(x, z);
+        float u = x * (field.res - 1.f) / (hf->res - 1), v = z * (field.res - 1.f) / (hf->res - 1);
+        int i = std::min((int)u, field.res - 2), j = std::min((int)v, field.res - 2);
+        return lerpf(lerpf(field.at(i, j), field.at(i + 1, j), u - i),
+                     lerpf(field.at(i, j + 1), field.at(i + 1, j + 1), u - i), v - j);
+    };
+    float value = sample(*morphFrom);
+    return morphTo && morphWeight > 0 ? lerpf(value, sample(*morphTo), morphWeight) : value;
+}
+
 bool worldBounds(const Object& o, V3& lo, V3& hi) {
     V3 a, b;
     if (!localBounds(o, a, b)) { lo = hi = o.worldPos; return isLight(o.type); }
@@ -119,21 +132,49 @@ bool worldBounds(const Object& o, V3& lo, V3& hi) {
     return true;
 }
 
+static V3 terrainSurface(const Object& terrain, V3 point, float& height) {
+    int cells = terrain.hf->res - 1;
+    float x = clampf((point.x + 1) * .5f, 0, 1) * cells;
+    float z = clampf((point.z + 1) * .5f, 0, 1) * cells;
+    int ix = std::min((int)x, cells - 1), iz = std::min((int)z, cells - 1);
+    float u = x - ix, v = z - iz;
+    float a = terrain.terrainAt(ix, iz), e = terrain.terrainAt(ix + 1, iz + 1);
+    float dx, dz;
+    if (u >= v) {
+        float b = terrain.terrainAt(ix + 1, iz);
+        dx = b - a;
+        dz = e - b;
+    } else {
+        float c = terrain.terrainAt(ix, iz + 1);
+        dx = e - c;
+        dz = c - a;
+    }
+    height = a + dx * u + dz * v;
+    return normalize(V3(-dx, 2.f / cells, -dz));
+}
+
 void Object::update(const Camera* camera, const Object* ancestor) {
     parentSpace = ancestor ? ancestor->fwd * bind : bind;
-    parentInv = parentSpace.inverse();
     V3 offset = bindOffset;
     if (terrainAnchor && ancestor && ancestor->type == ObjType::Terrain && ancestor->hf && ancestor->hf->res >= 2) {
-        int cells = ancestor->hf->res - 1;
-        float x = clampf((anchorPoint.x + 1) * .5f, 0, 1) * cells;
-        float z = clampf((anchorPoint.z + 1) * .5f, 0, 1) * cells;
-        int ix = std::min((int)x, cells - 1), iz = std::min((int)z, cells - 1);
-        float u = x - ix, v = z - iz;
-        float a = ancestor->terrainAt(ix, iz), e = ancestor->terrainAt(ix + 1, iz + 1);
-        float localY = u >= v ? a * (1 - u) + ancestor->terrainAt(ix + 1, iz) * (u - v) + e * v :
-                                a * (1 - v) + ancestor->terrainAt(ix, iz + 1) * (v - u) + e * u;
+        float localY;
+        V3 normal = terrainSurface(*ancestor, anchorPoint, localY);
+        if (dot(anchorNormal, anchorNormal) > .5f && length(normal - anchorNormal) > .0001f) {
+            V3 from = normalize(ancestor->nrm * anchorNormal), to = normalize(ancestor->nrm * normal);
+            V3 axis = cross(from, to);
+            float factor = 1 + dot(from, to);
+            if (factor > .001f) {
+                auto rotate = [&](V3 v) { return v + cross(axis, v) + cross(axis, cross(axis, v)) / factor; };
+                for (int column = 0; column < 3; ++column) {
+                    V3 v = rotate(parentSpace.col(column));
+                    for (int row = 0; row < 3; ++row) parentSpace.m[row][column] = v[row];
+                }
+                offset = anchorPoint + ancestor->inv * rotate(ancestor->fwd * (offset - anchorPoint));
+            }
+        }
         offset.y += localY - anchorPoint.y;
     }
+    parentInv = parentSpace.inverse();
     worldPos = parentSpace * pos + (ancestor ? ancestor->worldPos + ancestor->fwd * offset : offset);
     M3 orientation = rotY(rad(rot.y)) * rotX(rad(rot.x));
     bool facing = type == ObjType::Picture && picture.billboard && camera;
@@ -187,12 +228,18 @@ static bool hierarchyOrder(const std::vector<Object>& objects, std::vector<int>&
     return true;
 }
 
+static void updateTerrainMorph(Object& object, int frame);
+
 void Scene::updateAll() {
+    for (auto& object : objs) updateTerrainMorph(object, frame);
     for (Object& o : objs) if (o.instanceSource >= 0 && o.instanceSource < (int)objs.size()) {
         const Object& source = objs[o.instanceSource];
         o.mesh = source.mesh;
         o.hf = source.hf;
         o.terrain = source.terrain;
+        o.morphFrom = source.morphFrom;
+        o.morphTo = source.morphTo;
+        o.morphWeight = source.morphWeight;
         o.stone = source.stone;
         o.torus = source.torus;
         o.seed = source.seed;
@@ -383,6 +430,37 @@ Scene Scene::subset(const std::vector<int>& indices) const {
     return result;
 }
 
+int Scene::duplicateMirrored(const std::vector<int>& indices, int axis, V3 pivot) {
+    if (axis < 0 || axis > 2) return 0;
+    std::vector<int> visible;
+    for (int index : indices) {
+        if (index < 0 || index >= (int)objs.size()) continue;
+        const auto& obj = objs[index];
+        if (!obj.hidden && !obj.locked && !isInfinite(obj.type)) visible.push_back(index);
+    }
+    if (visible.empty()) return 0;
+    Scene copy = subset(visible);
+    M3 reflection;
+    reflection.m[axis][axis] = -1;
+    std::map<const Heightfield*, std::shared_ptr<Heightfield>> heightCopies;
+    for (auto& obj : copy.objs) {
+        obj.name += " mirror";
+        if (obj.hf) {
+            auto [entry, inserted] = heightCopies.try_emplace(obj.hf.get());
+            if (inserted) entry->second = std::make_shared<Heightfield>(*obj.hf);
+            obj.hf = entry->second;
+        }
+        if (obj.parent < 0) {
+            obj.bind = reflection * obj.bind;
+            obj.bindOffset = pivot + reflection * (obj.bindOffset - pivot);
+            obj.hasBind = true;
+        }
+    }
+    int count = (int)copy.objs.size();
+    append(std::move(copy));
+    return count;
+}
+
 int Scene::maxGroup() const {
     int m = 0;
     for (auto& o : objs) m = std::max(m, o.group);
@@ -411,6 +489,7 @@ int Scene::scatter(const std::vector<int>& sources, int surface, const std::vect
         copy.scl = V3(1);
         copy.keys.clear();
         copy.appearances.clear();
+        copy.terrainKeys.clear();
         prototypes.push_back(std::move(copy));
         lo = {std::min(lo.x, lower.x), std::min(lo.y, lower.y), std::min(lo.z, lower.z)};
         hi = {std::max(hi.x, upper.x), std::max(hi.y, upper.y), std::max(hi.z, upper.z)};
@@ -427,6 +506,8 @@ int Scene::scatter(const std::vector<int>& sources, int surface, const std::vect
         V3 receiverOrigin = receiver.worldPos;
         V3 anchor = receiverInv * (hit.p - receiverOrigin);
         bool terrainTop = receiver.type == ObjType::Terrain && dot(hit.n, receiver.nrm * V3(0, 1, 0)) > 0;
+        float anchorHeight;
+        V3 anchorSlope = terrainTop && align ? terrainSurface(receiver, anchor, anchorHeight) : V3();
         V3 up = align ? hit.n : V3(0, 1, 0);
         V3 right = normalize(cross(up, std::fabs(up.z) < 0.95f ? V3(0, 0, 1) : V3(-1, 0, 0)));
         V3 forward = cross(right, up);
@@ -447,6 +528,7 @@ int Scene::scatter(const std::vector<int>& sources, int surface, const std::vect
             copy.bindOffset = receiverInv * (hit.p + transform * (base.worldPos - pivot) - receiverOrigin);
             copy.terrainAnchor = terrainTop;
             copy.anchorPoint = anchor;
+            copy.anchorNormal = anchorSlope;
             objs.push_back(std::move(copy));
             ++created;
         }
@@ -557,6 +639,20 @@ static float easeTime(Ease ease, float t) {
     if (ease == Ease::Hold) return 0;
     if (ease == Ease::Smooth) return t * t * (3 - 2 * t);
     return t;
+}
+
+static void updateTerrainMorph(Object& object, int frame) {
+    int first, next;
+    float t;
+    if (!keySpan(object.terrainKeys, (float)frame, first, next, t)) {
+        object.morphFrom.reset();
+        object.morphTo.reset();
+        return;
+    }
+    const auto& a = object.terrainKeys[first];
+    object.morphFrom = a.field;
+    object.morphTo = object.terrainKeys[next].field;
+    object.morphWeight = a.ease == Ease::Spline ? easeTime(Ease::Smooth, t) : easeTime(a.ease, t);
 }
 
 template <class K, class G> static V3 motion(const std::vector<K>& v, int a, int b, float t, G get) {
@@ -785,7 +881,7 @@ static bool hitTerrain(const Object& terrain, V3 o, V3 d, LHit& h) {
                 V3 nb = tri == 0 ? f.normal(i + 1, j) : ne, nc = tri == 0 ? ne : f.normal(i, j + 1);
                 h.t = bt;
                 V3 n = na * (1 - bu - bv) + nb * bu + nc * bv;
-                h.n = terrain.terrain.clip > 0 || terrain.terrain.smoothing > 0 ? normalize(tri == 0 ? cross(e - a, b - a) : cross(c - a, e - a)) :
+                h.n = terrain.morphFrom || terrain.terrain.clip > 0 || terrain.terrain.smoothing > 0 ? normalize(tri == 0 ? cross(e - a, b - a) : cross(c - a, e - a)) :
                     normalize({n.x * terrain.terrain.height, n.y, n.z * terrain.terrain.height});
                 return true;
             }
@@ -1609,7 +1705,7 @@ static void writeSky(std::ostream& f, const Sky& k) {
     wv(f, k.stratusColor); wv(f, k.moonColor);
     ws(f, k.environment);
     f << k.environmentYaw << ' ' << k.environmentStrength << ' ' << k.environmentSamples << ' ' << k.environmentBackground << ' '
-      << k.indirectStrength << ' ' << k.indirectSamples << ' ';
+      << k.indirectStrength << ' ' << k.indirectSamples << ' ' << k.indirectBounces << ' ';
 }
 static void readSky(std::istream& f, Sky& k, int ver) {
     rs(f, k.name, ver);
@@ -1647,6 +1743,10 @@ static void readSky(std::istream& f, Sky& k, int ver) {
         k.indirectStrength = clampf(k.indirectStrength, 0, 2);
         k.indirectSamples = std::clamp(k.indirectSamples, 1, 16);
     }
+    if (ver >= 6) {
+        f >> k.indirectBounces;
+        k.indirectBounces = std::clamp(k.indirectBounces, 1, 4);
+    }
 }
 
 static void writeLayer(std::ostream& f, const TextureLayer& l) {
@@ -1655,9 +1755,10 @@ static void writeLayer(std::ostream& f, const TextureLayer& l) {
     for (float value : l.influence) f << value << ' ';
     ws(f, l.image);
     f << l.warp << ' ' << l.contrast << ' ' << l.bias << ' ' << l.maskLow << ' ' << l.maskHigh << ' ' << l.maskFeather << ' ' << l.octaves << ' ';
+    f << (int)l.heightOutput << ' ' << (int)l.transparencyOutput << ' ';
 }
 
-static bool readLayer(std::istream& f, TextureLayer& l, bool shaping) {
+static bool readLayer(std::istream& f, TextureLayer& l, int version) {
     int tex = 0, map = 0, blend = 0, mask = 0;
     if (!(f >> tex >> map >> blend >> mask >> l.texScale >> l.opacity)) return false;
     if (tex < 0 || tex >= (int)TexType::COUNT || map < 0 || map >= (int)TexMap::COUNT ||
@@ -1668,7 +1769,7 @@ static bool readLayer(std::istream& f, TextureLayer& l, bool shaping) {
     for (float& value : l.influence)
         if (!(f >> value) || value < 0 || value > 1) return false;
     rs(f, l.image, 2);
-    if (shaping) {
+    if (version >= 2) {
         f >> l.warp >> l.contrast >> l.bias >> l.maskLow >> l.maskHigh >> l.maskFeather >> l.octaves;
         l.warp = clampf(l.warp, 0, 4);
         l.contrast = clampf(l.contrast, 0, 4);
@@ -1678,6 +1779,13 @@ static bool readLayer(std::istream& f, TextureLayer& l, bool shaping) {
         l.maskFeather = clampf(l.maskFeather, 0.001f, 0.5f);
         l.octaves = std::clamp(l.octaves, 1, 10);
     }
+    if (version >= 3) {
+        int height, transparency;
+        if (!(f >> height >> transparency) || height < 0 || height >= (int)TexOutput::COUNT
+            || transparency < 0 || transparency >= (int)TexOutput::COUNT) return false;
+        l.heightOutput = (TexOutput)height;
+        l.transparencyOutput = (TexOutput)transparency;
+    }
     if (!f) return false;
     l.img.reset();
     return true;
@@ -1685,7 +1793,7 @@ static bool readLayer(std::istream& f, TextureLayer& l, bool shaping) {
 
 bool TextureLayer::save(const std::string& path) const {
     std::ofstream f(path);
-    f << std::setprecision(7) << "CANYONTEX 2\n";
+    f << std::setprecision(7) << "CANYONTEX 3\n";
     writeLayer(f, *this);
     f << '\n';
     return (bool)f;
@@ -1696,7 +1804,7 @@ bool TextureLayer::load(const std::string& path) {
     std::string header;
     int version = 0;
     TextureLayer layer;
-    if (!(f >> header >> version) || header != "CANYONTEX" || version < 1 || version > 2 || !readLayer(f, layer, version >= 2)) return false;
+    if (!(f >> header >> version) || header != "CANYONTEX" || version < 1 || version > 3 || !readLayer(f, layer, version)) return false;
     *this = std::move(layer);
     return true;
 }
@@ -1735,7 +1843,7 @@ static bool readMat(std::istream& f, Material& m, int ver) {
     if (!(f >> count) || count < 0 || count > MAX_TEXTURE_LAYERS) return false;
     m.layers.resize(count);
     for (auto& layer : m.layers)
-        if (!readLayer(f, layer, ver >= 5)) return false;
+        if (!readLayer(f, layer, ver >= 6 ? 3 : (ver >= 5 ? 2 : 1))) return false;
     if (ver >= 4) {
         f >> m.absorption >> m.volumeDensity >> m.volumeScatter >> m.volumeNoise;
         m.absorption = clampf(m.absorption, 0, 10);
@@ -1927,7 +2035,7 @@ void Scene::reloadAssets() {
 bool Scene::writeFile(const std::string& path) const {
     std::ofstream f(path);
     if (!f) return false;
-    f << std::setprecision(9) << "CANYON3D 5\ncamera ";
+    f << std::setprecision(9) << "CANYON3D 6\ncamera ";
     writeCam(f, cam);
     f << "\nsky ";
     writeSky(f, sky);
@@ -2006,7 +2114,7 @@ bool Scene::writeFile(const std::string& path) const {
             f << '\n';
         }
         if (o.instanceSource >= 0) f << "instancesource " << o.instanceSource << '\n';
-        if (o.terrainAnchor) { f << "terrainanchor "; wv(f, o.anchorPoint); f << '\n'; }
+        if (o.terrainAnchor) { f << "terrainanchor "; wv(f, o.anchorPoint); wv(f, o.anchorNormal); f << '\n'; }
         if (o.type == ObjType::Metaball) f << "metaball " << o.metaRadius << ' ' << o.metaStrength << ' ' << o.metaNegative << "\n";
         if (isLight(o.type)) {
             f << "lightfx "; writeLightSettings(f, o.lighting); f << '\n';
@@ -2047,6 +2155,11 @@ bool Scene::writeFile(const std::string& path) const {
                 f << "\n";
             } else f << "terrainref " << at->second << '\n';
         }
+        for (const auto& key : o.terrainKeys) {
+            f << "terrainkey " << key.frame << ' ' << (int)key.ease << ' ' << key.field->res << '\n';
+            for (float value : key.field->h) f << value << ' ';
+            f << '\n';
+        }
         if (o.type == ObjType::Mesh && o.mesh && !o.mesh->v.empty() && !o.treePart && o.instanceSource < 0) {
             auto [at, added] = storedMeshes.emplace(o.mesh.get(), objectIndex);
             if (added) {
@@ -2071,7 +2184,7 @@ bool Scene::load(const std::string& path) {
     std::ifstream f(path);
     std::string tok;
     int ver = 0;
-    if (!(f >> tok >> ver) || tok != "CANYON3D" || ver < 1 || ver > 5) return false;
+    if (!(f >> tok >> ver) || tok != "CANYON3D" || ver < 1 || ver > 6) return false;
     Scene s;
     size_t embeddedPixels = 0;
     s.sky = skyPresets()[0];
@@ -2208,6 +2321,7 @@ bool Scene::load(const std::string& path) {
             if (ver < 5 || s.objs.empty()) return false;
             s.objs.back().terrainAnchor = true;
             rv(f, s.objs.back().anchorPoint);
+            if (ver >= 6) rv(f, s.objs.back().anchorNormal);
         } else if (tok == "waterwaves") {
             if (ver < 5 || s.objs.empty() || s.objs.back().type != ObjType::Water) return false;
             auto& o = s.objs.back();
@@ -2278,6 +2392,19 @@ bool Scene::load(const std::string& path) {
                 if (lighting && (!isLight(s.objs.back().type) || !readLightSettings(f, k.lighting.emplace(), ver))) return false;
             }
             putKey(s.objs.back().appearances, k);
+        } else if (tok == "terrainkey") {
+            if (ver < 6 || s.objs.empty() || !isHeightfield(s.objs.back().type)) return false;
+            auto& keys = s.objs.back().terrainKeys;
+            TerrainKey key;
+            int res;
+            if (!(f >> key.frame) || key.frame < 0 || key.frame > 100000 || !readEase(f, key.ease)
+                || !(f >> res) || res < 2 || res > 1025 || keys.size() >= 32) return false;
+            auto field = std::make_shared<Heightfield>();
+            field->res = res;
+            field->h.resize((size_t)res * res);
+            for (float& value : field->h) if (!(f >> value) || value < 0 || value > 1) return false;
+            key.field = std::move(field);
+            putKey(keys, key);
         } else if (tok == "terrainshape") {
             if (ver < 4 || s.objs.empty() || !isHeightfield(s.objs.back().type) || !readTerrainShape(f, s.objs.back().terrain, ver)) return false;
         } else if (tok == "terrainref" || tok == "meshref") {
@@ -2390,7 +2517,7 @@ void Scene::append(Scene other) {
 bool Library::save(const std::string& path) const {
     std::ofstream f(path);
     if (!f) return false;
-    f << std::setprecision(7) << "CANYONLIB 5\n";
+    f << std::setprecision(7) << "CANYONLIB 6\n";
     for (auto& m : mats) { f << "material "; writeMat(f, m); f << "\n"; }
     for (auto& k : skies) { f << "sky "; writeSky(f, k); f << "\n"; }
     return (bool)f;
@@ -2400,7 +2527,7 @@ bool Library::load(const std::string& path) {
     std::ifstream f(path);
     std::string tok;
     int ver = 0;
-    if (!(f >> tok >> ver) || tok != "CANYONLIB" || ver < 2 || ver > 5) return false;
+    if (!(f >> tok >> ver) || tok != "CANYONLIB" || ver < 2 || ver > 6) return false;
     Library l;
     while (f >> tok) {
         if (tok == "material") {

@@ -1,0 +1,15 @@
+[
+  {"op": "title", "title": "Lanterns over Cedar Lake"},
+  {"op": "sky", "preset": "Overcast"},
+  {"op": "terrain", "name": "North Shore", "kind": "Rolling Hills", "seed": 21, "position": [0, -2, -8], "scale": [16, 7, 20]},
+  {"op": "material", "name": "North Shore", "preset": "Alpine Meadow"},
+  {"op": "layer", "name": "North Shore", "texture": "Ridged", "color_a": [0.28, 0.39, 0.19], "color_b": [0.44, 0.32, 0.24], "opacity": 0.45},
+  {"op": "object", "name": "Lake", "kind": "Water", "position": [0, 0.2, 0]},
+  {"op": "material", "name": "Lake", "preset": "Tropical Lagoon"},
+  {"op": "tree", "name": "Cedar", "position": [-14, 0, -20], "scale": [1.8, 1.8, 1.8], "seed": 40},
+  {"op": "scatter", "surface": "North Shore", "source": "Cedar", "count": 25, "seed": 81, "min": [-13, 0, -24], "max": [12, 30, -7]},
+  {"op": "object", "name": "Lantern", "kind": "Sphere", "position": [3, 3.0, -5], "scale": [0.65, 0.65, 0.65]},
+  {"op": "material", "name": "Lantern", "preset": "Bronze"},
+  {"op": "camera", "target": [0, 2, -7], "distance": 32, "pitch": 14, "yaw": 21},
+  {"op": "render", "width": 800, "height": 500, "quality": 1}
+]
