@@ -1,5 +1,15 @@
 # Bryce 7.1 feature gaps
 
+## Production modeling and animation
+
+- [ ] Editable polygon topology with independent UV corners, reusable selections, and large mesh editing.
+- [ ] Expanded topology operations including inset, bevel, weld, loop cuts, bridge, fill, knife, symmetry, and cleanup.
+- [ ] Modifier evaluation, richer UV editing, multiple material assignments, and interchange of these attributes.
+- [x] Skeleton creation, joint posing, skin binding, weight editing, and deformation through playback, save, and render.
+- [ ] Rig editing depth including weight painting and mirroring, bone tools, joint-local orientation controls, and larger deformation benchmarks.
+- [ ] Character animation with IK, constraints, reusable actions, retargeting, and clips.
+- [ ] Independent animation channels, curve handles, graph navigation, multi-key operations, and curve validation.
+
 The scores reflect impact on landscape work, from **10** for major workflow gaps to **1** for specialized features. Completed changes are recorded in [CHANGELOG.md](CHANGELOG.md). The comparison uses the Daz feature overview, help topics and Bryce 7 Artist Guide. Side-by-side verification with an installed Bryce 7.1 Pro remains open.
 
 ## Priority 9

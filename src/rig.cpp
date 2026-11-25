@@ -1,0 +1,291 @@
+#include "scene.h"
+
+namespace {
+
+bool finiteV(V3 v) {
+    return std::fabs(v.x) <= 1e6f && std::fabs(v.y) <= 1e6f && std::fabs(v.z) <= 1e6f;
+}
+
+bool validKey(const Key& key) {
+    return key.frame >= 0 && key.frame < 100000 && finiteV(key.pos) && finiteV(key.rot) && finiteV(key.scl) &&
+           key.scl.x >= .01f && key.scl.y >= .01f && key.scl.z >= .01f && key.scl.x <= 100 && key.scl.y <= 100 &&
+           key.scl.z <= 100 && key.ease >= Ease::Spline && key.ease < Ease::COUNT;
+}
+
+M3 restBasis(V3 direction) {
+    V3 y = normalize(direction);
+    V3 x = normalize(cross(y, std::fabs(y.z) < .9f ? V3(0, 0, 1) : V3(1, 0, 0)));
+    V3 z = cross(x, y);
+    M3 m;
+    for (int i = 0; i < 3; ++i) {
+        m.m[i][0] = x[i];
+        m.m[i][1] = y[i];
+        m.m[i][2] = z[i];
+    }
+    return m;
+}
+
+V3 perpendicular(V3 direction) {
+    return normalize(cross(direction, std::fabs(direction.z) < .9f ? V3(0, 0, 1) : V3(1, 0, 0)));
+}
+
+M3 turnTowards(V3 from, V3 to, float influence) {
+    from = normalize(from);
+    to = normalize(to);
+    V3 axis = cross(from, to);
+    float sine = length(axis);
+    float cosine = clampf(dot(from, to), -1, 1);
+    if (sine < 1e-7f && cosine >= 0) return {};
+    axis = sine > 1e-7f ? axis / sine : perpendicular(from);
+    float angle = std::atan2(sine, cosine) * influence;
+    float c = std::cos(angle), s = std::sin(angle);
+    M3 rotation;
+    const V3 axes[] = {{1,0,0}, {0,1,0}, {0,0,1}};
+    for (int i = 0; i < 3; ++i) {
+        V3 column = axes[i] * c + cross(axis, axes[i]) * s + axis * (axis[i] * (1 - c));
+        for (int row = 0; row < 3; ++row) rotation.m[row][i] = column[row];
+    }
+    return rotation;
+}
+
+void rotateSubtree(const Rig& rig, std::vector<PosedJoint>& posed, int root, const M3& rotation) {
+    V3 pivot = posed[root].head;
+    std::array<bool, MAX_RIG_JOINTS> affected{};
+    affected[root] = true;
+    for (int i = root; i < (int)posed.size(); ++i) {
+        int parent = rig.joints[i].parent;
+        if (i != root && (parent < 0 || !affected[parent])) continue;
+        affected[i] = true;
+        auto& joint = posed[i];
+        joint.head = pivot + rotation * (joint.head - pivot);
+        joint.tail = pivot + rotation * (joint.tail - pivot);
+        joint.basis = rotation * joint.basis;
+    }
+}
+
+void applyIK(const Rig& rig, std::vector<PosedJoint>& posed, const RigIK& chain, int frame) {
+    IKKey goal = sampleIK(chain, (float)frame);
+    if (goal.influence <= 0) return;
+    int root = rig.joints[chain.end].parent;
+    V3 origin = posed[root].head;
+    V3 upper = posed[chain.end].head - origin;
+    V3 lower = posed[chain.end].tail - posed[chain.end].head;
+    float a = length(upper), b = length(lower);
+    if (a < 1e-6f || b < 1e-6f) return;
+    V3 reach = goal.target - origin;
+    float distance = length(reach);
+    V3 aim = distance > 1e-6f ? reach / distance : normalize(upper);
+    float epsilon = std::min(a, b) * 1e-5f;
+    float d = clampf(distance, std::fabs(a - b) + epsilon, a + b);
+    V3 pole = goal.pole - origin;
+    V3 side = pole - aim * dot(pole, aim);
+    if (length(side) < 1e-6f) side = upper - aim * dot(upper, aim);
+    side = length(side) > 1e-6f ? normalize(side) : perpendicular(aim);
+    float along = clampf((a * a - b * b + d * d) / (2 * d), -a, a);
+    V3 elbow = aim * along + side * std::sqrt(std::max(0.f, a * a - along * along));
+    V3 end = origin + aim * d;
+    rotateSubtree(rig, posed, root, turnTowards(upper, elbow, goal.influence));
+    V3 moved = posed[chain.end].head;
+    rotateSubtree(rig, posed, chain.end, turnTowards(posed[chain.end].tail - moved, end - moved, goal.influence));
+}
+
+}  // namespace
+
+bool validRig(const Rig& rig, size_t vertices) {
+    if (rig.joints.empty() || rig.joints.size() > MAX_RIG_JOINTS || vertices > MAX_SKIN_VERTICES ||
+        (!rig.weights.empty() && rig.weights.size() != vertices)) return false;
+    for (size_t i = 0; i < rig.joints.size(); ++i) {
+        const auto& joint = rig.joints[i];
+        if (joint.parent < -1 || joint.parent >= (int)i || joint.name.empty() || joint.name.size() > 120 ||
+            !finiteV(joint.head) || !finiteV(joint.tail) || length(joint.tail - joint.head) < .0001f ||
+            !validKey(joint.pose) || joint.keys.size() > MAX_JOINT_KEYS) return false;
+        int last = -1;
+        for (const auto& key : joint.keys) {
+            if (!validKey(key) || key.frame <= last) return false;
+            last = key.frame;
+        }
+    }
+    for (const auto& v : rig.weights) {
+        float total = 0;
+        for (size_t i = 0; i < v.weight.size(); ++i) {
+            if (v.joint[i] >= rig.joints.size() || !(v.weight[i] >= 0 && v.weight[i] <= 1)) return false;
+            if (v.weight[i] > 0) {
+                for (size_t j = 0; j < i; ++j)
+                    if (v.weight[j] > 0 && v.joint[j] == v.joint[i]) return false;
+            }
+            total += v.weight[i];
+        }
+        if (total > 0 && std::fabs(total - 1.f) > .001f) return false;
+    }
+    if (rig.ik.size() > rig.joints.size() / 2) return false;
+    auto validGoal = [](const IKKey& key) {
+        return key.frame >= 0 && key.frame < 100000 && finiteV(key.target) && finiteV(key.pole) &&
+               key.influence >= 0 && key.influence <= 1 && key.ease >= Ease::Spline && key.ease < Ease::COUNT;
+    };
+    std::array<bool, MAX_RIG_JOINTS> driven{};
+    for (const auto& chain : rig.ik) {
+        if (chain.end < 0 || chain.end >= (int)rig.joints.size() || !validGoal(chain.settings) ||
+            chain.keys.size() > MAX_JOINT_KEYS) return false;
+        const Joint& end = rig.joints[chain.end];
+        int start = end.parent;
+        if (start < 0 || driven[start] || driven[chain.end] ||
+            length(end.head - rig.joints[start].head) < .0001f) return false;
+        driven[start] = driven[chain.end] = true;
+        int last = -1;
+        for (const auto& key : chain.keys) {
+            if (!validGoal(key) || key.frame <= last) return false;
+            last = key.frame;
+        }
+    }
+    return true;
+}
+
+std::vector<PosedJoint> poseRig(const Rig& rig, int frame) {
+    std::vector<PosedJoint> posed;
+    posed.reserve(rig.joints.size());
+    for (const auto& joint : rig.joints) {
+        Key key = sampleTransformTrack(joint.keys, (float)frame, joint.pose);
+        V3 head = joint.head;
+        M3 rest = restBasis(joint.tail - joint.head);
+        M3 basis = rest;
+        if (joint.parent >= 0) {
+            const auto& parent = posed[joint.parent];
+            M3 transform = parent.basis * parent.inverseBind;
+            head = parent.head + transform * (head - rig.joints[joint.parent].head);
+            basis = transform * basis;
+        }
+        head += basis * key.pos;
+        basis = basis * rotY(rad(key.rot.y)) * rotX(rad(key.rot.x)) * rotZ(rad(key.rot.z)) * scaleM(key.scl);
+        V3 tail = head + basis.col(1) * length(joint.tail - joint.head);
+        if (!finiteV(head) || !finiteV(tail) || !finiteV(basis.col(0)) ||
+            !finiteV(basis.col(1)) || !finiteV(basis.col(2))) return {};
+        posed.push_back({head, tail, basis, rest.transpose()});
+    }
+    if (!rig.ik.empty()) {
+        std::vector<const RigIK*> chains;
+        for (const auto& chain : rig.ik) chains.push_back(&chain);
+        std::sort(chains.begin(), chains.end(), [&](const RigIK* a, const RigIK* b) {
+            return rig.joints[a->end].parent < rig.joints[b->end].parent;
+        });
+        for (const RigIK* chain : chains) applyIK(rig, posed, *chain, frame);
+    }
+    return posed;
+}
+
+bool bindRig(Rig& rig, const Mesh& mesh) {
+    if (mesh.v.empty() || mesh.v.size() > MAX_SKIN_VERTICES || rig.joints.empty() ||
+        rig.joints.size() > MAX_RIG_JOINTS) return false;
+    std::vector<V3> directions;
+    std::vector<float> invLengths;
+    for (const auto& joint : rig.joints) {
+        V3 delta = joint.tail - joint.head;
+        float square = dot(delta, delta);
+        if (!(square >= 1e-8f)) return false;
+        directions.push_back(delta);
+        invLengths.push_back(1.f / square);
+    }
+    float epsilon = std::max(.00001f, length(mesh.bmax - mesh.bmin) * .02f);
+    std::vector<SkinWeights> weights(mesh.v.size());
+    for (size_t v = 0; v < mesh.v.size(); ++v) {
+        std::array<float, 4> distances{1e30f, 1e30f, 1e30f, 1e30f};
+        auto& vertex = weights[v];
+        for (size_t j = 0; j < rig.joints.size(); ++j) {
+            V3 offset = mesh.v[v] - rig.joints[j].head;
+            V3 delta = directions[j];
+            V3 near = offset - delta * clampf(dot(offset, delta) * invLengths[j], 0, 1);
+            float square = dot(near, near);
+            for (size_t slot = 0; slot < distances.size(); ++slot) {
+                if (square >= distances[slot]) continue;
+                for (size_t s = distances.size() - 1; s > slot; --s) {
+                    distances[s] = distances[s - 1];
+                    vertex.joint[s] = vertex.joint[s - 1];
+                }
+                distances[slot] = square;
+                vertex.joint[slot] = (uint16_t)j;
+                break;
+            }
+        }
+        float total = 0;
+        size_t count = std::min(distances.size(), rig.joints.size());
+        for (size_t i = 0; i < count; ++i) {
+            vertex.weight[i] = 1.f / (distances[i] + epsilon * epsilon);
+            total += vertex.weight[i];
+        }
+        if (!(total > 0)) return false;
+        for (auto& weight : vertex.weight) weight /= total;
+    }
+    rig.weights = std::move(weights);
+    return true;
+}
+
+bool setSkinWeight(SkinWeights& weights, int joint, float weight, size_t jointCount) {
+    if (joint < 0 || (size_t)joint >= jointCount || !(weight >= 0 && weight <= 1)) return false;
+    SkinWeights result;
+    size_t others = 0;
+    for (size_t i = 0; i < weights.weight.size(); ++i) {
+        if (weights.weight[i] <= 0 || weights.joint[i] == joint) continue;
+        result.joint[others] = weights.joint[i];
+        result.weight[others++] = weights.weight[i];
+    }
+    if (weight > 0 && others == result.weight.size()) {
+        size_t weakest = (size_t)(std::min_element(result.weight.begin(), result.weight.end()) - result.weight.begin());
+        --others;
+        result.joint[weakest] = result.joint[others];
+        result.weight[weakest] = result.weight[others];
+        result.weight[others] = 0;
+    }
+    if (others == 0 && weight > 0 && weight < 1) {
+        if (jointCount < 2) return false;
+        result.joint[0] = (uint16_t)(joint == 0 ? 1 : 0);
+        result.weight[0] = 1;
+        others = 1;
+    }
+    float total = 0;
+    for (float item : result.weight) total += item;
+    if (total > 0) {
+        float scale = (1 - weight) / total;
+        for (float& item : result.weight) item *= scale;
+    }
+    if (weight > 0) {
+        if (others >= result.weight.size()) return false;
+        result.joint[others] = (uint16_t)joint;
+        result.weight[others] = weight;
+    }
+    weights = result;
+    return true;
+}
+
+std::shared_ptr<const Mesh> deformRig(const Rig& rig, const Mesh& mesh, int frame) {
+    if (rig.weights.empty() || rig.weights.size() != mesh.v.size()) return {};
+    auto posed = poseRig(rig, frame);
+    if (posed.size() != rig.joints.size()) return {};
+    std::vector<M3> transforms, normals;
+    for (auto& joint : posed) {
+        transforms.push_back(joint.basis * joint.inverseBind);
+        normals.push_back(transforms.back().inverse().transpose());
+    }
+    auto result = std::make_shared<Mesh>();
+    result->tri = mesh.tri;
+    result->uv = mesh.uv;
+    result->v.resize(mesh.v.size());
+    bool sourceNormals = mesh.n.size() == mesh.v.size();
+    if (sourceNormals) result->n.resize(mesh.v.size());
+    for (size_t v = 0; v < mesh.v.size(); ++v) {
+        const auto& skin = rig.weights[v];
+        V3 p, n;
+        float total = 0;
+        for (size_t i = 0; i < skin.weight.size(); ++i) {
+            float weight = skin.weight[i];
+            if (weight <= 0) continue;
+            uint16_t j = skin.joint[i];
+            p += (posed[j].head + transforms[j] * (mesh.v[v] - rig.joints[j].head)) * weight;
+            if (sourceNormals) n += normals[j] * mesh.n[v] * weight;
+            total += weight;
+        }
+        result->v[v] = total > 0 ? p / total : mesh.v[v];
+        if (!finiteV(result->v[v])) return {};
+        if (sourceNormals) result->n[v] = length(n) > 1e-8f ? normalize(n) : mesh.n[v];
+    }
+    result->build();
+    return result;
+}

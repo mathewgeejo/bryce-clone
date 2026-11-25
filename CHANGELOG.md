@@ -1,5 +1,18 @@
 # Implementation log
 
+## Skeletal rigging and skinning
+
+- Added a rig editor for creating and naming joints, changing their parent and rest positions, posing, setting keys, and binding and editing skin weights.
+- Connected articulated meshes to the viewport, scene bounds, ray tracing, mesh export, linked instances, and timeline. Added native rig persistence and joint tracks in the Curve Editor.
+- Passed the Windows core suite and Linux-target syntax checks. Verified skeleton creation, binding, pose edits, and joint curve keys on the Windows desktop. Rendered different poses from two frames of a reloaded scene.
+
+## Mesh components and animation curves
+
+- Added a mesh editor with vertex, edge, and face selection, local transforms, face region extrusion, subdivision, face deletion, winding reversal, and planar UV projection.
+- Added procedural solid conversion, including exact cube topology, and connected mesh edits to scene undo, rendering, and persistence.
+- Added a transform curve editor with graph scrubbing, key value dragging, retiming, copying, and interpolation controls. The editor samples the same interpolation as playback.
+- Passed the Windows core suite and Linux-target syntax checks. The Windows desktop check converted a cube, extruded a face, subdivided the mesh, and saved two transform keys after a graph edit.
+
 ## Simulation presets and animation clips
 
 - Added Water, Oil, Syrup, and Lava with distinct materials and flow settings. Added a 512-particle detail mode and faster liquid neighbor searches.

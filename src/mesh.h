@@ -24,6 +24,12 @@ struct MeshLayer { std::string name; Mesh mesh; };
 bool loadDXF(const std::string& path, std::vector<MeshLayer>& layers, float scale, bool zUp, bool split, std::string& err);
 bool saveGeometry(const std::string& path, const std::vector<MeshLayer>& layers, bool dxf);
 
+Mesh makeEditableBox();
+bool subdivideMesh(Mesh& mesh);
+bool extrudeMeshFaces(Mesh& mesh, const std::vector<size_t>& faces, float distance);
+bool deleteMeshFaces(Mesh& mesh, const std::vector<size_t>& faces);
+void projectMeshUV(Mesh& mesh, int axis);
+
 struct TreeParams {
     float height = 1.f, spread = 38.f, trunkRadius = 0.05f, leafSize = 0.07f, leafDensity = 1.f;
     int levels = 3, branches = 4;

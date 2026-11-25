@@ -66,6 +66,28 @@ Close the studio before rebuilding so the linker can replace `Brycescape.exe`. T
 - Animate transforms and appearance tracks, switch between named cameras, and render stills, panoramas or numbered animation frames.
 - Save scene fragments in the thumbnail library. Package, embed or relink image assets through **Commands**.
 
+## Edit meshes and animation curves
+
+Select an object and open **F1 → Mesh Editor**. An imported mesh opens directly. Use **Convert Selection to Mesh** to turn a supported procedural solid into editable triangles. Cubes convert to an eight-vertex box.
+
+- Choose **Vertices**, **Edges**, or **Faces**, then click in the wire view. Shift-click toggles components. The 3D, Front, Top, and Side views help reach overlapping components.
+- Set local X, Y, and Z values and apply **Move**, **Rotate**, or **Scale**. Rotation and scale use the selection center.
+- In face mode, extrude a face region, delete faces, or reverse their winding. **Subdivide Mesh** splits each triangle into four with shared edge midpoints. Planar UV projection replaces the current UV coordinates along the chosen axis.
+
+The editor works with indexed triangles and supports up to 100,000 triangles per mesh. Existing UV seams retain their separate vertex indices. Reproject UVs when newly extruded sides need texture coordinates. **OK** commits one undoable edit and **Cancel** discards the session.
+
+Open **F1 → Curve Editor** with an object selected to inspect Location, Rotation, and Scale along each axis. Drag the graph background to scrub. Click a key to select it, drag vertically to change its value, or use the controls to retime, copy, remove, and change interpolation. Each transform key shares its frame and interpolation across all nine components. The graph samples the same curves used for playback.
+
+### Rig and pose a mesh
+
+Select a mesh and open **F1 → Rig Editor**. In **Skeleton**, add a root and child joints, select them in the preview, and adjust their rest positions. Click the joint name to rename it. **Bind Skin** assigns weights from joint distances.
+
+Use **Weights** to assign an influence to selected rest vertices. Shift-click toggles vertices, including coincident copies along a UV seam. Each vertex supports four influences. The editor adjusts the other weights when you assign one.
+
+In **Pose**, select a joint, set a frame, and adjust its local translation, rotation, or scale. **Set Pose Key** makes the pose part of the animation. Editing an animated joint at another frame sets a key there. The **Curve Editor** can switch between the object and its joint tracks. Click the joint name to cycle tracks and Shift-click to cycle backward.
+
+Rigged scenes save in `.c3d` version 7. Rendering and geometry export use the current pose. Linked instances share the source pose until you make them unique. Unbind before changing the mesh's topology.
+
 ## Simulate physics and liquid
 
 Open **Edit → Simulation** or choose **Simulation** from the **F1** command palette. Select a source object or use **Add Liquid Source** or **Add Drop Body** to place a starter above the scene. Choose the presets, clip length, and detail, then click **Bake & Play**. The preview stops at the last baked frame. **Bake** leaves the timeline at the start of the clip. **Ctrl+Z** undoes the bake.

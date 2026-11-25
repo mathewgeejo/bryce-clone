@@ -132,6 +132,49 @@ constexpr int MAX_TERRAIN_RESOLUTION = 4097;
 enum class Ease { Spline, Linear, Smooth, Hold, COUNT };
 const char* easeName(Ease ease);
 struct Key { int frame = 0; V3 pos, rot, scl{1, 1, 1}; Ease ease = Ease::Spline; };
+Key sampleTransformTrack(const std::vector<Key>& keys, float frame, const Key& fallback);
+constexpr int MAX_RIG_JOINTS = 256;
+constexpr size_t MAX_SKIN_VERTICES = 1000000;
+constexpr int MAX_JOINT_KEYS = 10000;
+
+struct Joint {
+    std::string name;
+    int parent = -1;
+    V3 head, tail{0, 1, 0};
+    Key pose;
+    std::vector<Key> keys;
+};
+struct SkinWeights {
+    std::array<uint16_t, 4> joint{};
+    std::array<float, 4> weight{};
+};
+struct IKKey {
+    int frame = 0;
+    V3 target, pole;
+    float influence = 1;
+    Ease ease = Ease::Linear;
+};
+struct RigIK {
+    int end = -1;
+    IKKey settings;
+    std::vector<IKKey> keys;
+};
+struct Rig {
+    std::vector<Joint> joints;
+    std::vector<SkinWeights> weights;
+    std::vector<RigIK> ik;
+};
+struct PosedJoint {
+    V3 head, tail;
+    M3 basis;
+    M3 inverseBind;
+};
+bool validRig(const Rig& rig, size_t vertices);
+IKKey sampleIK(const RigIK& ik, float frame);
+std::vector<PosedJoint> poseRig(const Rig& rig, int frame);
+bool bindRig(Rig& rig, const Mesh& mesh);
+bool setSkinWeight(SkinWeights& weights, int joint, float weight, size_t jointCount);
+std::shared_ptr<const Mesh> deformRig(const Rig& rig, const Mesh& mesh, int frame);
 struct TerrainKey { int frame = 0; std::shared_ptr<const Heightfield> field; Ease ease = Ease::Linear; };
 struct Camera;
 
@@ -200,19 +243,26 @@ struct Object {
     TreeParams tree;
     std::shared_ptr<Heightfield> hf;
     std::shared_ptr<const Mesh> mesh;
+    std::shared_ptr<const Rig> rig;
     std::vector<Key> keys;
     std::vector<AppearanceKey> appearances;
     std::vector<TerrainKey> terrainKeys;
     // derived by update()
     std::shared_ptr<const Heightfield> morphFrom, morphTo;
+    std::shared_ptr<const Mesh> posedMesh;
+    std::weak_ptr<const Mesh> skinSource;
+    std::weak_ptr<const Rig> skinRig;
+    int skinFrame = -1;
     float morphWeight = 0;
     M3 fwd, inv, nrm, parentSpace, parentInv;
     V3 bcenter, worldPos;
     float bradius = -1;
     bool csg = false;
     void update(const Camera* camera = nullptr, const Object* ancestor = nullptr);
+    const Mesh* visibleMesh() const { return posedMesh ? posedMesh.get() : mesh.get(); }
     void moveWorld(V3 delta) { pos += parentInv * delta; }
-    Key transformAt(int frame) const;
+    Key transformAt(int frame) const { return sampleTransform((float)frame); }
+    Key sampleTransform(float frame) const;
     float rawTerrainAt(int x, int z) const;
     float terrainAt(int x, int z) const {
         float value = rawTerrainAt(x, z);

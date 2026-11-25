@@ -97,10 +97,12 @@ bool localBounds(const Object& o, V3& lo, V3& hi) {
         if (o.stone.irregularity > 1) { hi = V3(0.8f + 0.48f * o.stone.irregularity); lo = -hi; }
         break;
     case ObjType::Disc: case ObjType::Square: lo.y = -0.01f; hi.y = 0.01f; break;
-    case ObjType::Mesh:
-        if (!o.mesh || o.mesh->v.empty()) return false;
-        lo = o.mesh->bmin; hi = o.mesh->bmax;
+    case ObjType::Mesh: {
+        const Mesh* mesh = o.visibleMesh();
+        if (!mesh || mesh->v.empty()) return false;
+        lo = mesh->bmin; hi = mesh->bmax;
         break;
+    }
     default:
         if (isInfinite(o.type) || isLight(o.type)) return false;
     }
@@ -232,9 +234,27 @@ static void updateTerrainMorph(Object& object, int frame);
 
 void Scene::updateAll() {
     for (auto& object : objs) updateTerrainMorph(object, frame);
+    for (auto& o : objs) {
+        if (o.instanceSource >= 0) continue;
+        if (!o.rig || !o.mesh || o.rig->weights.empty()) {
+            o.posedMesh.reset();
+            o.skinRig.reset();
+            continue;
+        }
+        bool animated = std::any_of(o.rig->joints.begin(), o.rig->joints.end(), [](const Joint& j) { return !j.keys.empty(); }) ||
+                        std::any_of(o.rig->ik.begin(), o.rig->ik.end(), [](const RigIK& chain) { return !chain.keys.empty(); });
+        int poseFrame = animated ? frame : 0;
+        if (o.skinFrame != poseFrame || o.skinSource.lock() != o.mesh || o.skinRig.lock() != o.rig) {
+            o.posedMesh = deformRig(*o.rig, *o.mesh, poseFrame);
+            o.skinSource = o.mesh;
+            o.skinRig = o.rig;
+            o.skinFrame = poseFrame;
+        }
+    }
     for (Object& o : objs) if (o.instanceSource >= 0 && o.instanceSource < (int)objs.size()) {
         const Object& source = objs[o.instanceSource];
         o.mesh = source.mesh;
+        o.posedMesh = source.posedMesh;
         o.hf = source.hf;
         o.terrain = source.terrain;
         o.morphFrom = source.morphFrom;
@@ -417,7 +437,11 @@ Scene Scene::subset(const std::vector<int>& indices) const {
         result.objs.push_back(objs[i]);
     }
     for (Object& o : result.objs) {
-        if (o.instanceSource >= 0) o.instanceSource = remap[o.instanceSource];
+        if (o.instanceSource >= 0) {
+            int original = o.instanceSource;
+            o.instanceSource = remap[original];
+            if (o.instanceSource < 0) o.rig = objs[original].rig;
+        }
         if (o.parent < 0) continue;
         int newParent = remap[o.parent];
         if (newParent < 0) bindParent(o, -1, nullptr);
@@ -492,6 +516,7 @@ int Scene::scatter(const std::vector<int>& sources, int surface, const std::vect
         if (o.hidden || o.csg || isLight(o.type) || o.type == ObjType::Metaball || !worldBounds(o, lower, upper)) continue;
         Object copy = o;
         copy.instanceSource = o.instanceSource < 0 ? index : o.instanceSource;
+        copy.rig.reset();
         copy.name += " instance";
         copy.parent = surface;
         copy.terrainAnchor = false;
@@ -625,7 +650,9 @@ template <class K> static bool keySpan(const std::vector<K>& v, float f, int& i0
     t = 0;
     if (f <= v.front().frame) return true;
     if (f >= v.back().frame) { i0 = i1 = (int)v.size() - 1; return true; }
-    for (i1 = 1; v[i1].frame <= f; ++i1) {}
+    i1 = (int)(std::upper_bound(v.begin(), v.end(), f, [](float time, const K& key) {
+        return time < key.frame;
+    }) - v.begin());
     i0 = i1 - 1;
     t = (f - v[i0].frame) / (float)(v[i1].frame - v[i0].frame);
     return true;
@@ -671,14 +698,40 @@ template <class K, class G> static V3 motion(const std::vector<K>& v, int a, int
     return v[a].ease == Ease::Spline ? spline(v, a, b, t, get) : lerp(get(v[a]), get(v[b]), easeTime(v[a].ease, t));
 }
 
-Key Object::transformAt(int frame) const {
+Key sampleTransformTrack(const std::vector<Key>& keys, float frame, const Key& fallback) {
     int first, next;
     float t;
-    if (!keySpan(keys, (float)frame, first, next, t)) return {frame, pos, rot, scl};
+    if (!keySpan(keys, frame, first, next, t)) {
+        Key value = fallback;
+        value.frame = (int)frame;
+        return value;
+    }
     V3 scale = motion(keys, first, next, t, [](const Key& k) { return k.scl; });
-    return {frame, motion(keys, first, next, t, [](const Key& k) { return k.pos; }),
+    return {(int)frame, motion(keys, first, next, t, [](const Key& k) { return k.pos; }),
             motion(keys, first, next, t, [](const Key& k) { return k.rot; }),
             {std::max(scale.x, .01f), std::max(scale.y, .01f), std::max(scale.z, .01f)}, keys[first].ease};
+}
+
+Key Object::sampleTransform(float frame) const {
+    return sampleTransformTrack(keys, frame, {0, pos, rot, scl});
+}
+
+IKKey sampleIK(const RigIK& ik, float frame) {
+    int first, next;
+    float t;
+    if (!keySpan(ik.keys, frame, first, next, t)) {
+        IKKey goal = ik.settings;
+        goal.frame = (int)frame;
+        return goal;
+    }
+    const IKKey& a = ik.keys[first];
+    const IKKey& b = ik.keys[next];
+    float blend = a.ease == Ease::Spline ?
+                  spline(ik.keys, first, next, t, [](const IKKey& key) { return key.influence; }) :
+                  lerpf(a.influence, b.influence, easeTime(a.ease, t));
+    return {(int)frame, motion(ik.keys, first, next, t, [](const IKKey& key) { return key.target; }),
+            motion(ik.keys, first, next, t, [](const IKKey& key) { return key.pole; }),
+            clampf(blend, 0, 1), a.ease};
 }
 
 AppearanceKey Object::appearance(int f) const {
@@ -1104,7 +1157,8 @@ static bool intersectObj(const Object& ob, const Ray& r, float tmax, Hit& h) {
     case ObjType::Mesh: {
         float t;
         V3 n;
-        if (ob.mesh && ob.mesh->intersect(lo, ld, EPS, tmax, t, n, ob.flatMesh, &h.uv)) { lh = {t, n}; ok = true; }
+        const Mesh* mesh = ob.visibleMesh();
+        if (mesh && mesh->intersect(lo, ld, EPS, tmax, t, n, ob.flatMesh, &h.uv)) { lh = {t, n}; ok = true; }
         break;
     }
     default: ok = hitPlane(lo, ld, lh); break;
@@ -1542,8 +1596,8 @@ void wireframe(const Object& o, std::vector<V3>& s) {
     case ObjType::Terrain: if (o.hf && o.hf->res > 1) grid(*o.hf, 1); break;
     case ObjType::Lattice: if (o.hf && o.hf->res > 1) { grid(*o.hf, 1); grid(*o.hf, -1); } break;
     case ObjType::Mesh:
-        if (o.mesh) {
-            const Mesh& m = *o.mesh;
+        if (const Mesh* mesh = o.visibleMesh()) {
+            const Mesh& m = *mesh;
             int n = m.triCount(), step = std::max(1, n / 1500);
             for (int t = 0; t < n; t += step) {
                 V3 a = m.v[m.tri[t * 3]], b = m.v[m.tri[t * 3 + 1]], c = m.v[m.tri[t * 3 + 2]];
@@ -2059,7 +2113,9 @@ void Scene::reloadAssets() {
 bool Scene::writeFile(const std::string& path) const {
     std::ofstream f(path);
     if (!f) return false;
-    f << std::setprecision(9) << "CANYON3D 6\ncamera ";
+    bool hasRig = std::any_of(objs.begin(), objs.end(), [](const Object& o) { return bool(o.rig); });
+    bool hasIK = std::any_of(objs.begin(), objs.end(), [](const Object& o) { return o.rig && !o.rig->ik.empty(); });
+    f << std::setprecision(9) << "CANYON3D " << (hasIK ? 8 : hasRig ? 7 : 6) << "\ncamera ";
     writeCam(f, cam);
     f << "\nsky ";
     writeSky(f, sky);
@@ -2198,6 +2254,47 @@ bool Scene::writeFile(const std::string& path) const {
                 for (size_t i = 0; i < m.tri.size(); i++) f << m.tri[i] << ((i % 3 == 2) ? '\n' : ' ');
             } else f << "meshref " << at->second << '\n';
         }
+        if (o.rig) {
+            if (o.instanceSource >= 0 || !o.mesh || !validRig(*o.rig, o.mesh->v.size())) return false;
+            f << "rig " << o.rig->joints.size() << ' ' << o.rig->weights.size() << '\n';
+            auto writePose = [&](const Key& key) {
+                wv(f, key.pos); wv(f, key.rot); wv(f, key.scl);
+            };
+            for (const auto& joint : o.rig->joints) {
+                ws(f, joint.name);
+                f << joint.parent << ' ';
+                wv(f, joint.head); wv(f, joint.tail);
+                writePose(joint.pose);
+                f << (int)joint.pose.ease << ' ' << joint.keys.size() << '\n';
+                for (const auto& key : joint.keys) {
+                    f << key.frame << ' ' << (int)key.ease << ' ';
+                    writePose(key);
+                    f << '\n';
+                }
+            }
+            for (const auto& vertex : o.rig->weights) {
+                for (size_t i = 0; i < vertex.weight.size(); ++i)
+                    f << vertex.joint[i] << ' ' << vertex.weight[i] << ' ';
+                f << '\n';
+            }
+            if (!o.rig->ik.empty()) {
+                f << "rigik " << o.rig->ik.size() << '\n';
+                auto writeGoal = [&](const IKKey& key) {
+                    wv(f, key.target); wv(f, key.pole);
+                    f << key.influence << ' ' << (int)key.ease << ' ';
+                };
+                for (const auto& chain : o.rig->ik) {
+                    f << chain.end << ' ';
+                    writeGoal(chain.settings);
+                    f << chain.keys.size() << '\n';
+                    for (const auto& key : chain.keys) {
+                        f << key.frame << ' ';
+                        writeGoal(key);
+                        f << '\n';
+                    }
+                }
+            }
+        }
     }
     f << "end\n";
     f.close();
@@ -2208,7 +2305,7 @@ bool Scene::load(const std::string& path) {
     std::ifstream f(path);
     std::string tok;
     int ver = 0;
-    if (!(f >> tok >> ver) || tok != "CANYON3D" || ver < 1 || ver > 6) return false;
+    if (!(f >> tok >> ver) || tok != "CANYON3D" || ver < 1 || ver > 8) return false;
     Scene s;
     size_t embeddedPixels = 0;
     s.sky = skyPresets()[0];
@@ -2470,6 +2567,55 @@ bool Scene::load(const std::string& path) {
             }
             m->build();
             s.objs.back().mesh = m;
+        } else if (tok == "rig") {
+            if (ver < 7 || s.objs.empty()) return false;
+            Object& o = s.objs.back();
+            size_t count, vertices;
+            if (o.rig || o.type != ObjType::Mesh || o.treePart || o.instanceSource >= 0 || !o.mesh ||
+                !(f >> count >> vertices) || count == 0 || count > MAX_RIG_JOINTS ||
+                o.mesh->v.size() > MAX_SKIN_VERTICES || (vertices && vertices != o.mesh->v.size())) return false;
+            auto rig = std::make_shared<Rig>();
+            rig->joints.resize(count);
+            auto readPose = [&](Key& key) { rv(f, key.pos); rv(f, key.rot); rv(f, key.scl); };
+            for (auto& joint : rig->joints) {
+                rs(f, joint.name, ver);
+                f >> joint.parent;
+                rv(f, joint.head); rv(f, joint.tail);
+                readPose(joint.pose);
+                size_t keys;
+                if (!readEase(f, joint.pose.ease) || !(f >> keys) || keys > MAX_JOINT_KEYS) return false;
+                joint.keys.resize(keys);
+                for (auto& key : joint.keys) {
+                    if (!(f >> key.frame) || !readEase(f, key.ease)) return false;
+                    readPose(key);
+                }
+            }
+            rig->weights.resize(vertices);
+            for (auto& vertex : rig->weights)
+                for (size_t i = 0; i < vertex.weight.size(); ++i)
+                    f >> vertex.joint[i] >> vertex.weight[i];
+            if (!f || !validRig(*rig, o.mesh->v.size())) return false;
+            o.rig = std::move(rig);
+        } else if (tok == "rigik") {
+            if (ver < 8 || s.objs.empty()) return false;
+            Object& o = s.objs.back();
+            size_t count;
+            if (!o.rig || !o.rig->ik.empty() || !(f >> count) || count == 0 || count > o.rig->joints.size() / 2) return false;
+            auto rig = std::make_shared<Rig>(*o.rig);
+            rig->ik.resize(count);
+            auto readGoal = [&](IKKey& key) {
+                rv(f, key.target); rv(f, key.pole);
+                return (f >> key.influence) && readEase(f, key.ease);
+            };
+            for (auto& chain : rig->ik) {
+                size_t keys;
+                if (!(f >> chain.end) || !readGoal(chain.settings) || !(f >> keys) || keys > MAX_JOINT_KEYS) return false;
+                chain.keys.resize(keys);
+                for (auto& key : chain.keys)
+                    if (!(f >> key.frame) || !readGoal(key)) return false;
+            }
+            if (!validRig(*rig, o.mesh->v.size())) return false;
+            o.rig = std::move(rig);
         } else if (tok == "end") break;
         else return false;
         if (!f) return false;
@@ -2490,6 +2636,8 @@ bool Scene::load(const std::string& path) {
     });
     for (Object& o : s.objs) {
         if (o.terrainAnchor && (o.parent < 0 || s.objs[o.parent].type != ObjType::Terrain)) return false;
+        if (o.rig && (!o.mesh || o.type != ObjType::Mesh || o.treePart || o.instanceSource >= 0 ||
+                      !validRig(*o.rig, o.mesh->v.size()))) return false;
         if (o.instanceSource >= 0) {
             if (o.instanceSource >= (int)s.objs.size()) return false;
             const Object& src = s.objs[o.instanceSource];
@@ -2636,11 +2784,12 @@ Mesh contourScene(const Scene& scene, V3 lo, V3 hi, int resolution) {
 
 Mesh meshSurface(const Object& o) {
     Mesh m;
-    if (o.type == ObjType::Mesh && o.mesh) {
-        m.v = o.mesh->v;
-        m.tri = o.mesh->tri;
-        m.uv = o.mesh->uv;
-        m.n = o.mesh->n;
+    const Mesh* mesh = o.visibleMesh();
+    if (o.type == ObjType::Mesh && mesh) {
+        m.v = mesh->v;
+        m.tri = mesh->tri;
+        m.uv = mesh->uv;
+        m.n = mesh->n;
         for (V3& n : m.n) n = normalize(o.nrm * n);
     } else if (isHeightfield(o.type) && o.hf && o.hf->res > 1) {
         int n = std::min(o.hf->res, 513);

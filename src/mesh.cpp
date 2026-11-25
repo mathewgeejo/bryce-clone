@@ -10,6 +10,7 @@
 #include <locale>
 #include <map>
 #include <sstream>
+#include <utility>
 
 static void growBox(V3& lo, V3& hi, V3 p) {
     lo = V3(std::min(lo.x, p.x), std::min(lo.y, p.y), std::min(lo.z, p.z));
@@ -34,6 +35,152 @@ void Mesh::build() {
     nodes.clear();
     nodes.reserve(triCount() * 2 / 3 + 1);
     if (triCount() > 0) buildNode(0, triCount(), 0);
+}
+
+Mesh makeEditableBox() {
+    Mesh mesh;
+    mesh.v = {{-1,-1,-1}, {1,-1,-1}, {1,1,-1}, {-1,1,-1},
+              {-1,-1,1}, {1,-1,1}, {1,1,1}, {-1,1,1}};
+    mesh.tri = {0,2,1, 0,3,2, 4,5,6, 4,6,7, 0,1,5, 0,5,4,
+                3,7,6, 3,6,2, 0,4,7, 0,7,3, 1,2,6, 1,6,5};
+    mesh.build();
+    return mesh;
+}
+
+namespace {
+using MeshEdge = std::pair<uint32_t, uint32_t>;
+MeshEdge edgeKey(uint32_t a, uint32_t b) { return std::minmax(a, b); }
+
+void compactMesh(Mesh& mesh) {
+    std::vector<uint32_t> remap(mesh.v.size(), UINT32_MAX);
+    std::vector<V3> vertices, uv;
+    for (auto& index : mesh.tri) {
+        auto& mapped = remap[index];
+        if (mapped == UINT32_MAX) {
+            mapped = (uint32_t)vertices.size();
+            vertices.push_back(mesh.v[index]);
+            if (!mesh.uv.empty()) uv.push_back(mesh.uv[index]);
+        }
+        index = mapped;
+    }
+    mesh.v = std::move(vertices);
+    mesh.uv = std::move(uv);
+}
+
+void rebuildEditedMesh(Mesh& mesh) {
+    mesh.n.clear();
+    mesh.build();
+}
+}  // namespace
+
+bool subdivideMesh(Mesh& mesh) {
+    if (mesh.tri.empty() || mesh.triCount() > 500000 || mesh.v.size() > 2000000) return false;
+    std::map<MeshEdge, uint32_t> middles;
+    auto middle = [&](uint32_t a, uint32_t b) {
+        auto [it, inserted] = middles.emplace(edgeKey(a, b), (uint32_t)mesh.v.size());
+        if (inserted) {
+            mesh.v.push_back((mesh.v[a] + mesh.v[b]) * .5f);
+            if (!mesh.uv.empty()) mesh.uv.push_back((mesh.uv[a] + mesh.uv[b]) * .5f);
+        }
+        return it->second;
+    };
+    std::vector<uint32_t> triangles;
+    triangles.reserve(mesh.tri.size() * 4);
+    for (size_t i = 0; i < mesh.tri.size(); i += 3) {
+        uint32_t a = mesh.tri[i], b = mesh.tri[i + 1], c = mesh.tri[i + 2];
+        uint32_t ab = middle(a, b), bc = middle(b, c), ca = middle(c, a);
+        triangles.insert(triangles.end(), {a, ab, ca, ab, b, bc, ca, bc, c, ab, bc, ca});
+    }
+    mesh.tri = std::move(triangles);
+    rebuildEditedMesh(mesh);
+    return true;
+}
+
+bool extrudeMeshFaces(Mesh& mesh, const std::vector<size_t>& faces, float distance) {
+    if (faces.empty() || !std::isfinite(distance) || std::fabs(distance) < 1e-6f) return false;
+    size_t count = (size_t)mesh.triCount();
+    if (count > 2000000 || faces.size() > (2000000 - count) / 6 || mesh.v.size() > 2000000) return false;
+    struct EdgeUse { uint32_t a, b; int selected = 0, total = 0; };
+    std::map<MeshEdge, EdgeUse> edges;
+    std::vector<bool> selected(count);
+    V3 normal;
+    for (size_t face : faces) {
+        if (face >= count || selected[face]) return false;
+        selected[face] = true;
+        const uint32_t* v = &mesh.tri[3 * face];
+        normal += cross(mesh.v[v[1]] - mesh.v[v[0]], mesh.v[v[2]] - mesh.v[v[0]]);
+        for (int i = 0; i < 3; ++i) {
+            uint32_t a = v[i], b = v[(i + 1) % 3];
+            auto [entry, added] = edges.emplace(edgeKey(a, b), EdgeUse{a, b});
+            auto& use = entry->second;
+            if (!added && (use.selected != 1 || use.a == a)) return false;
+            ++use.selected;
+        }
+    }
+    if (length(normal) < 1e-8f) return false;
+    for (size_t i = 0; i < mesh.tri.size(); i += 3) {
+        for (int j = 0; j < 3; ++j) {
+            auto it = edges.find(edgeKey(mesh.tri[i + j], mesh.tri[i + (j + 1) % 3]));
+            if (it != edges.end() && ++it->second.total > 2) return false;
+        }
+    }
+    V3 offset = normalize(normal) * distance;
+    std::map<uint32_t, uint32_t> cap;
+    for (size_t face : faces) {
+        for (int i = 0; i < 3; ++i) {
+            auto& index = mesh.tri[face * 3 + i];
+            auto [entry, added] = cap.emplace(index, (uint32_t)mesh.v.size());
+            if (added) {
+                mesh.v.push_back(mesh.v[index] + offset);
+                if (!mesh.uv.empty()) {
+                    V3 texture = mesh.uv[index];
+                    mesh.uv.push_back(texture);
+                }
+            }
+            index = entry->second;
+        }
+    }
+    for (const auto& entry : edges) {
+        const auto& edge = entry.second;
+        if (edge.selected != 1) continue;
+        uint32_t a = cap.at(edge.a), b = cap.at(edge.b);
+        mesh.tri.insert(mesh.tri.end(), {edge.a, edge.b, b, edge.a, b, a});
+    }
+    // Keep cap face indices stable for repeated extrusion in the editor.
+    compactMesh(mesh);
+    rebuildEditedMesh(mesh);
+    return true;
+}
+
+bool deleteMeshFaces(Mesh& mesh, const std::vector<size_t>& faces) {
+    if (faces.empty()) return false;
+    size_t count = (size_t)mesh.triCount();
+    std::vector<bool> removed(count);
+    for (size_t face : faces) {
+        if (face >= count || removed[face]) return false;
+        removed[face] = true;
+    }
+    if (faces.size() == count) return false;
+    std::vector<uint32_t> triangles;
+    triangles.reserve((count - faces.size()) * 3);
+    for (size_t i = 0; i < count; ++i)
+        if (!removed[i]) triangles.insert(triangles.end(), mesh.tri.begin() + i * 3, mesh.tri.begin() + i * 3 + 3);
+    mesh.tri = std::move(triangles);
+    compactMesh(mesh);
+    rebuildEditedMesh(mesh);
+    return true;
+}
+
+void projectMeshUV(Mesh& mesh, int axis) {
+    if (axis < 0 || axis > 2) return;
+    int u = (axis + 1) % 3, v = (axis + 2) % 3;
+    V3 extent = mesh.bmax - mesh.bmin;
+    float width = std::max(extent[u], 1e-8f), height = std::max(extent[v], 1e-8f);
+    mesh.uv.resize(mesh.v.size());
+    for (size_t i = 0; i < mesh.v.size(); ++i) {
+        V3 local = mesh.v[i] - mesh.bmin;
+        mesh.uv[i] = {local[u] / width, local[v] / height, 0};
+    }
 }
 
 int Mesh::buildNode(int first, int count, int depth) {

@@ -57,6 +57,95 @@ static int fails = 0;
 #define CHECK(c) do { if (!(c)) { printf("  FAIL %s:%d %s\n", __FILE__, __LINE__, #c); fails++; } } while (0)
 
 int main() {
+    printf("rig bind pose, animation, linked meshes, and persistence\n");
+    {
+        auto base = std::make_shared<Mesh>(makeEditableBox());
+        Rig rig;
+        Joint root;
+        root.name = "Pelvis";
+        root.head = {0, -1, 0};
+        root.tail = {};
+        Joint child;
+        child.name = "Spine";
+        child.parent = 0;
+        rig.joints = {root, child};
+        CHECK(bindRig(rig, *base));
+        SkinWeights full{{0,1,2,3}, {.1f,.2f,.3f,.4f}};
+        CHECK(setSkinWeight(full, 4, .5f, 5));
+        CHECK(full.joint[3] == 4 && full.weight[3] == .5f &&
+              std::fabs(full.weight[0] + full.weight[1] + full.weight[2] - .5f) < .001f);
+        for (size_t v = 0; v < base->v.size(); ++v)
+            CHECK(setSkinWeight(rig.weights[v], base->v[v].y < 0 ? 0 : 1, 1, 2));
+        CHECK(validRig(rig, base->v.size()));
+        auto rest = deformRig(rig, *base, 0);
+        CHECK(rest && length(rest->v[6] - base->v[6]) < .001f);
+        rig.joints[0].keys = {{0, {}, {}, V3(1), Ease::Linear}, {20, {3,0,0}, {}, V3(1), Ease::Linear}};
+        rig.joints[1].keys = {{0, {}, {}, V3(1), Ease::Linear}, {20, {}, {0,0,90}, V3(1), Ease::Linear}};
+        auto pose = poseRig(rig, 20);
+        CHECK(pose.size() == 2 && length(pose[1].tail - V3(2,0,0)) < .001f);
+        Scene scene;
+        Object actor = makeObject(ObjType::Mesh, 1);
+        actor.name = "Actor";
+        actor.mesh = base;
+        actor.rig = std::make_shared<Rig>(rig);
+        Object link = actor;
+        link.rig.reset();
+        link.instanceSource = 0;
+        link.pos = {10, 0, 0};
+        scene.objs = {actor, link};
+        scene.applyFrame(10);
+        const auto* geometry = scene.objs[0].visibleMesh();
+        CHECK(geometry != base.get() && geometry == scene.objs[1].visibleMesh());
+        CHECK(std::fabs(geometry->v[0].x - .5f) < .001f);
+        Hit hit;
+        CHECK(intersectScene(scene, {{2, -.8f, 5}, {0,0,-1}}, 20, hit) && hit.obj == 0);
+        auto detached = scene.subset({1});
+        CHECK(detached.objs[0].rig == actor.rig && detached.objs[0].instanceSource < 0);
+        auto exported = meshSelection(scene, {0}, 24);
+        CHECK(exported.size() == 1 && length(exported[0].mesh.v[0] - geometry->v[0]) < .001f);
+        CHECK(scene.save("build/t/rigging.c3d"));
+        Scene reopened;
+        CHECK(reopened.load("build/t/rigging.c3d"));
+        if (reopened.objs.size() == 2 && reopened.objs[0].rig) {
+            CHECK(reopened.frame == 10 && reopened.objs[0].rig->joints[1].name == "Spine");
+            CHECK(length(reopened.objs[0].visibleMesh()->v[6] - geometry->v[6]) < .001f);
+            reopened.applyFrame(20);
+            CHECK(length(reopened.objs[0].visibleMesh()->v[6] - V3(2,1,1)) < .001f);
+        }
+        rig.joints[0].parent = 1;
+        CHECK(!validRig(rig, base->v.size()));
+    }
+    printf("editable mesh topology and curve sampling\n");
+    {
+        Mesh box = makeEditableBox();
+        CHECK(box.v.size() == 8 && box.triCount() == 12);
+        CHECK(extrudeMeshFaces(box, {6, 7}, .5f));
+        CHECK(box.v.size() == 12 && box.triCount() == 20);
+        CHECK(std::fabs(box.bmax.y - 1.5f) < .001f);
+        projectMeshUV(box, 1);
+        CHECK(box.uv.size() == box.v.size());
+        CHECK(subdivideMesh(box) && box.triCount() == 80);
+        CHECK(box.uv.size() == box.v.size() && box.n.size() == box.v.size());
+        CHECK(deleteMeshFaces(box, {0, 3}) && box.triCount() == 78);
+        CHECK(!deleteMeshFaces(box, {9000}) && box.triCount() == 78);
+        auto mesh = std::make_shared<Mesh>(std::move(box));
+        Object edited = makeObject(ObjType::Mesh, 1);
+        edited.mesh = mesh;
+        edited.keys = {{0, {0,0,0}, {}, V3(1), Ease::Linear}, {8, {8,0,0}, {}, V3(1), Ease::Hold},
+                       {12, {20,0,0}, {}, V3(1), Ease::Linear}};
+        CHECK(std::fabs(edited.sampleTransform(2.5f).pos.x - 2.5f) < .001f);
+        CHECK(edited.sampleTransform(11.5f).pos.x == 8 && edited.transformAt(12).pos.x == 20);
+        Scene scene;
+        scene.objs.push_back(edited);
+        scene.applyFrame(4);
+        CHECK(scene.save("build/t/mesh-edit.c3d"));
+        Scene reopened;
+        CHECK(reopened.load("build/t/mesh-edit.c3d"));
+        if (!reopened.objs.empty() && reopened.objs[0].mesh) {
+            CHECK(reopened.objs[0].mesh->triCount() == 78 && reopened.objs[0].mesh->uv.size() == mesh->uv.size());
+            CHECK(std::fabs(reopened.objs[0].sampleTransform(2.5f).pos.x - 2.5f) < .001f);
+        }
+    }
     printf("rigid-body and liquid simulation bakes\n");
     {
         Scene scene;

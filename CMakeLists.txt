@@ -11,6 +11,7 @@ add_library(canyon_core STATIC
     src/mesh.cpp
     src/presets.cpp
     src/render.cpp
+    src/rig.cpp
     src/scene.cpp
     src/simulation.cpp
     src/terrain.cpp
