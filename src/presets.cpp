@@ -190,7 +190,7 @@ const std::vector<Sky>& skyPresets() {
 const std::vector<std::string>& exampleNames() {
     static const std::vector<std::string> n = {"Snowy Island", "Desert Canyon", "Moonlit Lake", "Boolean Studio", "Forest Glade", "Alien World",
                                                "Chrome Dreams", "Floating Isles", "Ringed Planet", "Monolith Lake", "Stone Arch", "Volcano Isle",
-                                               "Salt Road", "Boolean Observatory", "Windward Basin"};
+                                               "Salt Road", "Boolean Observatory", "Windward Basin", "Pines at the Inlet"};
     return n;
 }
 
@@ -204,7 +204,8 @@ const std::vector<std::string>& exampleDescriptions() {
         "A weathered sandstone arch among dunes and distant mesas.", "A smoking volcano island glowing over a deep ocean.",
         "Salt flats and badlands with a freestanding survey-marker cutout.",
         "A carved and nested stone observatory over a reflective floor.",
-        "A glacial bowl, cloud shadows and low drifting mist."};
+        "A glacial bowl, cloud shadows and low drifting mist.",
+        "Linked pines on a layered hillside beside wind-rippled water."};
     return d;
 }
 
@@ -523,6 +524,38 @@ Scene makeExample(int i) {
         mist.name = "Drifting Mist";
         s.objs.push_back(mist);
         s.cam.target = {0, 5, -20}; s.cam.dist = 48; s.cam.pitch = 12; s.cam.yaw = 9;
+        break;
+    }
+    case 15: {
+        s.sky = skyNamed("Misty Morning");
+        s.sky.fog = .1f;
+        s.sky.indirectStrength = .12f;
+        Object land = kindTerrain(1, {0, -1, -12}, {21, 9, 15}, "Earth", TerrainKind::Hills, 331);
+        TextureLayer grass;
+        grass.tex = TexType::Ridged;
+        grass.color1 = {.36f, .48f, .22f};
+        grass.color2 = {.22f, .31f, .12f};
+        grass.mask = TexMask::Slope;
+        grass.maskLow = 0; grass.maskHigh = .23f;
+        grass.warp = .38f;
+        land.mat.layers.push_back(grass);
+        s.objs.push_back(land);
+        Object water = prim(ObjType::Water, 1, {0, 1.2f, 0}, V3(1), "Tropical Lagoon");
+        water.directionalWater = true;
+        water.waveHeight = .022f;
+        s.objs.push_back(water);
+        TreeParams pine{1.22f, 28, .064f, .092f, 1.42f, 3, 4, 77, .24f, .72f, 2};
+        addTree(s, pine, {0, 0, 50}, 3.5f, findMaterial("Bark"), findMaterial("Leaves"), 1);
+        s.updateAll();
+        std::vector<Ray> rays;
+        for (int n = 0; n < 74; ++n) {
+            float x = (rng.f() * 2 - 1) * 17, z = -9 - rng.f() * 15;
+            if (heightAt(land, (x + 21) / 42, (z + 27) / 30) > water.pos.y + .3f)
+                rays.push_back({{x, 15, z}, {0, -1, 0}});
+        }
+        s.scatter({2, 3}, 0, rays, .65f, 1.3f, 360, false, rng);
+        s.objs[2].hidden = s.objs[3].hidden = true;
+        s.cam.target = {0, 2.6f, -13}; s.cam.dist = 33; s.cam.pitch = 13; s.cam.yaw = 22;
         break;
     }
     default: {

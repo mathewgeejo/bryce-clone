@@ -8,6 +8,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <iomanip>
 #include <functional>
 #include <iterator>
@@ -54,11 +55,12 @@ int gSel = -1, gTab = 0, gView = 0, gTool = 0;
 bool gShowRender = false;
 enum ViewMode { Wire, DepthWire, BoundsOnly, Solid, Textured } gViewMode = Wire;
 bool gDisplayPalette = false, gSafeFrame = false, gViewPreviewDirty = true;
+bool gCameraPath = false;
 float gPreviewScale = 0.45f;
 std::string gHoverTip, gLastTip;
 uint64_t gTipSince = 0;
 Renderer gMainR, gNanoR, gLabR, gViewR;
-enum Lab { LabNone, LabMat, LabSky, LabTerrain, LabTree, LabRender, LabTools, LabExamples, LabObject, LabAttributes, LabDxf, LabMotion, LabAssets, LabCameras, LabCommands } gLab = LabNone;
+enum Lab { LabNone, LabMat, LabSky, LabTerrain, LabTree, LabRender, LabTools, LabExamples, LabObject, LabAttributes, LabDxf, LabMotion, LabAssets, LabCameras, LabCommands, LabScatter } gLab = LabNone;
 Scene gLabBackup;
 bool gLabChanged = false, gNanoDirty = true, gLabDirty = false, gMainWasBusy = false;
 uint64_t gLastChange = 0, gRenderStart = 0;
@@ -74,7 +76,10 @@ uint64_t gLastRowTime = 0;
 uint32_t gSeed = 100;
 float gBrushSize = 0.06f, gBrushStr = 0.5f, gRough = 0.5f, gTerraces = 6;
 BrushMode gBrush = BrushMode::Raise;
-enum Drag { DragNone, DragObj, DragCam, DragSculpt, DragLightAim } gDrag = DragNone;
+enum Drag { DragNone, DragObj, DragCam, DragSculpt, DragLightAim, DragScatter } gDrag = DragNone;
+bool gScatter = false, gScatterAlign = true;
+int gScatterSeed = 1, gScatterDab = 0, gScatterX = 0, gScatterY = 0;
+float gScatterRadius = 46, gScatterDensity = 8, gScatterMin = .6f, gScatterMax = 1.4f, gScatterYaw = 360;
 const int TOOL_SCULPT = 3;
 struct SculptHit { int obj = -1; float u = 0, v = 0; } gSculptHover, gSculpt;
 uint64_t gSculptLast = 0;
@@ -105,6 +110,8 @@ float gTerrainFrequency = 4, gErosionDensity = 1;
 bool gRegionTool = false, gRegionMask = false;
 V3 gRegionStart, gRegionEnd;
 TerrainPatch gTerrainClipboard;
+std::shared_ptr<const Image> gTerrainBlendMask;
+float gTerrainBlend = 1;
 std::vector<Heightfield> gTerrainUndo, gTerrainRedo;
 BoolMode gNestedMode = BoolMode::Positive;
 struct AssetTile { std::string path, name; std::vector<uint32_t> thumbnail; };
@@ -386,10 +393,24 @@ void selectObj(int i, bool add, bool single = false) {
     gSel = i;
 }
 
+static void trimHistory(std::vector<History>& history) {
+    size_t bytes = 0, first = history.size();
+    while (first > 0 && history.size() - first < 40) {
+        std::set<const Heightfield*> counted;
+        for (const auto& object : history[first - 1].scene.objs) {
+            if (object.hf && counted.insert(object.hf.get()).second)
+                bytes += object.hf->h.size() * sizeof(float) + object.hf->n.size() * sizeof(V3);
+        }
+        if (bytes > 256ull * 1024 * 1024 && first < history.size()) break;
+        --first;
+    }
+    history.erase(history.begin(), history.begin() + first);
+}
+
 void pushUndo(Scene s, std::string action = "Edit scene") {
     gUndo.push_back({std::move(s), std::move(action)});
     gDirty = true;
-    if (gUndo.size() > 40) gUndo.erase(gUndo.begin());
+    trimHistory(gUndo);
     gRedo.clear();
 }
 
@@ -417,6 +438,7 @@ void endInteraction() {
 void sceneReplaced() {
     gMainR.cancel();
     clearSel();
+    gScatter = false;
     gShowRender = gPlaying = false;
     for (int& c : gCounter) c = 0;
     for (auto& o : gScene.objs) gCounter[(int)o.type]++;
@@ -431,6 +453,7 @@ void undoRedo(bool redo) {
     if (from.empty()) { gStatus = redo ? "Nothing to redo." : "Nothing to undo."; return; }
     auto action = from.back().action;
     to.push_back({gScene.snapshot(), action});
+    trimHistory(to);
     gScene = std::move(from.back().scene);
     from.pop_back();
     sceneReplaced();
@@ -752,7 +775,8 @@ bool fileDialog(bool save, const char* filter, const char* ext, std::string& out
 
 const char* SCENE_FILTER = "Landscape Scene (*.c3d)\0*.c3d\0All Files (*.*)\0*.*\0";
 const char* BMP_FILTER = "Bitmap Image (*.bmp)\0*.bmp\0";
-const char* IMAGE_FILTER = "Pictures (*.bmp;*.png;*.jpg;*.jpeg;*.tga;*.tif;*.tiff)\0*.bmp;*.png;*.jpg;*.jpeg;*.tga;*.tif;*.tiff\0All Files (*.*)\0*.*\0";
+const char* IMAGE_FILTER = "Images\0*.bmp;*.png;*.jpg;*.jpeg;*.tga;*.tif;*.tiff;*.pgm;*.hdr;*.rgbe;*.pic\0All Files (*.*)\0*.*\0";
+const char* HDR_FILTER = "Radiance HDR\0*.hdr;*.rgbe;*.pic\0All Files (*.*)\0*.*\0";
 const char* OUTPUT_FILTER = "PNG Image (*.png)\0*.png\0TIFF Image (*.tiff)\0*.tiff;*.tif\0Bitmap Image (*.bmp)\0*.bmp\0";
 
 std::string baseName(const std::string& p) {
@@ -1220,7 +1244,7 @@ Lab objectEditor(const Object& o) {
     if (isHeightfield(o.type)) return LabTerrain;
     if (o.treePart) return LabTree;
     if (o.type == ObjType::Metaball || o.type == ObjType::Picture || o.type == ObjType::Stone ||
-        o.type == ObjType::Torus || o.type == ObjType::Mesh || isLight(o.type)) return LabObject;
+        o.type == ObjType::Torus || o.type == ObjType::Mesh || o.type == ObjType::Water || isLight(o.type)) return LabObject;
     return LabNone;
 }
 
@@ -1245,6 +1269,8 @@ void openLab(Lab l) {
         gRegionTool = gRegionMask = false;
         gTerrainUndo.clear();
         gTerrainRedo.clear();
+        gTerrainBlendMask.reset();
+        gTerrainBlend = 1;
     }
     gLabBackup = gScene.snapshot();
     gLab = l;
@@ -1832,7 +1858,7 @@ void drawViewport() {
             else if (o.boolMode == BoolMode::Positive) c = rgb(50, 202, 194);
             else if (o.locked) c = rgb(70, 70, 76);
             pen = c;
-            if (gViewMode == BoundsOnly) {
+            if (gViewMode == BoundsOnly || (o.instanceSource >= 0 && !sel)) {
                 V3 lo, hi;
                 if (!worldBounds(o, lo, hi)) return;
                 auto corner = [&](int i) { return V3((i & 1) ? hi.x : lo.x, (i & 2) ? hi.y : lo.y, (i & 4) ? hi.z : lo.z); };
@@ -1854,7 +1880,18 @@ void drawViewport() {
             auto at = [&](const Key& k) { return o.worldPos + o.parentSpace * (k.pos - o.pos); };
             for (size_t i = 1; i < o.keys.size(); ++i) seg(at(o.keys[i - 1]), at(o.keys[i]));
         }
-        if (validSel() && gTool != TOOL_SCULPT) {
+        if (gCameraPath && gScene.camKeys.size() >= 2) {
+            pen = rgb(115, 224, 213);
+            int first = gScene.camKeys.front().frame, last = gScene.camKeys.back().frame;
+            V3 previous = gScene.cameraAt((float)first).eye();
+            int count = std::clamp(last - first, 1, 128);
+            for (int i = 1; i <= count; ++i) {
+                V3 next = gScene.cameraAt(lerpf((float)first, (float)last, (float)i / count)).eye();
+                seg(previous, next);
+                previous = next;
+            }
+        }
+        if (validSel() && gTool != TOOL_SCULPT && !gScatter) {
             const Object& selected = gScene.objs[gSel];
             R aim{};
             if (!selected.hidden && !selected.locked && (selected.type == ObjType::Spotlight || selected.type == ObjType::Parallel)) {
@@ -1971,6 +2008,14 @@ void drawViewport() {
         Color c = rgb(240, 190, 106);
         line(x, y, x + w, y, c); line(x + w, y, x + w, y + h, c);
         line(x + w, y + h, x, y + h, c); line(x, y + h, x, y, c);
+        if (gScene.render.region) {
+            const auto& crop = gScene.render;
+            int x0 = x + (int)(w * crop.cropX), x1 = std::min(x + w, x + (int)(w * (crop.cropX + crop.cropW)));
+            int y0 = y + (int)(h * crop.cropY), y1 = std::min(y + h, y + (int)(h * (crop.cropY + crop.cropH)));
+            Color region = rgb(111, 228, 197);
+            line(x0, y0, x1, y0, region); line(x1, y0, x1, y1, region);
+            line(x1, y1, x0, y1, region); line(x0, y1, x0, y0, region);
+        }
     }
     if (button({vp.x + vp.w - 100, vp.y + 5, 94, 22}, "Display", gDisplayPalette, gSmall)) gDisplayPalette = !gDisplayPalette;
     R palette{vp.x + vp.w - 198, vp.y + 34, 190, 142};
@@ -1996,11 +2041,21 @@ void drawViewport() {
     }
     line(vp.x, vp.y, vp.x + vp.w, vp.y, rgb(28, 28, 32));
 
-    if (hov(vp) && !(gDisplayPalette && hov(palette)) && gIn.pressed && gActive == 0) {
+    bool overCanvas = hov(vp) && !(gDisplayPalette && hov(palette));
+    if (gScatter && overCanvas && !gBlocked && !gShowRender) {
+        setClip(vp);
+        circle(gIn.mx, gIn.my, (int)gScatterRadius, rgb(245, 208, 120));
+        clearClip();
+    }
+    if (overCanvas && gIn.pressed && gActive == 0) {
         gActive = VIEW_ID;
         SculptHit sh = gTool == TOOL_SCULPT && !gShowRender ? sculptPick(gIn.mx, gIn.my) : SculptHit();
         if (gShowRender) { gShowRender = false; gDrag = DragNone; }
-        else if (sh.obj >= 0) {
+        else if (gScatter) {
+            gDrag = DragScatter;
+            gScatterX = gIn.mx;
+            gScatterY = gIn.my;
+        } else if (sh.obj >= 0) {
             if (!isSel(sh.obj) || gSel != sh.obj) selectObj(sh.obj, false);
             gSculpt = sh;
             gDrag = DragSculpt;
@@ -2017,7 +2072,26 @@ void drawViewport() {
             if (p >= 0) gStatus = "Selected " + gScene.objs[p].name + (gSelSet.size() > 1 ? " (+" + std::to_string(gSelSet.size() - 1) + " more)." : ".");
         }
     }
-    if (gActive == VIEW_ID && gIn.down && gDrag == DragSculpt && (gIn.dx || gIn.dy)) {
+    if (gActive == VIEW_ID && gIn.down && gDrag == DragScatter && overCanvas &&
+        (gIn.pressed || std::hypot((float)(gIn.mx - gScatterX), (float)(gIn.my - gScatterY)) >= gScatterRadius * .45f)) {
+        gScatterX = gIn.mx;
+        gScatterY = gIn.my;
+        ViewBasis view = curBasis();
+        float half = vp.h * .5f, cx = vp.x + vp.w * .5f, cy = vp.y + half;
+        Rng rng((uint32_t)gScatterSeed + 2654435761u * (uint32_t)gScatterDab++);
+        std::vector<Ray> rays;
+        for (int i = 0; i < (int)gScatterDensity; ++i) {
+            float radius = i ? gScatterRadius * std::sqrt(rng.f()) : 0;
+            float angle = rng.f() * 2 * PI;
+            float x = gIn.mx + radius * std::cos(angle), y = gIn.my + radius * std::sin(angle);
+            if (vp.in((int)x, (int)y)) rays.push_back(view.ray((x - cx) / half, (cy - y) / half));
+        }
+        int made = gScene.scatter(sortedSel(), gSel, rays, std::min(gScatterMin, gScatterMax), std::max(gScatterMin, gScatterMax),
+                                  gScatterYaw, gScatterAlign, rng);
+        if (made) sceneChanged();
+        gStatus = made ? "Painted " + std::to_string(made) + " instances. Press Esc to stop painting." :
+                        "No instances placed. Select source objects, then Shift-click the receiving surface last.";
+    } else if (gActive == VIEW_ID && gIn.down && gDrag == DragSculpt && (gIn.dx || gIn.dy)) {
         SculptHit sh = sculptPick(gIn.mx, gIn.my);
         if (sh.obj == gSculpt.obj) gSculpt = sh;
         uint64_t now = nowMs();
@@ -2281,8 +2355,36 @@ void drawCamerasLab() {
     y += 28;
     if (c.lookAt >= 0 && c.lookAt < (int)gScene.objs.size())
         label(cx, y, ("Looking at " + gScene.objs[c.lookAt].name).c_str(), w);
+    toggle({cx, y + 28, 212, 24}, "Show Camera Path", gCameraPath);
     if (ch) { gView = 0; gShowRender = false; sceneChanged(); }
     labFooter(p);
+}
+
+void drawScatterLab() {
+    R p = panel(490, 372, "Scatter Brush");
+    int x = p.x + 16, y = p.y + 46, w = p.w - 32;
+    label(x, y, "Select sources, then Shift-click the surface last.", w); y += 24;
+    slider({x, y, w, 24}, "Brush Radius (px)", gScatterRadius, 8, 180, "%.0f"); y += 30;
+    slider({x, y, w, 24}, "Instances per Dab", gScatterDensity, 1, 64, "%.0f"); y += 30;
+    slider({x, y, w / 2 - 4, 24}, "Minimum Scale", gScatterMin, .05f, 5);
+    slider({x + w / 2 + 4, y, w / 2 - 4, 24}, "Maximum Scale", gScatterMax, .05f, 5); y += 30;
+    slider({x, y, w, 24}, "Rotation Range", gScatterYaw, 0, 360, "%.0f"); y += 30;
+    sliderI({x, y, w, 24}, "Random Seed", gScatterSeed, 1, 65535); y += 30;
+    toggle({x, y, w, 24}, "Align to Surface", gScatterAlign); y += 34;
+    if (button({x, y, w, 28}, "Start Painting", false, gBold)) {
+        if (gSelSet.size() < 2) {
+            gStatus = "Select at least one source object and one receiving surface.";
+            closeLab(true);
+            return;
+        }
+        gScatter = true;
+        gScatterDab = 0;
+        gShowRender = false;
+        closeLab(false);
+        gStatus = "Paint over the selected surface. Press Esc to stop painting.";
+        return;
+    }
+    labFooter(p, true);
 }
 
 void drawCommandsLab() {
@@ -2302,6 +2404,7 @@ void drawCommandsLab() {
         {"Recover Autosave", "Restore a recovery scene", actRecover},
         {"Reload Scene Images", "Refresh files from disk", [] { gScene.reloadAssets(); sceneChanged(); }},
         {"Save with Embedded Images", "Keep images inside the scene file", actEmbed},
+        {"Scatter Brush", "Paint linked objects", [] { openLab(LabScatter); }},
     };
     for (int i = 0; i < (int)std::size(commands); ++i) {
         int x = p.x + 18 + (i % 2) * 369, y = p.y + 50 + (i / 2) * 36;
@@ -2345,6 +2448,17 @@ void drawObjectLab() {
             swatch({x, y + 112, 288, 24}, "Key Color", picture.keyColor);
             ch |= slider({x, y + 142, 288, 24}, "Key Tolerance", picture.keyTolerance, 0, 1);
         }
+    } else if (o.type == ObjType::Water) {
+        ch |= dragF({x, y, 288, 24}, "Water Level", o.pos.y, .05f); y += 30;
+        ch |= toggle({x, y, 288, 24}, "Directional Waves", o.directionalWater); y += 30;
+        if (o.directionalWater) {
+            ch |= slider({x, y, 288, 24}, "Wind Direction", o.waveAngle, -180, 180, "%.0f"); y += 30;
+            ch |= slider({x, y, 288, 24}, "Wavelength", o.waveLength, .1f, 50, "%.2f", true); y += 30;
+            ch |= slider({x, y, 288, 24}, "Wave Height", o.waveHeight, 0, .7f); y += 30;
+        }
+        const char* water[] = {"Water", "Tropical Lagoon", "Deep Ocean"};
+        for (int i = 0; i < 3; ++i)
+            if (button({x + i * 96, y, 92, 24}, water[i], o.mat.name == water[i], gSmall)) { o.mat = findMaterial(water[i]); ch = true; }
     } else if (o.type == ObjType::Metaball) {
         ch |= slider({x, y, 288, 24}, "Influence Radius", o.metaRadius, 0.2f, 4.f);
         ch |= slider({x, y + 30, 288, 24}, "Field Strength", o.metaStrength, 0.1f, 4.f);
@@ -2391,6 +2505,15 @@ void drawObjectLab() {
         ch |= toggle({x + 146, ly, 142, 24}, "Cast Shadows", l.casts); ly += 28;
         ch |= toggle({x, ly, 142, 24}, "Disk Area", l.disk);
         ch |= toggle({x + 146, ly, 142, 24}, "Visible Emitter", l.visible); ly += 28;
+        int px = p.x + 324, py = y + 266;
+        ch |= slider({px, py, 158, 24}, "Diffuse Light", l.diffuseStrength, 0, 2);
+        ch |= slider({px + 162, py, 158, 24}, "Specular Light", l.specularStrength, 0, 2); py += 28;
+        ch |= dragI({px, py, 158, 24}, "Target Group", l.targetGroup, .2f, 0, 1000000);
+        if (button({px + 162, py, 158, 24}, l.excludeGroup ? "Exclude Target" : "Include Target")) {
+            l.excludeGroup = !l.excludeGroup;
+            ch = true;
+        }
+        note({px, py + 28, 320, 42}, "Group 0 lights all objects. Drag to set a group number.");
         if (o.type == ObjType::Spotlight) {
             int sel = gSel;
             if (button({x, ly, 188, 24}, l.gel.empty() ? "Load Projected Gel..." : baseName(l.gel).c_str())) defer([sel] {
@@ -2505,7 +2628,7 @@ void drawTextureLayers(Material& m) {
                 layer.map = (TexMap)i;
                 ch = true;
             }
-        y += 72;
+        y += ((int)TexMap::COUNT + 1) / 2 * 22 + 6;
         swatch({tx, y, 216, 24}, "Color A", layer.color1); y += 28;
         swatch({tx, y, 216, 24}, "Color B", layer.color2); y += 28;
         if (button({tx, y, 216, 24}, layer.image.empty() ? "Load BMP..." : baseName(layer.image).c_str())) {
@@ -2530,14 +2653,14 @@ void drawTextureLayers(Material& m) {
         int ax = p.x + 484;
         y = p.y + 46;
         label(ax, y, "Blend");
-        const char* blend[] = {"Mix", "Multiply", "Add"};
+        const char* blend[] = {"Mix", "Multiply", "Add", "Subtract", "Screen"};
         for (int i = 0; i < (int)TexBlend::COUNT; i++)
-            if (button({ax + i * 72, y + 20, 68, 22}, blend[i], (int)layer.blend == i, gSmall)) {
+            if (button({ax + (i % 3) * 72, y + 20 + (i / 3) * 24, 68, 22}, blend[i], (int)layer.blend == i, gSmall)) {
                 layer.blend = (TexBlend)i;
                 ch = true;
             }
-        y += 48;
-        const char* mask[] = {"No Mask", "Mask: Luminance", "Mask: Inverse Luminance", "Mask: Previous Layer"};
+        y += 70;
+        const char* mask[] = {"No Mask", "Mask: Luminance", "Mask: Inverse Luminance", "Mask: Previous Layer", "Mask: Elevation", "Mask: Slope"};
         if (button({ax, y, 212, 24}, mask[(int)layer.mask])) {
             layer.mask = (TexMask)(((int)layer.mask + 1) % (int)TexMask::COUNT);
             ch = true;
@@ -2561,9 +2684,27 @@ void drawTextureLayers(Material& m) {
             });
         }
     }
-    preview({p.x + 714, p.y + 46, 310, 310}, "Material preview");
-    if (!layers.empty())
-        note({p.x + 714, p.y + 386, 310, 62}, ("Selected layer affects " + (affected.empty() ? std::string("no channels.") : affected + ".")).c_str());
+    preview({p.x + 714, p.y + 46, 310, 240}, "Material preview");
+    if (!layers.empty()) {
+        TextureLayer& layer = layers[gLayerIndex];
+        int sx = p.x + 714, sy = p.y + 315;
+        if (layer.tex != TexType::Image) {
+            ch |= slider({sx, sy, 310, 24}, "Coordinate Warp", layer.warp, 0, 4); sy += 28;
+            if (layer.tex == TexType::Noise || layer.tex == TexType::Ridged) {
+                ch |= sliderI({sx, sy, 310, 24}, "Noise Octaves", layer.octaves, 1, 10); sy += 28;
+            }
+        }
+        ch |= slider({sx, sy, 152, 24}, "Contrast", layer.contrast, 0, 4);
+        ch |= slider({sx + 158, sy, 152, 24}, "Bias", layer.bias, -1, 1); sy += 28;
+        if (layer.mask == TexMask::Elevation || layer.mask == TexMask::Slope) {
+            ch |= slider({sx, sy, 152, 24}, "Mask From", layer.maskLow, 0, 1);
+            ch |= slider({sx + 158, sy, 152, 24}, "Mask To", layer.maskHigh, 0, 1); sy += 28;
+            ch |= slider({sx, sy, 310, 24}, "Mask Feather", layer.maskFeather, .001f, .5f); sy += 28;
+            note({sx, sy, 310, 32}, layer.mask == TexMask::Slope ? "Slope runs from flat (0) to vertical (1)." : "Elevation is measured in object space.");
+            sy += 36;
+        }
+        note({sx, sy, 310, 52}, ("Selected layer affects " + (affected.empty() ? std::string("no channels.") : affected + ".")).c_str());
+    }
     if (ch) sceneChanged();
     labFooter(p);
 }
@@ -2615,7 +2756,7 @@ void drawMatLab() {
     label(x2, y, "Mapping");
     for (int t = 0; t < (int)TexMap::COUNT; t++)
         if (button({x2 + (t % 2) * 114, y + 20 + (t / 2) * 26, 110, 22}, mapName((TexMap)t), m.map == (TexMap)t, gSmall)) { m.map = (TexMap)t; ch = true; }
-    y += 20 + 3 * 26 + 6;
+    y += 20 + (((int)TexMap::COUNT + 1) / 2) * 26 + 6;
     label(x2, y, "Colors");
     y += 20;
     swatch({x2, y, 224, 24}, "Color A", m.color1);
@@ -2661,6 +2802,37 @@ void drawMatLab() {
     ch |= slider({fx, fy, 320, 24}, "Volume Noise", m.volumeNoise, 0, 1);
     if (ch) sceneChanged();
     labFooter(P);
+}
+
+void addLightRig(int style) {
+    int group = gScene.maxGroup();
+    if (group == (std::numeric_limits<int>::max)()) { gStatus = "Scene group limit reached."; return; }
+    ++group;
+    int count = style == 0 ? 12 : (style == 1 ? 5 : 3);
+    V3 center = validSel() ? gScene.objs[gSel].worldPos : gScene.cam.target;
+    float radius = std::max(6.f, gScene.cam.dist * .3f);
+    for (int i = 0; i < count; ++i) {
+        bool dome = style == 0;
+        auto type = dome ? ObjType::Parallel : ObjType::Light;
+        Object light = makeObject(type, ++gCounter[(int)type]);
+        light.name = std::string(dome ? "Dome " : (style == 1 ? "Cluster " : "Fill ")) + std::to_string(i + 1);
+        float angle = i * (dome ? 2.3999632f : (2 * PI / count));
+        float up = dome ? (i + .5f) / count : .55f;
+        float side = std::sqrt(1 - up * up);
+        V3 direction(std::cos(angle) * side, up, std::sin(angle) * side);
+        light.pos = center + direction * radius;
+        light.rot = {std::acos(up) * 180 / PI, std::atan2(direction.x, direction.z) * 180 / PI, 0};
+        light.lightPower = (dome ? 1.2f : (style == 1 ? 1.6f : .75f)) / count;
+        light.lightColor = dome ? V3(.78f, .86f, 1.f) : V3(1.f, .93f, .83f);
+        light.lighting.falloff = Falloff::InverseSquare;
+        light.lighting.range = radius;
+        light.lighting.casts = style != 2;
+        light.lightSize = dome ? .6f : radius * .12f;
+        light.group = group;
+        gScene.objs.push_back(std::move(light));
+    }
+    gStatus = "Added " + std::to_string(count) + " grouped lights.";
+    sceneChanged();
 }
 
 void drawSkyLab() {
@@ -2737,14 +2909,46 @@ void drawSkyLab() {
     ch |= toggle({x3, y, w2, 24}, k.shadows ? "Shadows: On" : "Shadows: Off", k.shadows); y += 34;
     swatch({x3, y, w2, 24}, "Cloud Color", k.cloudColor); y += 28;
     swatch({x3, y, w2, 24}, "Ambient Color", k.ambientColor);
-    preview({P.x + P.w - 356, P.y + 46, 340, 255}, "Camera view preview");
-    int sx = P.x + P.w - 356, sy = P.y + 330;
+    preview({P.x + P.w - 356, P.y + 46, 340, 164}, "Camera view preview");
+    int sx = P.x + P.w - 356, sy = P.y + 242;
     ch |= slider({sx, sy, 340, 24}, "Cloud Altitude", k.cloudAltitude, 1, 200); sy += 28;
     ch |= slider({sx, sy, 340, 24}, "Cloud Thickness", k.cloudThickness, 0.1f, 30); sy += 28;
     ch |= slider({sx, sy, 340, 24}, "Cloud Shadows", k.cloudShadow, 0, 1); sy += 28;
     ch |= slider({sx, sy, 340, 24}, "Sky Lighting", k.skylight, 0, 2); sy += 28;
     swatch({sx, sy, 340, 24}, "Stratus Tint", k.stratusColor); sy += 28;
-    swatch({sx, sy, 340, 24}, "Moon Tint", k.moonColor);
+    swatch({sx, sy, 340, 24}, "Moon Tint", k.moonColor); sy += 28;
+    if (button({sx, sy, 244, 24}, k.environment.empty() ? "Load HDR Environment..." : baseName(k.environment).c_str())) defer([] {
+        std::string path;
+        if (!fileDialog(false, HDR_FILTER, "hdr", path)) return;
+        auto image = loadImageCached(path, true);
+        if (!image || !image->hdr) { gStatus = "Could not read this Radiance HDR image."; return; }
+        gScene.sky.environment = path;
+        gScene.sky.environmentImage = std::move(image);
+        sceneChanged();
+    });
+    if (button({sx + 250, sy, 90, 24}, "Clear HDR") && !k.environment.empty()) {
+        k.environment.clear();
+        k.environmentImage.reset();
+        ch = true;
+    }
+    sy += 28;
+    if (!k.environment.empty()) {
+        ch |= slider({sx, sy, 166, 24}, "HDR Rotation", k.environmentYaw, -180, 180, "%.0f");
+        ch |= slider({sx + 172, sy, 168, 24}, "HDR Strength", k.environmentStrength, 0, 16); sy += 28;
+        float samples = (float)k.environmentSamples;
+        if (slider({sx, sy, 166, 24}, "HDR Samples", samples, 1, 64, "%.0f")) {
+            k.environmentSamples = (int)std::lround(samples);
+            ch = true;
+        }
+        ch |= toggle({sx + 172, sy, 168, 24}, "HDR Background", k.environmentBackground);
+        sy += 28;
+    }
+    ch |= slider({sx, sy, 166, 24}, "Indirect Light", k.indirectStrength, 0, 2);
+    ch |= sliderI({sx + 172, sy, 168, 24}, "Bounce Samples", k.indirectSamples, 1, 16);
+    sy += 28;
+    const char* rigs[] = {"Add Dome", "Add Cluster", "Add Fill"};
+    for (int i = 0; i < 3; ++i)
+        if (button({sx + i * 114, sy, 110, 24}, rigs[i])) addLightRig(i);
     if (ch) sceneChanged();
     labFooter(P);
 }
@@ -2752,6 +2956,12 @@ void drawSkyLab() {
 void rememberTerrain(const Heightfield& f) {
     if (gTerrainUndo.size() >= 8) gTerrainUndo.erase(gTerrainUndo.begin());
     gTerrainUndo.push_back({f.res, f.h, {}});
+    size_t cells = 0;
+    for (const auto& entry : gTerrainUndo) cells += entry.h.size();
+    while (cells > 33554432 && gTerrainUndo.size() > 1) {
+        cells -= gTerrainUndo.front().h.size();
+        gTerrainUndo.erase(gTerrainUndo.begin());
+    }
     gTerrainRedo.clear();
 }
 
@@ -2824,6 +3034,15 @@ void drawTerrainLab() {
     }
     if (button({hm.x, ry + 28, 128, 24}, "Undo Terrain Edit")) terrainHistory(false);
     if (button({hm.x + 132, ry + 28, 132, 24}, "Redo Terrain Edit")) terrainHistory(true);
+    if (button({hm.x + 268, ry + 28, 132, 24}, "Material to Height")) {
+        Image heights = terrainMaterialHeightMap(o, std::min(f.res, 1025));
+        if (!heights.px.empty()) {
+            rememberTerrain(f);
+            hfBlendImage(f, region, heights, gTerrainBlend, gTerrainBlendMask.get());
+            ch = true;
+            gStatus = "Blended the material bump or color into the selected terrain region.";
+        }
+    }
 
     int x = P.x + 432, y = P.y + 46;
     label(x, y, "Generate");
@@ -2856,11 +3075,11 @@ void drawTerrainLab() {
     y += ((nops + 2) / 3) * 26 + 6;
     label(x, y, "Resolution");
     y += 20;
-    const int resv[] = {129, 257, 513, 1025, 2049};
+    const int resv[] = {129, 257, 513, 1025, 2049, MAX_TERRAIN_RESOLUTION};
     for (int i = 0; i < (int)std::size(resv); i++) {
         char b[16];
         snprintf(b, sizeof b, "%d", resv[i] - 1);
-        if (button({x + i * 45, y, 43, 22}, b, f.res == resv[i], gSmall) && f.res != resv[i]) {
+        if (button({x + i * 38, y, 36, 22}, b, f.res == resv[i], gSmall) && f.res != resv[i]) {
             rememberTerrain(f); hfResample(f, resv[i]); ch = true;
         }
     }
@@ -2875,32 +3094,63 @@ void drawTerrainLab() {
         if (button({x + (i % 4) * 57, y + (i / 4) * 26, 54, 22}, brushName((BrushMode)i), gBrush == (BrushMode)i, gSmall)) gBrush = (BrushMode)i;
     int sel = gSel;
     int x4 = P.x + P.w - 336;
-    preview({x4, P.y + 46, 320, 240}, "Camera view preview");
-    y = P.y + 320;
+    preview({x4, P.y + 46, 320, 178}, "Camera view preview");
+    y = P.y + 250;
     label(x4, y, "Picture");
     y += 20;
-    if (button({x4, y, 158, 24}, "Import Picture...")) {
-        defer([sel] {
+    if (button({x4, y, 158, 24}, "Blend Height Map...")) {
+        defer([sel, region] {
             std::string p;
             if (!fileDialog(false, IMAGE_FILTER, "png", p) || sel >= (int)gScene.objs.size() || !gScene.objs[sel].hf) return;
             auto im = loadImage(p);
             if (!im) { gStatus = "Could not read " + p; return; }
             rememberTerrain(*gScene.objs[sel].hf);
-            hfFromImage(*gScene.objs[sel].hf, *im);
+            hfBlendImage(*gScene.objs[sel].hf, region, *im, gTerrainBlend, gTerrainBlendMask.get());
             sceneChanged();
         });
     }
     if (button({x4 + 162, y, 158, 24}, "Export Height Map...")) {
         defer([sel] {
             std::string p;
-            if (!fileDialog(true, BMP_FILTER, "bmp", p) || sel >= (int)gScene.objs.size() || !gScene.objs[sel].hf) return;
+            if (!fileDialog(true, "16-bit TIFF\0*.tif;*.tiff\0" "16-bit PGM\0*.pgm\0Bitmap\0*.bmp\0", "tif", p) ||
+                sel >= (int)gScene.objs.size() || !gScene.objs[sel].hf) return;
             const Heightfield& hf = *gScene.objs[sel].hf;
-            std::vector<uint32_t> px(hf.h.size());
-            for (size_t i = 0; i < px.size(); i++) { uint32_t v = (uint32_t)(clampf(hf.h[i], 0, 1) * 255); px[i] = (v << 16) | (v << 8) | v; }
-            gStatus = saveBMP(p, hf.res, hf.res, px) ? "Exported height map " + p : "Could not write " + p;
+            auto ext = std::filesystem::path(p).extension().string();
+            for (char& c : ext) c = (char)std::tolower((unsigned char)c);
+            bool saved = false;
+            if (ext == ".tif" || ext == ".tiff") saved = saveHeightTiff(p, hf.res, hf.res, hf.h);
+            else if (ext == ".pgm") {
+                std::ofstream out(p, std::ios::binary);
+                out << "P5\n" << hf.res << ' ' << hf.res << "\n65535\n";
+                for (float h : hf.h) {
+                    unsigned value = (unsigned)std::lround(clampf(h, 0, 1) * 65535);
+                    out.put((char)(value >> 8)); out.put((char)(value & 255));
+                }
+                out.close();
+                saved = (bool)out;
+            }
+            else if (ext == ".bmp") {
+                std::vector<uint32_t> px(hf.h.size());
+                for (size_t i = 0; i < px.size(); i++) {
+                    uint32_t v = (uint32_t)(clampf(hf.h[i], 0, 1) * 255);
+                    px[i] = (v << 16) | (v << 8) | v;
+                }
+                saved = saveBMP(p, hf.res, hf.res, px);
+            }
+            gStatus = saved ? "Exported height map " + p : "Could not write " + p;
         });
     }
     y += 32;
+    if (button({x4, y, 226, 22}, gTerrainBlendMask ? "Replace Blend Mask..." : "Load Blend Mask...")) defer([] {
+        std::string path;
+        if (!fileDialog(false, IMAGE_FILTER, "png", path)) return;
+        auto mask = loadImage(path);
+        if (mask) gTerrainBlendMask = std::move(mask);
+        else gStatus = "Could not read the blend mask.";
+    });
+    if (button({x4 + 232, y, 88, 22}, "Clear Mask")) gTerrainBlendMask.reset();
+    y += 26;
+    slider({x4, y, 320, 22}, "Height Map Blend", gTerrainBlend, 0, 1); y += 26;
     sliderI({x4, y, 155, 22}, "Seed", gTerrainSeed, 0, 99999);
     sliderI({x4 + 162, y, 158, 22}, "Octaves", gTerrainOctaves, 1, 10); y += 26;
     slider({x4, y, 155, 22}, "Frequency", gTerrainFrequency, 0.5f, 16);
@@ -2913,8 +3163,9 @@ void drawTerrainLab() {
     y += 28;
     ch |= slider({x4, y, 320, 24}, "Height Gain", o.terrain.height, 0.05f, 5); y += 28;
     ch |= slider({x4, y, 320, 24}, "Clip Low Points", o.terrain.clip, 0, 1); y += 28;
+    ch |= slider({x4, y, 320, 24}, "Surface Smoothing", o.terrain.smoothing, 0, 1); y += 28;
     if (o.type == ObjType::Terrain) ch |= slider({x4, y, 320, 24}, "Base Thickness", o.terrain.thickness, 0, 2);
-    note({x4, y + 32, 320, 60}, "Imported pictures use brightness as height. Export saves the height map as a grayscale bitmap.");
+    note({x4, y + 32, 320, 42}, "A white mask blends at full strength. TIFF and PGM preserve 16-bit height precision.");
     if (ch) sceneChanged();
     labFooter(P);
 }
@@ -2935,7 +3186,16 @@ void drawTreeLab() {
     ch |= slider({x, y, w, 24}, "Leaf Density", t.leafDensity, 0, 3); y += 30;
     ch |= sliderI({x, y, w, 24}, "Branch Levels", t.levels, 1, 5); y += 30;
     ch |= sliderI({x, y, w, 24}, "Branches", t.branches, 2, 6); y += 30;
+    ch |= slider({x, y, w, 24}, "Branch Lift", t.upwardBias, -.5f, .7f); y += 30;
+    ch |= slider({x, y, w, 24}, "Branch Taper", t.taper, .25f, 1); y += 30;
+    const char* foliage[] = {"Leaf Cards", "Broad Leaves", "Needles"};
+    if (button({x, y, w, 24}, foliage[t.foliageShape])) { t.foliageShape = (t.foliageShape + 1) % 3; ch = true; }
+    y += 30;
     if (button({x, y, w, 26}, "New Random Shape")) { t.seed = ++gSeed * 7 + 3; ch = true; }
+    y += 34;
+    if (button({x, y, 85, 24}, "Pine")) { t = {1.3f, 28, .065f, .06f, 1.7f, 3, 4, t.seed, .25f, .72f, 2}; ch = true; }
+    if (button({x + 88, y, 84, 24}, "Oak")) { t = {1.1f, 56, .085f, .11f, 1.35f, 3, 4, t.seed, .12f, .66f, 1}; ch = true; }
+    if (button({x + 175, y, 85, 24}, "Willow")) { t = {1.2f, 53, .058f, .08f, 1.2f, 3, 5, t.seed, -.25f, .59f, 2}; ch = true; }
     if (ch) {
         for (int i : members) { gScene.objs[i].tree = t; regenTree(gScene.objs[i]); }
         sceneChanged();
@@ -3263,6 +3523,7 @@ void drawUI() {
         case LabAssets: drawAssetsLab(); break;
         case LabCameras: drawCamerasLab(); break;
         case LabCommands: drawCommandsLab(); break;
+        case LabScatter: drawScatterLab(); break;
         default: break;
         }
     }
@@ -3477,6 +3738,7 @@ void handleKey(int wp) {
     bool ctrl = input.ctrl, shift = input.shift;
     if (wp == KeyCode::Escape) {
         if (gLab != LabNone) { closeLab(true); endInteraction(); }
+        else if (gScatter) { gScatter = false; gDrag = DragNone; gStatus = "Scatter brush closed."; }
         else if (gMainR.busy() || gAnimRender || !gQueue.empty()) actRender();
         else gShowRender = false;
         return;
@@ -3520,12 +3782,72 @@ void usage(FILE* out) {
                "  Brycescape --render OUTPUT [WIDTH HEIGHT [SCENE.c3d]]\n"
                "  Brycescape --example INDEX OUTPUT [WIDTH HEIGHT [QUALITY]]\n"
                "  Brycescape --export-example INDEX OUTPUT.c3d\n"
+               "  Brycescape --render-frames SCENE.c3d OUTPUT_DIR FIRST LAST\n"
                "  Brycescape --batch QUEUE.txt\n", out);
+}
+
+int renderFrames(const char* path, const char* directory, int first, int last) {
+    namespace fs = std::filesystem;
+    Scene scene;
+    if (!scene.load(path)) { std::fprintf(stderr, "Could not read scene: %s\n", path); return 3; }
+    if (first < 0 || last < first || last >= scene.frames) {
+        std::fprintf(stderr, "Frame range must be between 0 and %d.\n", scene.frames - 1);
+        return 2;
+    }
+    int w = scene.render.width > 0 ? scene.render.width : 800, h = scene.render.height > 0 ? scene.render.height : 500;
+    if ((size_t)w * h > 64000000) return 2;
+    fs::path folder(directory);
+    std::error_code error;
+    fs::create_directories(folder, error);
+    if (error) { std::fprintf(stderr, "Could not open output folder: %s\n", directory); return 4; }
+    int rendered = 0, busy = 0, complete = 0;
+    for (int frame = first; frame <= last; ++frame) {
+        char name[32];
+        std::snprintf(name, sizeof name, "frame_%06d", frame);
+        fs::path output = folder / (std::string(name) + ".png");
+        if (fs::is_regular_file(output, error)) { ++complete; continue; }
+        fs::path claim = folder / (std::string(name) + ".rendering");
+        if (!fs::create_directory(claim, error)) {
+            if (error) { std::fprintf(stderr, "Could not claim frame %d.\n", frame); return 4; }
+            ++busy;
+            continue;
+        }
+        // Recheck after claiming in case a worker published between the earlier check and directory creation.
+        bool alreadyDone = fs::is_regular_file(output, error);
+        bool ok = alreadyDone;
+        const char* suffixes[] = {"_depth.png", "_id.png", ".png"};
+        if (!alreadyDone) {
+            Scene frameScene = scene;
+            frameScene.applyFrame(frame);
+            std::vector<uint32_t> pixels((size_t)w * h);
+            std::printf("Rendering frame %d\n", frame);
+            renderImage(frameScene, w, h, pixels.data());
+            ok = saveRenderOutput((claim / output.filename()).string(), frameScene, w, h, std::move(pixels));
+            for (size_t i = 0; ok && i < std::size(suffixes); ++i) {
+                if ((i == 0 && !scene.render.depthOutput) || (i == 1 && !scene.render.idOutput)) continue;
+                std::string file = std::string(name) + suffixes[i];
+                fs::rename(claim / file, folder / file, error);
+                ok = !error;
+            }
+        }
+        for (const char* suffix : suffixes) fs::remove(claim / (std::string(name) + suffix), error);
+        fs::remove(claim, error);
+        if (!ok) { std::fprintf(stderr, "Could not publish frame %d.\n", frame); return 4; }
+        if (alreadyDone) ++complete;
+        else ++rendered;
+    }
+    std::printf("Frames rendered: %d, already complete: %d, claimed by other workers: %d\n", rendered, complete, busy);
+    return 0;
 }
 
 int headless(int argc, char** argv) {
     std::string_view command = argv[1];
     if (command == "--help") { usage(stdout); return 0; }
+    if (command == "--render-frames") {
+        int first, last;
+        if (argc != 6 || !parseInt(argv[4], first) || !parseInt(argv[5], last)) { usage(stderr); return 2; }
+        return renderFrames(argv[2], argv[3], first, last);
+    }
     if (command == "--batch") {
         std::vector<RenderJob> jobs;
         if (argc != 3 || !readQueue(argv[2], jobs)) { usage(stderr); return 2; }

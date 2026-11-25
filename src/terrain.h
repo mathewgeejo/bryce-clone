@@ -21,6 +21,7 @@ struct HeightRegion { int x0, z0, x1, z1; };
 struct TerrainPatch { int width = 0, height = 0; std::vector<float> values; };
 TerrainPatch hfCopyRegion(const Heightfield& f, HeightRegion area);
 void hfPasteRegion(Heightfield& f, HeightRegion area, const TerrainPatch& patch);
+void hfBlendImage(Heightfield& f, HeightRegion area, const Image& image, float amount, const Image* mask);
 void hfBrush(Heightfield& f, float u, float v, float radius, float amount, BrushMode mode = BrushMode::Raise, const HeightRegion* mask = nullptr);
 void hfResample(Heightfield& f, int res);
 void hfTerrace(Heightfield& f, int levels);

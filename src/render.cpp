@@ -58,6 +58,12 @@ static V3 texCoord(const Texture& m, const Object& o, const Hit& h, float& u, fl
     case TexMap::Cylindrical: u = ang(); v = (lr.y + 1) * 0.5f; return {u * 8, lr.y * 2, 0.5f};
     case TexMap::PlanarXZ: u = (lr.x + 1) * 0.5f; v = (lr.z + 1) * 0.5f; return {h.lp.x, 0.5f, h.lp.z};
     case TexMap::PlanarXY: u = (lr.x + 1) * 0.5f; v = (lr.y + 1) * 0.5f; return {h.lp.x, h.lp.y, 0.5f};
+    case TexMap::MeshUV:
+        if (o.mesh && !o.mesh->uv.empty()) {
+            u = h.uv.x; v = h.uv.y;
+            return {u, v, .5f};
+        }
+        [[fallthrough]];
     default: {
         V3 ln = o.fwd.transpose() * h.n;
         float ax = std::fabs(ln.x), ay = std::fabs(ln.y), az = std::fabs(ln.z);
@@ -69,7 +75,7 @@ static V3 texCoord(const Texture& m, const Object& o, const Hit& h, float& u, fl
     }
 }
 
-static TextureSample evalTexture(const Texture& m, V3 p, float u, float v, float y, float ny, float transparency, bool layer = false) {
+static TextureSample evalTexture(const Texture& m, V3 p, float u, float v, float y, float ny, float transparency, bool layer = false, int octaves = 5) {
     TextureSample s{m.color1, transparency, 1};
     switch (m.tex) {
     case TexType::Checker: {
@@ -87,7 +93,14 @@ static TextureSample evalTexture(const Texture& m, V3 p, float u, float v, float
         s.color = lerp(m.color2, m.color1, smoothstep(-0.25f, 0.3f, fbm(p * 3.f, 4)));
         if (noise3(p * 25.f) > 0.42f) s.color = s.color * 0.55f;
         break;
-    case TexType::Noise: s.color = lerp(m.color2, m.color1, clampf(0.5f + 0.7f * fbm(p, 5), 0, 1)); break;
+    case TexType::Noise: s.color = lerp(m.color2, m.color1, clampf(0.5f + 0.7f * fbm(p, octaves), 0, 1)); break;
+    case TexType::Ridged: s.color = lerp(m.color2, m.color1, clampf(1 - turb(p, octaves), 0, 1)); break;
+    case TexType::Cellular: {
+        float next;
+        float nearest = worley(p, next);
+        s.color = lerp(m.color2, m.color1, smoothstep(0.f, .45f, next - nearest));
+        break;
+    }
     case TexType::Clouds: {
         float n = fbm(p, 6);
         s.trans = 1.f - smoothstep(-0.05f, 0.35f, n);
@@ -145,7 +158,9 @@ static TextureSample evalTexture(const Texture& m, V3 p, float u, float v, float
 
 template <class T> static T blendTexture(T base, T texture, float weight, TexBlend mode) {
     if (mode == TexBlend::Add) return base + texture * weight;
+    if (mode == TexBlend::Subtract) return base - texture * weight;
     if (mode == TexBlend::Multiply) texture = base * texture;
+    if (mode == TexBlend::Screen) texture = base + texture - base * texture;
     return base + (texture - base) * weight;
 }
 
@@ -172,16 +187,29 @@ static Surf evalSurface(const Material& m, const Object& o, const Hit& h, bool b
         V3 p = texCoord(layer, o, h, u, v) * layer.texScale;
         M3 rot = rotY(rad(layer.rotation.y)) * rotX(rad(layer.rotation.x)) * rotZ(rad(layer.rotation.z));
         p = rot * p + layer.offset;
+        if (layer.warp > 0 && layer.tex != TexType::Image)
+            p += V3(noise3(p), noise3(p + V3(43)), noise3(p - V3(31))) * layer.warp;
         if (layer.tex == TexType::Image) {
             V3 uv = rot * V3((u - 0.5f) * layer.texScale, (v - 0.5f) * layer.texScale, 0) + layer.offset;
             u = uv.x + 0.5f; v = uv.y + 0.5f;
         }
-        TextureSample component = evalTexture(layer, p, u, v, p.y, h.n.y, 0, true);
+        TextureSample component = evalTexture(layer, p, u, v, p.y, h.n.y, 0, true, layer.octaves);
+        if (layer.contrast != 1 || layer.bias != 0) {
+            auto adjust = [&](float value) { return clampf((value - .5f) * layer.contrast + .5f + layer.bias, 0, 1); };
+            V3 c = component.color;
+            component.color = {adjust(c.x), adjust(c.y), adjust(c.z)};
+        }
         float lum = clampf(dot(component.color, V3(0.299f, 0.587f, 0.114f)), 0, 1);
         float weight = layer.opacity;
         if (layer.mask == TexMask::Luminance) weight *= lum;
         else if (layer.mask == TexMask::InverseLuminance) weight *= 1 - lum;
         else if (layer.mask == TexMask::Previous) weight *= previous;
+        else if (layer.mask == TexMask::Elevation || layer.mask == TexMask::Slope) {
+            float value = layer.mask == TexMask::Slope ? std::acos(clampf(std::fabs(h.n.y), 0, 1)) / (PI * .5f) :
+                          clampf(isHeightfield(o.type) ? h.lr.y : (h.lr.y + 1) * .5f, 0, 1);
+            float low = std::min(layer.maskLow, layer.maskHigh), high = std::max(layer.maskLow, layer.maskHigh);
+            weight *= smoothstep(low - layer.maskFeather, low, value) * (1 - smoothstep(high, high + layer.maskFeather, value));
+        }
         previous = lum;
         auto scalar = [&](float current, TexChannel channel, float value) {
             float amount = weight * layer.influence[channel];
@@ -200,6 +228,32 @@ static Surf evalSurface(const Material& m, const Object& o, const Hit& h, bool b
         s.ambient = scalar(s.ambient, TexAmbient, lum);
     }
     return s;
+}
+
+Image terrainMaterialHeightMap(const Object& terrain, int samples) {
+    Image output;
+    if (!terrain.hf || terrain.hf->res < 2 || samples < 2 || samples > 1025) return output;
+    output.w = output.h = samples;
+    output.px.resize((size_t)samples * samples);
+    int last = terrain.hf->res - 1;
+    for (int z = 0; z < samples; ++z) {
+        for (int x = 0; x < samples; ++x) {
+            int gx = x * last / (samples - 1), gz = z * last / (samples - 1);
+            Hit hit;
+            hit.lr = {2.f * x / (samples - 1) - 1, terrain.terrainAt(gx, gz), 2.f * z / (samples - 1) - 1};
+            hit.lp = hit.lr * terrain.scl;
+            hit.ly = hit.lr.y;
+            hit.p = terrain.worldPos + terrain.fwd * hit.lr;
+            V3 normal = terrain.hf->normal(gx, gz);
+            normal.x *= terrain.terrain.height;
+            normal.z *= terrain.terrain.height;
+            hit.n = normalize(terrain.nrm * normal);
+            Surf result = evalSurface(terrain.mat, terrain, hit);
+            float height = result.layeredBump ? result.height : dot(result.color, V3(.3f, .59f, .11f));
+            output.px[(size_t)z * samples + x] = V3(clampf(height, 0, 1));
+        }
+    }
+    return output;
 }
 
 static float bumpField(const Material& m, V3 q) {
@@ -235,7 +289,16 @@ static V3 layerNormal(const Material& m, const Object& o, const Hit& h, V3 n) {
     return normalize(n - (u * du + v * dv) * 0.08f);
 }
 
+static V3 environmentColor(const Sky& sky, V3 d) {
+    const Image& map = *sky.environmentImage;
+    d = rotY(-rad(sky.environmentYaw)) * d;
+    float u = std::atan2(d.x, d.z) / (2 * PI) + 0.5f;
+    float v = std::acos(clampf(d.y, -1, 1)) / PI;
+    return map.sample(u, clampf(v, 0.5f / map.h, 1 - 0.5f / map.h)) * sky.environmentStrength;
+}
+
 V3 skyColor(const Sky& k, V3 d) {
+    if (k.environmentImage && k.environmentBackground) return environmentColor(k, d);
     if (k.mode == 3) return k.zenith;
     float y = d.y, ex = k.mode == 0 ? 0.8f : (k.mode == 1 ? 0.3f : 0.45f);
     V3 zen = k.mode == 1 ? k.zenith * 0.6f : k.zenith, hor = k.mode == 0 ? lerp(k.horizon, V3(1.f), 0.15f) : k.horizon;
@@ -428,23 +491,60 @@ static V3 trace(Ctx& c, const Ray& r, int depth, RayPurpose purpose = RayPurpose
         maximum = t; emitted = true; lamp = l.lightColor * l.lightPower;
     }
     if (emitted) return compositeVolumes(s, r, maximum, atmosHit(k, r.o, r.o + r.d * maximum, maximum, lamp), c.premium);
-    if (!surface) return compositeVolumes(s, r, maximum, atmosSky(k, r, skyColor(k, r.d)), c.premium);
+    if (!surface) {
+        bool environment = k.environmentImage && (k.environmentBackground || purpose == RayPurpose::Reflection);
+        V3 background = environment ? environmentColor(k, r.d) : atmosSky(k, r, skyColor(k, r.d));
+        return compositeVolumes(s, r, maximum, background, c.premium);
+    }
     const Object& ob = s.objs[h.obj];
     const Material& m = ob.mat;
     Surf sf = evalSurface(m, ob, h);
     bool inside = dot(h.n, r.d) > 0;
     V3 nf = bumpNormal(m, h, inside ? -h.n : h.n);
     if (sf.layeredBump) nf = layerNormal(m, ob, h, nf);
+    if (ob.type == ObjType::Water && ob.directionalWater) {
+        float frequency = 2 * PI / ob.waveLength, angle = rad(ob.waveAngle);
+        V3 direction(std::cos(angle), 0, std::sin(angle));
+        V3 crosswind(-direction.z, 0, direction.x);
+        float phase = frequency * dot(h.p, direction) + s.frame * .12f;
+        float ripple = 2.7f * frequency * dot(h.p, crosswind) + s.frame * .07f;
+        V3 gradient = direction * (frequency * std::cos(phase)) + crosswind * (.6f * frequency * std::cos(ripple));
+        nf = normalize(nf - gradient * (inside ? -ob.waveHeight : ob.waveHeight));
+    }
     V3 diff = sf.color * k.ambientColor * (k.ambient * sf.ambient * 2.f), spec(0.f);
     if (k.skylight > 0) diff += sf.color * skyColor(k, nf) * (m.diffuse * k.skylight * 0.38f);
-    auto light = [&](V3 L, V3 li, float maxd, bool casts = true) {
+    auto light = [&](V3 L, V3 li, float maxd, bool casts = true, float diffuse = 1, float specular = 1) {
         float ndl = m.tex == TexType::Clouds && ob.type != ObjType::Picture ? std::fabs(dot(h.n, L)) * 0.8f + 0.2f : dot(nf, L);
         if (ndl <= 0) return;
         if (k.shadows && casts) li = li * shadowRay(s, h.p + nf * EPS, L, maxd);
         if (maxc(li) <= 0) return;
-        diff += sf.color * li * (m.diffuse * ndl);
-        if (sf.specular > 0) spec += li * (sf.specular * std::pow(std::max(0.f, dot(nf, normalize(L - r.d))), m.shininess));
+        diff += sf.color * li * (m.diffuse * ndl * diffuse);
+        if (sf.specular > 0) spec += li * (specular * sf.specular * std::pow(std::max(0.f, dot(nf, normalize(L - r.d))), m.shininess));
     };
+    if (k.environmentImage && k.environmentStrength > 0) {
+        const Image& map = *k.environmentImage;
+        const auto& cdf = map.lightCdf;
+        M3 rotate = rotY(rad(k.environmentYaw));
+        int samples = c.premium ? k.environmentSamples : std::min(4, k.environmentSamples);
+        if (!cdf.empty() && cdf.back() > 0) {
+            for (int sample = 0; sample < samples; ++sample) {
+                double pick = cdf.back() * (sample + (double)c.rng.f()) / samples;
+                auto pixel = std::upper_bound(cdf.begin(), cdf.end(), pick);
+                if (pixel == cdf.end()) continue;
+                size_t index = pixel - cdf.begin();
+                int y = (int)(index / map.w);
+                float cosTop = std::cos(PI * y / map.h), cosBottom = std::cos(PI * (y + 1) / map.h);
+                float cosTheta = lerpf(cosTop, cosBottom, c.rng.f());
+                float sinTheta = std::sqrt(std::max(0.f, 1 - cosTheta * cosTheta));
+                float phi = ((index % map.w + c.rng.f()) / map.w - 0.5f) * 2 * PI;
+                V3 direction = rotate * V3(std::sin(phi) * sinTheta, cosTheta, std::cos(phi) * sinTheta);
+                double probability = (*pixel - (index ? cdf[index - 1] : 0.0)) / cdf.back();
+                double areaOverPi = 2.0 * (cosTop - cosBottom) / map.w;
+                if (probability > 0)
+                    light(direction, map.px[index] * (float)(areaOverPi * k.environmentStrength / (samples * probability)), 1e30f);
+            }
+        }
+    }
     float sunI = smoothstep(-3, 3, k.sunAlt);
     V3 sun = k.sunDir();
     if (sunI > 0) {
@@ -458,10 +558,11 @@ static V3 trace(Ctx& c, const Ray& r, int depth, RayPurpose purpose = RayPurpose
     for (int i : s.lights) {
         const Object& lo = s.objs[i];
         const auto& profile = lo.lighting;
+        if (profile.targetGroup > 0 && ((ob.group == profile.targetGroup) == profile.excludeGroup)) continue;
         if (lo.type == ObjType::Parallel) {
             V3 L = -lo.lightAxis();
             if (c.soft && lo.lightSize > 0) L = jitterDir(L, lo.lightSize * 0.05f, c.rng);
-            light(L, lo.lightColor * lo.lightPower, 1e30f, profile.casts);
+            light(L, lo.lightColor * lo.lightPower, 1e30f, profile.casts, profile.diffuseStrength, profile.specularStrength);
             continue;
         }
         int samples = c.soft && lo.lightSize > 0 ? profile.samples : 1;
@@ -489,7 +590,7 @@ static V3 trace(Ctx& c, const Ray& r, int depth, RayPurpose purpose = RayPurpose
                 li = li * profile.gelImage->sampleClamped(0.5f + 0.5f * projected.x / depth, 0.5f + 0.5f * projected.z / depth, false);
             }
         }
-        light(L, li, d - EPS, profile.casts);
+        light(L, li, d - EPS, profile.casts, profile.diffuseStrength, profile.specularStrength);
         }
     }
     float reflF = sf.reflect, transF = sf.trans;
@@ -514,8 +615,20 @@ static V3 trace(Ctx& c, const Ray& r, int depth, RayPurpose purpose = RayPurpose
         reflF += (1 - reflF) * kr * transF;
         transF *= 1 - kr;
     }
-    V3 col = diff * std::max(0.f, 1 - reflF - transF) + spec + sf.color * (m.emission * sf.glow);
     int maxDepth = s.render.bounces > 0 ? s.render.bounces : (c.premium ? 6 : 5);
+    if (depth == 0 && k.indirectStrength > 0 && m.diffuse > 0 && reflF + transF < 0.99f) {
+        int samples = c.premium ? k.indirectSamples : 1;
+        V3 right = normalize(cross(nf, std::fabs(nf.y) > .95f ? V3(0, 0, 1) : V3(0, 1, 0)));
+        V3 forward = cross(nf, right), bounced;
+        for (int i = 0; i < samples; ++i) {
+            float radius2 = (i + c.rng.f()) / samples, angle = 2 * PI * c.rng.f();
+            float radius = std::sqrt(radius2);
+            V3 direction = nf * std::sqrt(1 - radius2) + (right * std::cos(angle) + forward * std::sin(angle)) * radius;
+            bounced += trace(c, {h.p + nf * EPS, direction}, maxDepth + 1);
+        }
+        diff += bounced * sf.color * (k.indirectStrength * m.diffuse / samples);
+    }
+    V3 col = diff * std::max(0.f, 1 - reflF - transF) + spec + sf.color * (m.emission * sf.glow);
     bool blur = c.blur && m.blur > 0;
     if (depth < maxDepth) {
         if (reflF > 0.01f) {

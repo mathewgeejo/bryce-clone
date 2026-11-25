@@ -2,6 +2,7 @@
 #include <array>
 #include <memory>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -9,9 +10,9 @@
 #include "mesh.h"
 #include "vmath.h"
 
-enum class TexType { None, Checker, Marble, Wood, Granite, Noise, Clouds, Waves, Strata, Altitude, Spots, Bricks, Rust, Lava, Rings, Gradient, Image, COUNT };
+enum class TexType { None, Checker, Marble, Wood, Granite, Noise, Clouds, Waves, Strata, Altitude, Spots, Bricks, Rust, Lava, Rings, Gradient, Image, Ridged, Cellular, COUNT };
 const char* texName(TexType t);
-enum class TexMap { Object, World, Spherical, Cylindrical, PlanarXZ, PlanarXY, COUNT };
+enum class TexMap { Object, World, Spherical, Cylindrical, PlanarXZ, PlanarXY, MeshUV, COUNT };
 const char* mapName(TexMap m);
 
 struct Texture {
@@ -23,8 +24,8 @@ struct Texture {
     std::shared_ptr<const Image> img;
 };
 
-enum class TexBlend { Mix, Multiply, Add, COUNT };
-enum class TexMask { None, Luminance, InverseLuminance, Previous, COUNT };
+enum class TexBlend { Mix, Multiply, Add, Subtract, Screen, COUNT };
+enum class TexMask { None, Luminance, InverseLuminance, Previous, Elevation, Slope, COUNT };
 enum TexChannel { TexColor, TexBump, TexSpecular, TexReflection, TexTransparency, TexAmbient, TexChannelCount };
 constexpr int MAX_TEXTURE_LAYERS = 16;
 
@@ -33,6 +34,9 @@ struct TextureLayer : Texture {
     TexBlend blend = TexBlend::Mix;
     TexMask mask = TexMask::None;
     float opacity = 1.f;
+    float warp = 0, contrast = 1, bias = 0;
+    float maskLow = 0.25f, maskHigh = 0.75f, maskFeather = 0.1f;
+    int octaves = 5;
     std::array<float, TexChannelCount> influence{1};
     bool save(const std::string& path) const;
     bool load(const std::string& path);
@@ -69,6 +73,13 @@ struct Sky {
     float rainbow = 0;
     float cloudAltitude = 12, cloudThickness = 2, cloudShadow = 0, skylight = 0;
     V3 stratusColor{1, 1, 1}, moonColor{0.95f, 0.93f, 0.88f};
+    std::string environment;
+    std::shared_ptr<const Image> environmentImage;
+    float environmentYaw = 0, environmentStrength = 1;
+    int environmentSamples = 8;
+    bool environmentBackground = true;
+    float indirectStrength = 0;
+    int indirectSamples = 4;
     V3 sunDir() const { return dirFrom(sunAlt, sunAz); }
     V3 moonDir() const { return dirFrom(moonAlt, moonAz); }
     static V3 dirFrom(float alt, float az) {
@@ -94,6 +105,9 @@ struct LightSettings {
     float range = 20;
     int samples = 1;
     bool casts = true, disk = false, enabled = true, visible = false;
+    float diffuseStrength = 1, specularStrength = 1;
+    int targetGroup = 0;
+    bool excludeGroup = false;
     std::string gel;
     std::shared_ptr<const Image> gelImage;
 };
@@ -106,8 +120,11 @@ struct Heightfield {
     std::vector<float> h;
     std::vector<V3> n;
     float at(int x, int z) const { return h[z * res + x]; }
+    V3 normal(int x, int z) const;
+    V3 calculateNormal(int x, int z) const;
     void computeNormals(int x0 = 0, int z0 = 0, int x1 = -1, int z1 = -1);
 };
+constexpr int MAX_TERRAIN_RESOLUTION = 4097;
 
 enum class Ease { Spline, Linear, Smooth, Hold, COUNT };
 const char* easeName(Ease ease);
@@ -132,7 +149,7 @@ struct StoneShape {
     float irregularity = 1.f, blockiness = 0.f, smoothing = 0.f;
 };
 
-struct TerrainShape { float height = 1, clip = 0, thickness = 0; };
+struct TerrainShape { float height = 1, clip = 0, thickness = 0, smoothing = 0; };
 
 struct AppearanceKey {
     int frame = 0;
@@ -143,6 +160,7 @@ struct AppearanceKey {
     std::array<float, 4> light{};
     bool hidden = false;
     Ease ease = Ease::Linear;
+    std::optional<LightSettings> lighting;
 };
 
 struct Object {
@@ -155,6 +173,9 @@ struct Object {
     LightSettings lighting;
     int group = 0;
     int parent = -1;
+    int instanceSource = -1;
+    bool terrainAnchor = false;
+    V3 anchorPoint;
     M3 bind;
     V3 bindOffset;
     bool hasBind = false;
@@ -165,6 +186,8 @@ struct Object {
     Picture picture;
     TorusShape torus;
     StoneShape stone;
+    bool directionalWater = false;
+    float waveAngle = 35, waveLength = 2, waveHeight = .03f;
     TerrainShape terrain;
     bool flatMesh = false;
     uint32_t seed = 1;
@@ -181,7 +204,16 @@ struct Object {
     bool csg = false;
     void update(const Camera* camera = nullptr, const Object* ancestor = nullptr);
     void moveWorld(V3 delta) { pos += parentInv * delta; }
-    float terrainAt(int x, int z) const { return std::max(terrain.clip, hf->at(x, z)) * terrain.height; }
+    float terrainAt(int x, int z) const {
+        float value = hf->at(x, z);
+        if (terrain.smoothing > 0) {
+            int limit = hf->res - 1;
+            float neighbors = hf->at(std::max(0, x - 1), z) + hf->at(std::min(limit, x + 1), z) +
+                              hf->at(x, std::max(0, z - 1)) + hf->at(x, std::min(limit, z + 1));
+            value = lerpf(value, neighbors * .25f, terrain.smoothing);
+        }
+        return std::max(terrain.clip, value) * terrain.height;
+    }
     AppearanceKey appearance(int frame) const;
     V3 lightAxis() const { return normalize(fwd * V3(0, -1, 0)); }
 };
@@ -222,7 +254,7 @@ ViewBasis orthoBasis(int mode, V3 center, float halfH);
 
 struct Hit {
     float t = 0;
-    V3 p, n, lp, lr, pictureColor;
+    V3 p, n, lp, lr, pictureColor, uv;
     float pictureOpacity = 1;
     float ly = 0;
     int obj = -1;
@@ -278,9 +310,12 @@ struct Scene {
     void reloadAssets();
     void append(Scene other);
     Camera viewCamera() const;
+    Camera cameraAt(float frame) const;
     void selectCamera(int index);
     bool setParent(int child, int newParent);
     bool setBooleanParent(int child, int parent, BoolMode mode);
+    int scatter(const std::vector<int>& sources, int surface, const std::vector<Ray>& rays,
+                float minScale, float maxScale, float yawRange, bool align, Rng& rng);
     Scene subset(const std::vector<int>& indices) const;
 private:
     bool writeFile(const std::string& path) const;

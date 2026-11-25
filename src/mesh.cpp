@@ -76,7 +76,7 @@ static bool boxHit(V3 lo, V3 hi, V3 o, V3 inv, float tmin, float tmax) {
     return true;
 }
 
-bool Mesh::intersect(V3 o, V3 d, float tmin, float tmax, float& tOut, V3& nOut, bool flat) const {
+bool Mesh::intersect(V3 o, V3 d, float tmin, float tmax, float& tOut, V3& nOut, bool flat, V3* texture) const {
     if (nodes.empty()) return false;
     V3 inv(1.f / (d.x != 0 ? d.x : 1e-30f), 1.f / (d.y != 0 ? d.y : 1e-30f), 1.f / (d.z != 0 ? d.z : 1e-30f));
     int stack[96], sp = 0;
@@ -104,6 +104,7 @@ bool Mesh::intersect(V3 o, V3 d, float tmin, float tmax, float& tOut, V3& nOut, 
                 tmax = tt;
                 tOut = tt;
                 nOut = flat ? cross(e1, e2) : n[ia] * (1 - u - w) + n[ib] * u + n[ic] * w;
+                if (texture && !uv.empty()) *texture = uv[ia] * (1 - u - w) + uv[ib] * u + uv[ic] * w;
                 hit = true;
             }
         } else if (sp + 2 <= 96) {
@@ -120,10 +121,10 @@ bool Mesh::intersect(V3 o, V3 d, float tmin, float tmax, float& tOut, V3& nOut, 
 bool loadOBJ(const std::string& path, Mesh& m, std::string& err) {
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) { err = "cannot open file"; return false; }
-    std::vector<V3> pos, nrm;
-    std::map<std::pair<int, int>, uint32_t> remap;
+    std::vector<V3> pos, nrm, uv;
+    std::map<std::array<int, 3>, uint32_t> remap;
     Mesh out;
-    bool allNormals = true;
+    bool allNormals = true, allUVs = true;
     char line[4096];
     while (fgets(line, sizeof line, f)) {
         if (line[0] == 'v' && line[1] == ' ') {
@@ -132,25 +133,28 @@ bool loadOBJ(const std::string& path, Mesh& m, std::string& err) {
         } else if (line[0] == 'v' && line[1] == 'n') {
             V3 p;
             if (sscanf(line + 3, "%f %f %f", &p.x, &p.y, &p.z) == 3) nrm.push_back(normalize(p));
+        } else if (line[0] == 'v' && line[1] == 't') {
+            V3 p;
+            if (sscanf(line + 3, "%f %f", &p.x, &p.y) == 2) uv.push_back(p);
         } else if (line[0] == 'f' && line[1] == ' ') {
             std::vector<uint32_t> poly;
             char* tok = strtok(line + 2, " \t\r\n");
-            while (tok) {
+            while (tok && tok[0] != '#') {
                 int vi = 0, ti = 0, ni = 0;
-                if (sscanf(tok, "%d/%d/%d", &vi, &ti, &ni) != 3 && sscanf(tok, "%d//%d", &vi, &ni) != 2) {
-                    ni = 0;
-                    sscanf(tok, "%d", &vi);
-                }
+                if (sscanf(tok, "%d/%d/%d", &vi, &ti, &ni) < 2) sscanf(tok, "%d//%d", &vi, &ni);
                 if (vi < 0) vi = (int)pos.size() + vi + 1;
                 if (ni < 0) ni = (int)nrm.size() + ni + 1;
+                if (ti < 0) ti = (int)uv.size() + ti + 1;
                 if (vi < 1 || vi > (int)pos.size()) { fclose(f); err = "bad vertex index"; return false; }
                 if (ni < 1 || ni > (int)nrm.size()) { ni = 0; allNormals = false; }
-                auto key = std::make_pair(vi, ni);
+                if (ti < 1 || ti > (int)uv.size()) { ti = 0; allUVs = false; }
+                std::array<int, 3> key{vi, ni, ti};
                 auto it = remap.find(key);
                 if (it == remap.end()) {
                     it = remap.emplace(key, (uint32_t)out.v.size()).first;
                     out.v.push_back(pos[vi - 1]);
                     out.n.push_back(ni ? nrm[ni - 1] : V3(0, 1, 0));
+                    out.uv.push_back(ti ? uv[ti - 1] : V3());
                 }
                 poly.push_back(it->second);
                 tok = strtok(nullptr, " \t\r\n");
@@ -165,6 +169,7 @@ bool loadOBJ(const std::string& path, Mesh& m, std::string& err) {
     fclose(f);
     if (out.tri.empty()) { err = "no faces found"; return false; }
     if (!allNormals) out.n.clear();
+    if (!allUVs) out.uv.clear();
     V3 lo(1e30f), hi(-1e30f);
     for (V3 p : out.v) growBox(lo, hi, p);
     V3 c = (lo + hi) * 0.5f;
@@ -325,19 +330,31 @@ bool saveGeometry(const std::string& path, const std::vector<MeshLayer>& layers,
     out.precision(9);
     if (dxf) out << "0\nSECTION\n2\nENTITIES\n";
     else out << "# Brycescape geometry\n";
-    size_t base = 1;
+    size_t base = 1, uvBase = 1, normalsBase = 1;
     for (const auto& [name, mesh] : layers) {
         std::string label = name;
         for (char& c : label) if (!(c >= 'A' && c <= 'Z') && !(c >= 'a' && c <= 'z') &&
                                   !(c >= '0' && c <= '9') && c != '-') c = '_';
         if (label.empty()) label = "Object";
+        bool hasUV = mesh.v.size() == mesh.uv.size() && !mesh.uv.empty();
+        bool hasNormals = mesh.v.size() == mesh.n.size() && !mesh.n.empty();
         if (!dxf) {
             out << "o " << label << '\n';
             for (V3 p : mesh.v) out << "v " << p.x << ' ' << p.y << ' ' << p.z << '\n';
+            if (hasUV) for (V3 p : mesh.uv) out << "vt " << p.x << ' ' << p.y << '\n';
+            if (hasNormals) for (V3 p : mesh.n) out << "vn " << p.x << ' ' << p.y << ' ' << p.z << '\n';
         }
         for (size_t i = 0; i < mesh.tri.size(); i += 3) {
             if (!dxf) {
-                out << "f " << base + mesh.tri[i] << ' ' << base + mesh.tri[i + 1] << ' ' << base + mesh.tri[i + 2] << '\n';
+                out << "f";
+                for (int k = 0; k < 3; ++k) {
+                    uint32_t index = mesh.tri[i + k];
+                    out << ' ' << base + index;
+                    if (hasUV || hasNormals) out << '/';
+                    if (hasUV) out << uvBase + index;
+                    if (hasNormals) out << '/' << normalsBase + index;
+                }
+                out << '\n';
                 continue;
             }
             out << "0\n3DFACE\n8\n" << label << '\n';
@@ -347,6 +364,8 @@ bool saveGeometry(const std::string& path, const std::vector<MeshLayer>& layers,
             }
         }
         base += mesh.v.size();
+        if (hasUV) uvBase += mesh.uv.size();
+        if (hasNormals) normalsBase += mesh.n.size();
     }
     if (dxf) out << "0\nENDSEC\n0\nEOF\n";
     out.close();
@@ -378,15 +397,21 @@ void makeTree(const TreeParams& p, Mesh& trunk, Mesh& leaves) {
         V3 nn = normalize(V3(rng.f() - 0.5f, rng.f() * 0.8f + 0.2f, rng.f() - 0.5f));
         V3 t = std::fabs(nn.y) < 0.9f ? V3(0, 1, 0) : V3(1, 0, 0), u = normalize(cross(nn, t)) * s, w = normalize(cross(nn, u)) * s;
         uint32_t b = (uint32_t)leaves.v.size();
+        if (p.foliageShape != 0) {
+            float width = p.foliageShape == 1 ? 0.68f : 0.17f;
+            for (V3 q : {c - w, c + u * width, c + w, c - u * width}) { leaves.v.push_back(q); leaves.n.push_back(nn); }
+            leaves.tri.insert(leaves.tri.end(), {b, b + 1, b + 2, b, b + 2, b + 3});
+            return;
+        }
         for (V3 q : {c - u - w, c + u - w, c + u + w, c - u + w}) { leaves.v.push_back(q); leaves.n.push_back(nn); }
         leaves.tri.insert(leaves.tri.end(), {b, b + 1, b + 2, b, b + 2, b + 3});
     };
     std::function<void(V3, V3, float, float, int)> branch;
     branch = [&](V3 base, V3 dir, float len, float radius, int level) {
         V3 tip = base + dir * len;
-        tube(trunk, base, tip, radius, radius * 0.7f);
+        tube(trunk, base, tip, radius, radius * p.taper);
         if (level >= p.levels) {
-            int cnt = std::max(1, (int)(12 * p.leafDensity));
+            int cnt = (int)std::lround(12 * p.leafDensity);
             for (int i = 0; i < cnt; i++)
                 leaf(lerp(base, tip, 0.3f + 0.7f * rng.f()) + V3(rng.f() - 0.5f, rng.f() - 0.5f, rng.f() - 0.5f) * (len * 0.6f),
                      p.leafSize * (0.7f + 0.6f * rng.f()));
@@ -398,7 +423,7 @@ void makeTree(const TreeParams& p, Mesh& trunk, Mesh& leaves) {
             float at = 0.4f + 0.55f * (b + rng.f()) / p.branches, ang = phase + 2 * PI * b / p.branches + (rng.f() - 0.5f);
             float sp = rad(p.spread * (0.75f + 0.5f * rng.f()));
             V3 perp = u * std::cos(ang) + w * std::sin(ang);
-            V3 nd = normalize(dir * std::cos(sp) + perp * std::sin(sp) + V3(0, 0.15f, 0));
+            V3 nd = normalize(dir * std::cos(sp) + perp * std::sin(sp) + V3(0, p.upwardBias, 0));
             branch(lerp(base, tip, at), nd, len * (0.55f + 0.2f * rng.f()), radius * 0.6f, level + 1);
         }
         branch(tip, normalize(dir + V3(rng.f() - 0.5f, 0.3f, rng.f() - 0.5f) * 0.25f), len * 0.65f, radius * 0.7f, level + 1);

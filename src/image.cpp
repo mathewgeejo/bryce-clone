@@ -11,11 +11,151 @@
 #endif
 #include "image.h"
 
+#include <array>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <limits>
 #include <map>
 #include <mutex>
+#include <sstream>
+
+void Image::buildLightDistribution() {
+    lightCdf.resize(px.size());
+    double sum = 0;
+    for (int y = 0; y < h; ++y) {
+        double area = std::cos(PI * y / h) - std::cos(PI * (y + 1) / h);
+        for (int x = 0; x < w; ++x) {
+            size_t i = (size_t)y * w + x;
+            sum += dot(px[i], V3(.2126f, .7152f, .0722f)) * area;
+            lightCdf[i] = sum;
+        }
+    }
+}
+
+static std::shared_ptr<Image> loadHDR(const std::string& path) {
+    std::ifstream file(path, std::ios::binary);
+    char line[1024];
+    auto readLine = [&] {
+        if (!file.getline(line, sizeof line)) return std::string{};
+        std::string text(line);
+        if (!text.empty() && text.back() == '\r') text.pop_back();
+        return text;
+    };
+    auto magic = readLine();
+    if (magic != "#?RADIANCE" && magic != "#?RGBE") return {};
+    bool rgb = false;
+    for (auto field = readLine(); !field.empty(); field = readLine()) {
+        if (field == "FORMAT=32-bit_rle_rgbe") rgb = true;
+        else if (field.rfind("FORMAT=", 0) == 0) return {};
+    }
+    std::istringstream resolution(readLine());
+    int height = 0, width = 0;
+    std::string ya, xa;
+    if (!rgb || !(resolution >> ya >> height >> xa >> width) ||
+        (ya != "-Y" && ya != "+Y") || (xa != "+X" && xa != "-X") ||
+        width < 1 || height < 1 || width > 16384 || height > 16384 || (size_t)width * height > 33554432) return {};
+    auto image = std::make_shared<Image>();
+    image->w = width;
+    image->h = height;
+    image->hdr = true;
+    image->px.resize((size_t)width * height);
+    using Pixel = std::array<uint8_t, 4>;
+    std::vector<Pixel> row(width);
+    for (int y = 0; y < height; ++y) {
+        Pixel head;
+        if (!file.read(reinterpret_cast<char*>(head.data()), 4)) return {};
+        if (width >= 8 && width <= 32767 && head[0] == 2 && head[1] == 2 && !(head[2] & 128)) {
+            if (head[2] * 256 + head[3] != width) return {};
+            for (int channel = 0; channel < 4; ++channel) {
+                for (int x = 0; x < width;) {
+                    int code = file.get(), count = code > 128 ? code - 128 : code;
+                    if (count <= 0 || count > width - x) return {};
+                    int value = file.get();
+                    while (count-- > 0) {
+                        if (value < 0) return {};
+                        row[x++][channel] = (uint8_t)value;
+                        if (code <= 128 && count > 0) value = file.get();
+                    }
+                }
+            }
+        } else {
+            int shift = 0;
+            for (int x = 0; x < width;) {
+                if (head[0] == 1 && head[1] == 1 && head[2] == 1) {
+                    if (!x || shift >= 24) return {};
+                    int count = int(head[3]) << shift;
+                    if (count > width - x) return {};
+                    Pixel previous = row[x - 1];
+                    std::fill_n(row.begin() + x, count, previous);
+                    x += count;
+                    shift += 8;
+                } else {
+                    row[x++] = head;
+                    shift = 0;
+                }
+                if (x < width && !file.read(reinterpret_cast<char*>(head.data()), 4)) return {};
+            }
+        }
+        size_t offset = (size_t)(ya == "-Y" ? y : height - 1 - y) * width;
+        for (int x = 0; x < width; ++x) {
+            const Pixel& p = row[x];
+            float unit = p[3] ? std::ldexp(1.f, int(p[3]) - 136) : 0;
+            V3 c = V3(p[0], p[1], p[2]) * unit;
+            image->px[offset + (xa == "+X" ? x : width - 1 - x)] = {std::min(c.x, 1e20f), std::min(c.y, 1e20f), std::min(c.z, 1e20f)};
+        }
+    }
+    image->buildLightDistribution();
+    return image;
+}
+
+static std::shared_ptr<Image> loadPGM(const std::string& path) {
+    std::ifstream file(path, std::ios::binary);
+    auto skip = [&] {
+        file >> std::ws;
+        while (file.peek() == '#') {
+            file.ignore((std::numeric_limits<std::streamsize>::max)(), '\n');
+            file >> std::ws;
+        }
+    };
+    char magic[3]{};
+    if (!file.read(magic, 2) || magic[0] != 'P' || (magic[1] != '2' && magic[1] != '5')) return {};
+    int w = 0, h = 0, maxValue = 0;
+    skip(); file >> w;
+    skip(); file >> h;
+    skip(); file >> maxValue;
+    if (!file || w < 1 || h < 1 || (size_t)w * h > 33554432 || maxValue < 1 || maxValue > 65535) return {};
+    if (magic[1] == '5') {
+        int separator = file.get();
+        if (separator < 0 || !std::isspace((unsigned char)separator)) return {};
+        if (separator == '\r' && file.peek() == '\n') file.get();
+    }
+    auto image = std::make_shared<Image>();
+    image->w = w;
+    image->h = h;
+    image->px.resize((size_t)w * h);
+    for (V3& pixel : image->px) {
+        int value = -1;
+        if (magic[1] == '2') {
+            skip();
+            if (!(file >> value)) return {};
+        } else {
+            int first = file.get();
+            if (first < 0) return {};
+            value = first;
+            if (maxValue > 255) {
+                int low = file.get();
+                if (low < 0) return {};
+                value = first * 256 + low;
+            }
+        }
+        if (value < 0 || value > maxValue) return {};
+        pixel = V3((float)value / maxValue);
+    }
+    return image;
+}
 
 static uint32_t rd32(const uint8_t* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24); }
 static uint32_t rd16(const uint8_t* p) { return p[0] | (p[1] << 8); }
@@ -185,6 +325,8 @@ std::shared_ptr<Image> loadImage(const std::string& path) {
         return image;
     }
     std::string ext = imageExtension(path);
+    if (ext == ".hdr" || ext == ".rgbe" || ext == ".pic") return loadHDR(path);
+    if (ext == ".pgm") return loadPGM(path);
     if (ext == ".bmp") return loadBMP(path);
     if (ext == ".tga") return loadTGA(path);
 #ifdef _WIN32
@@ -201,6 +343,17 @@ std::shared_ptr<Image> loadImage(const std::string& path) {
                                      WICBitmapPaletteTypeCustom))) return {};
     UINT w = 0, h = 0;
     if (FAILED(converter->GetSize(&w, &h)) || !w || !h || (size_t)w * h > 64000000) return {};
+    WICPixelFormatGUID native;
+    if (SUCCEEDED(frame->GetPixelFormat(&native)) && IsEqualGUID(native, GUID_WICPixelFormat16bppGray)) {
+        std::vector<uint16_t> gray((size_t)w * h);
+        if (FAILED(frame->CopyPixels(nullptr, w * 2, (UINT)(gray.size() * 2), reinterpret_cast<BYTE*>(gray.data())))) return {};
+        auto image = std::make_shared<Image>();
+        image->w = (int)w;
+        image->h = (int)h;
+        image->px.reserve(gray.size());
+        for (uint16_t value : gray) image->px.emplace_back(value / 65535.f);
+        return image;
+    }
     std::vector<uint8_t> pixels((size_t)w * h * 4);
     if (FAILED(converter->CopyPixels(nullptr, w * 4, (UINT)pixels.size(), pixels.data()))) return {};
     return fromPixels((int)w, (int)h, pixels.data(), (int)w * 4, 4);
@@ -210,6 +363,31 @@ std::shared_ptr<Image> loadImage(const std::string& path) {
         uint32_t w = 0, h = 0;
         if (!file || !TIFFGetField(file.get(), TIFFTAG_IMAGEWIDTH, &w) ||
             !TIFFGetField(file.get(), TIFFTAG_IMAGELENGTH, &h) || !w || !h || (size_t)w * h > 64000000) return {};
+        uint16_t bits = 0, channels = 0, color = 0, orientation = 0, format = 0;
+        TIFFGetFieldDefaulted(file.get(), TIFFTAG_BITSPERSAMPLE, &bits);
+        TIFFGetFieldDefaulted(file.get(), TIFFTAG_SAMPLESPERPIXEL, &channels);
+        TIFFGetFieldDefaulted(file.get(), TIFFTAG_ORIENTATION, &orientation);
+        TIFFGetFieldDefaulted(file.get(), TIFFTAG_SAMPLEFORMAT, &format);
+        TIFFGetField(file.get(), TIFFTAG_PHOTOMETRIC, &color);
+        if (bits == 16 && channels == 1 && format == SAMPLEFORMAT_UINT && !TIFFIsTiled(file.get()) &&
+            (color == PHOTOMETRIC_MINISBLACK || color == PHOTOMETRIC_MINISWHITE) && orientation >= 1 && orientation <= 4 &&
+            TIFFScanlineSize(file.get()) == (tmsize_t)w * 2) {
+            auto image = std::make_shared<Image>();
+            image->w = (int)w;
+            image->h = (int)h;
+            image->px.resize((size_t)w * h);
+            std::vector<uint16_t> row(w);
+            for (uint32_t y = 0; y < h; ++y) {
+                if (TIFFReadScanline(file.get(), row.data(), y, 0) < 0) return {};
+                size_t offset = (size_t)(orientation >= 3 ? h - 1 - y : y) * w;
+                for (uint32_t x = 0; x < w; ++x) {
+                    float value = row[x] / 65535.f;
+                    image->px[offset + ((orientation == 2 || orientation == 3) ? w - 1 - x : x)] =
+                        V3(color == PHOTOMETRIC_MINISWHITE ? 1 - value : value);
+                }
+            }
+            return image;
+        }
         std::vector<uint32_t> raster((size_t)w * h);
         if (!TIFFReadRGBAImageOriented(file.get(), w, h, raster.data(), ORIENTATION_TOPLEFT, 1)) return {};
         auto image = std::make_shared<Image>();
@@ -234,6 +412,42 @@ std::shared_ptr<Image> loadImage(const std::string& path) {
         gdk_pixbuf_get_rowstride(buf), gdk_pixbuf_get_n_channels(buf)) : nullptr;
     g_object_unref(buf);
     return image;
+#endif
+}
+
+bool saveHeightTiff(const std::string& path, int width, int height, const std::vector<float>& heights) {
+    if (width < 1 || height < 1 || heights.size() != (size_t)width * height || heights.size() > 64000000) return false;
+    std::vector<uint16_t> values;
+    values.reserve(heights.size());
+    for (float v : heights) values.push_back((uint16_t)std::lround(clampf(v, 0, 1) * 65535.f));
+#ifdef _WIN32
+    Wic wic;
+    if (!wic.factory) return false;
+    ComPtr<IWICStream> stream;
+    ComPtr<IWICBitmapEncoder> encoder;
+    ComPtr<IWICBitmapFrameEncode> frame;
+    ComPtr<IPropertyBag2> properties;
+    WICPixelFormatGUID format = GUID_WICPixelFormat16bppGray;
+    return SUCCEEDED(wic.factory->CreateStream(stream.GetAddressOf())) &&
+        SUCCEEDED(stream->InitializeFromFilename(std::filesystem::path(path).c_str(), GENERIC_WRITE)) &&
+        SUCCEEDED(wic.factory->CreateEncoder(GUID_ContainerFormatTiff, nullptr, encoder.GetAddressOf())) &&
+        SUCCEEDED(encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache)) &&
+        SUCCEEDED(encoder->CreateNewFrame(frame.GetAddressOf(), properties.GetAddressOf())) &&
+        SUCCEEDED(frame->Initialize(properties.Get())) && SUCCEEDED(frame->SetSize(width, height)) &&
+        SUCCEEDED(frame->SetPixelFormat(&format)) && IsEqualGUID(format, GUID_WICPixelFormat16bppGray) &&
+        SUCCEEDED(frame->WritePixels(height, width * 2, (UINT)(values.size() * 2), reinterpret_cast<BYTE*>(values.data()))) &&
+        SUCCEEDED(frame->Commit()) && SUCCEEDED(encoder->Commit());
+#else
+    std::unique_ptr<TIFF, decltype(&TIFFClose)> file(TIFFOpen(path.c_str(), "w"), TIFFClose);
+    if (!file) return false;
+    TIFF* tiff = file.get();
+    if (!TIFFSetField(tiff, TIFFTAG_IMAGEWIDTH, (uint32_t)width) || !TIFFSetField(tiff, TIFFTAG_IMAGELENGTH, (uint32_t)height) ||
+        !TIFFSetField(tiff, TIFFTAG_SAMPLESPERPIXEL, 1) || !TIFFSetField(tiff, TIFFTAG_BITSPERSAMPLE, 16) ||
+        !TIFFSetField(tiff, TIFFTAG_ORIENTATION, ORIENTATION_TOPLEFT) || !TIFFSetField(tiff, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG) ||
+        !TIFFSetField(tiff, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_MINISBLACK) || !TIFFSetField(tiff, TIFFTAG_COMPRESSION, COMPRESSION_LZW)) return false;
+    for (int y = 0; y < height; ++y)
+        if (TIFFWriteScanline(tiff, values.data() + (size_t)y * width, (uint32_t)y, 0) < 0) return false;
+    return TIFFWriteDirectory(tiff) != 0;
 #endif
 }
 

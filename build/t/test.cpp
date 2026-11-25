@@ -56,6 +56,113 @@ static int fails = 0;
 #define CHECK(c) do { if (!(c)) { printf("  FAIL %s:%d %s\n", __FILE__, __LINE__, #c); fails++; } } while (0)
 
 int main() {
+    printf("HDR lighting, terrain precision, and linked scatter\n");
+    {
+        const char* hdr = "build/t/parity fixture.hdr";
+        const char* path = "build/t/parity fixture.c3d";
+        const char* height = "build/t/parity height.tif";
+        const char* pgm = "build/t/parity height.pgm";
+        {
+            std::ofstream file(hdr, std::ios::binary);
+            file << "#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 1 +X 8\n";
+            const uint8_t scan[] = {2, 2, 0, 8, 136, 192, 136, 96, 136, 48, 136, 130};
+            file.write(reinterpret_cast<const char*>(scan), sizeof scan);
+        }
+        {
+            std::ofstream file(pgm);
+            file << "P2\n# 16-bit terrain\n2 1\n65535\n12000 12001\n";
+        }
+        auto image = loadImage(hdr);
+        CHECK(image && image->hdr && image->px[0].x == 3 && image->lightCdf.back() > 0);
+        auto elevation = loadImage(pgm);
+        CHECK(elevation && elevation->px[0].x < elevation->px[1].x);
+        CHECK(saveHeightTiff(height, 2, 1, {12000 / 65535.f, 12001 / 65535.f}));
+        auto tiff = loadImage(height);
+        CHECK(tiff && std::fabs(tiff->px[1].x - 12001 / 65535.f) < 1e-6f && tiff->px[1].x > tiff->px[0].x);
+        Heightfield hf;
+        hfInit(hf, 9);
+        Image mask; mask.w = mask.h = 1; mask.px = {V3(.5f)};
+        if (elevation) hfBlendImage(hf, {2, 2, 6, 6}, *elevation, 1, &mask);
+        CHECK(hf.at(0, 0) == 0 && std::fabs(hf.at(4, 4) - 6000.25f / 65535.f) < 1e-6f);
+        Scene scene;
+        scene.sky.environment = hdr;
+        scene.sky.environmentImage = image;
+        scene.sky.indirectStrength = .5f;
+        auto terrain = makeObject(ObjType::Terrain, 1);
+        terrain.pos = {}; terrain.scl = {10, 2, 10};
+        hfInit(*terrain.hf, 9);
+        hfAdd(*terrain.hf, .3f);
+        terrain.mat.tex = TexType::None;
+        terrain.mat.color1 = V3(.4f);
+        Image baked = terrainMaterialHeightMap(terrain, 9);
+        CHECK(baked.w == 9 && baked.h == 9 && std::fabs(baked.px.back().x - .4f) < .0001f);
+        scene.objs = {makeObject(ObjType::Torus, 1), terrain};
+        TextureLayer layer;
+        layer.tex = TexType::Ridged;
+        layer.mask = TexMask::Slope;
+        layer.blend = TexBlend::Screen;
+        layer.warp = .6f;
+        layer.octaves = 7;
+        scene.objs[0].mat.layers.push_back(layer);
+        scene.updateAll();
+        Rng rng(11);
+        CHECK(scene.scatter({0}, 1, {{{3, 5, 0}, {0, -1, 0}}, {{6, 5, 0}, {0, -1, 0}}}, 1, 1, 0, true, rng) == 2);
+        if (scene.objs.size() == 4) {
+            CHECK(scene.objs[2].terrainAnchor && scene.objs[2].parent == 1);
+            scene.objs[0].torus.major = .9f;
+            scene.updateAll();
+            CHECK(scene.objs[2].instanceSource == 0 && scene.objs[3].torus.major == .9f);
+            V3 before = scene.objs[3].worldPos;
+            scene.objs[1].pos.z += 2;
+            hfAdd(*scene.objs[1].hf, .1f);
+            scene.updateAll();
+            CHECK(length(scene.objs[3].worldPos - before - V3(0, .2f, 2)) < .001f);
+            Scene detached = scene.subset({3});
+            CHECK(detached.objs[0].instanceSource == -1 && detached.objs[0].torus.major == .9f);
+        }
+        std::string error;
+        CHECK(scene.embedAssets(error) && scene.save(path));
+        Scene loaded;
+        CHECK(loaded.load(path) && loaded.objs.size() == 4 && loaded.objs[2].instanceSource == 0 && loaded.objs[2].terrainAnchor &&
+              loaded.sky.environmentImage && loaded.sky.environmentImage->hdr && loaded.sky.environmentImage->px[0].x == 3 &&
+              loaded.sky.indirectStrength == .5f && loaded.objs[0].mat.layers[0].octaves == 7);
+        Object light = makeObject(ObjType::Light, 1);
+        light.lighting.targetGroup = 3;
+        light.lighting.diffuseStrength = .2f;
+        putKey(light.appearances, light.appearance(0));
+        light.lighting.diffuseStrength = .8f;
+        putKey(light.appearances, light.appearance(10));
+        loaded.objs.push_back(light);
+        CHECK(loaded.save(path));
+        Scene animation;
+        CHECK(animation.load(path) && animation.objs.size() == 5);
+        if (animation.objs.size() == 5) {
+            animation.applyFrame(5);
+            CHECK(std::fabs(animation.objs.back().lighting.diffuseStrength - .5f) < .0001f &&
+                  animation.objs.back().lighting.targetGroup == 3);
+        }
+        Heightfield large;
+        hfInit(large, MAX_TERRAIN_RESOLUTION);
+        CHECK(large.n.empty() && large.normal(2000, 2000).y == 1);
+        for (const char* file : {hdr, path, height, pgm}) std::remove(file);
+    }
+    {
+        const char* source = "build/t/parity-uv.obj";
+        const char* exported = "build/t/parity-export.obj";
+        {
+            std::ofstream file(source);
+            file << "v -1 -1 0\nv 1 -1 0\nv 0 1 0\nvt 0 0\nvt 1 0\nvt 0.5 1\nf 1/1 2/2 3/3\n";
+        }
+        Mesh mesh, roundTrip;
+        std::string error;
+        CHECK(loadOBJ(source, mesh, error) && mesh.uv.size() == 3);
+        V3 n, uv;
+        float t = 0;
+        CHECK(mesh.intersect({0, 0, 1}, {0, 0, -1}, .001f, 5, t, n, false, &uv) && length(uv - V3(.5f, .5f, 0)) < .001f);
+        CHECK(saveGeometry(exported, {{"UV triangle", mesh}}, false) && loadOBJ(exported, roundTrip, error) && roundTrip.uv.size() == 3);
+        std::remove(source);
+        std::remove(exported);
+    }
     printf("DXF import/export and implicit geometry\n");
     {
         const char* path = "build/t/brycescape-format.dxf";

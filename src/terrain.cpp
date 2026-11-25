@@ -463,18 +463,28 @@ void hfSharpen(Heightfield& f) {
     f.computeNormals();
 }
 
-void hfFromImage(Heightfield& f, const Image& img) {
-    int N = f.res;
-    for (int z = 0; z < N; z++)
-        for (int x = 0; x < N; x++) {
-            V3 c = img.sample((x + 0.5f) / N, (z + 0.5f) / N);
-            f.h[z * N + x] = clampf(c.x * 0.3f + c.y * 0.59f + c.z * 0.11f, 0, 1);
+void hfBlendImage(Heightfield& f, HeightRegion area, const Image& image, float amount, const Image* mask) {
+    int width = area.x1 - area.x0 + 1, height = area.z1 - area.z0 + 1;
+    auto gray = [](V3 c) { return clampf(dot(c, V3(.3f, .59f, .11f)), 0, 1); };
+    for (int z = area.z0; z <= area.z1; ++z)
+        for (int x = area.x0; x <= area.x1; ++x) {
+            float u = (x - area.x0 + .5f) / width, v = (z - area.z0 + .5f) / height;
+            float value = gray(image.sampleClamped(u, v, false));
+            float weight = mask ? amount * gray(mask->sampleClamped(u, v, false)) : amount;
+            auto& cell = f.h[z * f.res + x];
+            cell = lerpf(cell, value, weight);
         }
-    f.computeNormals();
+    f.computeNormals(area.x0 - 1, area.z0 - 1, area.x1 + 1, area.z1 + 1);
+}
+
+void hfFromImage(Heightfield& f, const Image& img) {
+    hfBlendImage(f, {0, 0, f.res - 1, f.res - 1}, img, 1, nullptr);
 }
 
 void hfResample(Heightfield& f, int res) {
-    Heightfield o = f;
+    Heightfield o;
+    o.res = f.res;
+    o.h = std::move(f.h);
     f.res = res;
     f.h.assign((size_t)res * res, 0.f);
     for (int z = 0; z < res; z++)

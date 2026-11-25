@@ -56,8 +56,12 @@ Close the studio before rebuilding so the linker can replace `Brycescape.exe`. T
 - Add picture cards with PNG alpha or chroma cutouts. Use fixed planes or cards that face the camera.
 - Combine primitives with Boolean operations, generate trees, import OBJ or layered DXF meshes, and export selections as OBJ or DXF.
 - Parent objects through **Edit Tools → Parent to Active** and inspect the relationships in the scene hierarchy.
+- Paint linked vegetation or geometry onto terrain with **F1 → Scatter Brush**. Select the source objects first and Shift-click the receiving surface last. Set the brush density, size variation, rotation, alignment and seed, then paint in the viewport. Press **Esc** to leave the brush. Terrain instances follow height edits and share their source geometry.
 - Layer procedural and image textures across material channels, and save individual texture layers as `.c3tex` presets.
+- Use **Texture Layers** to warp procedural coordinates, shape levels, and mask layers by elevation or slope. The **Mesh UV** mapping option uses the texture coordinates supplied by an imported OBJ.
 - Place point, spot, and directional lights, and tune fog, clouds, sunlight, and moonlight.
+- Load a Radiance HDR environment in **Sky Lab** for background, reflections and lighting. Use the indirect light controls for a diffuse bounce, or add a grouped dome, cluster or fill rig.
+- Blend a heightmap into a terrain or rectangle with an optional grayscale mask. **Material to Height** blends the material's bump or color into the heightfield, sampled on a grid of up to 1025 points per side. The terrain editor supports 16-bit grayscale TIFF and PGM and a 4097-point grid. Press **E** on water to edit directional waves.
 - Animate transforms and appearance tracks, switch between named cameras, and render stills, panoramas or numbered animation frames.
 - Save scene fragments in the thumbnail library. Package, embed or relink image assets through **Commands**.
 
@@ -69,6 +73,7 @@ Close the studio before rebuilding so the linker can replace `Brycescape.exe`. T
 ./out/linux/Brycescape --example 0 example.bmp 640 400
 ./out/linux/Brycescape --export-example 0 example.c3d
 ./out/linux/Brycescape --batch "render queue.txt"
+./out/linux/Brycescape --render-frames "my scene.c3d" "shared frames" 0 119
 ```
 
 On Windows, use `.\build\Brycescape.exe` with the same arguments.
@@ -76,6 +81,10 @@ On Windows, use `.\build\Brycescape.exe` with the same arguments.
 `--render` opens the default scene when no scene file is supplied. Example indices start at zero. The command-line renderer also works on Linux without a running desktop session.
 
 A queue file contains one scene and output pair per line, such as `"my scene.c3d" "output.tiff"`. Relative paths resolve from the queue file. In the desktop, use **Render Options → Start Render Queue**. Animation output can use a name such as `walk_{frame}.png`.
+
+For distributed animation rendering, run the same `--render-frames` job on multiple workers with access to the same scene assets and output folder. The scene determines the image size and render settings. The range is inclusive and starts at frame zero. Each worker claims frames using directories on the shared filesystem, so use a share that supports atomic directory creation. Use a separate output folder per job. Workers can rerun a job and skip finished frames. If a worker crashes, its `.rendering` directory identifies the interrupted frame. Remove that directory after confirming the worker has stopped, then rerun the job.
+
+Brycescape uses its own `.c3d` scene format and reads older versions. For geometry interchange with Bryce or Daz Studio, use OBJ. Brycescape reads OBJ geometry, normals and UVs. Apply the exported material images in the Materials Lab using **Mesh UV**. ASCII DXF also works for 3DFACE and polyface meshes. The remaining native file, preset and interchange work is tracked in the backlog.
 
 ## Useful keys
 

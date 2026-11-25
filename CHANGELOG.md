@@ -1,5 +1,20 @@
 # Implementation log
 
+## Bryce 7.1 workflows
+
+- Added a reproducible Scatter Brush with density, radius, rotation, scale variation and normal alignment. Copies share source geometry and follow receiver transforms. Terrain placements also follow height edits.
+- Added Radiance RGBE maps for HDR backgrounds, reflections and importance-sampled illumination. Sky Lab controls rotation, intensity, sample count and background visibility. Scene packaging and embedding preserve HDR assets.
+- Added indirect diffuse lighting, grouped dome, cluster and fill rigs, and per-light controls for diffuse strength, specular strength and group influence.
+- Expanded texture layers with ridged and cellular functions, coordinate warp, noise octaves, level shaping, new blend operations and elevation and slope masks.
+- Added terrain image blending with grayscale masks, material-to-height baking, 16-bit PGM and grayscale TIFF, a 4097-point grid and keyable surface smoothing. Large heightfields calculate normals on demand, and terrain history has a memory budget.
+- Expanded appearance keys to cover light settings and material absorption and volumes. Added camera paths using the same camera interpolation as playback, plus a crop overlay in the safe frame.
+- Added Pine, Oak and Willow starting shapes with adjustable branch lift, taper and leaf geometry. Added the original Pines at the Inlet example.
+- Added a water editor with level, directional animated ripples, wavelength, wave height and presets.
+- Preserved OBJ UVs and normals through import, scene persistence and export. Added Mesh UV material mapping.
+- Added shared-folder animation rendering with per-frame claims, PNG output, optional render passes and restart support.
+- Added scene and library version 5 and texture preset version 2 for these settings. Legacy files remain readable.
+- Verified the Windows regression suite, desktop startup, a legacy v4 render, the new forest example, and two concurrent animation workers. A local shared-folder test rendered 2,058 linked objects with alpha, depth and object ID outputs and resumed an interrupted frame. Linux x86-64 C++17 syntax checks passed.
+
 ## Brycescape
 
 - Renamed the studio, build targets, launcher and project documentation to **Brycescape**. Linux migrates the existing material and sky library on first startup.
